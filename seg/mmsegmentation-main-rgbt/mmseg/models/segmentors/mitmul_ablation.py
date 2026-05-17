@@ -707,16 +707,20 @@ def _apply_degradation(img_tensor, modality, mean, std,
     return result
 
 
-def _generate_local_mask(B, H, W, num_regions=3, device='cpu'):
+def _generate_local_mask(B, H, W, num_regions=3, device='cpu', level=2):
     mask = torch.zeros(B, 1, H, W, device=device)
-    region_h = H // 4
-    region_w = W // 4
+    coverage = {2: 0.20, 3: 0.35, 4: 0.50, 5: 0.70}
+    target_area = coverage.get(level, 0.20) * H * W / num_regions
     for b in range(B):
         for _ in range(num_regions):
-            rh = random.randint(region_h, H // 2)
-            rw = random.randint(region_w, W // 2)
-            y1 = random.randint(0, H - rh)
-            x1 = random.randint(0, W - rw)
+            aspect = random.uniform(0.5, 2.0)
+            area = target_area * random.uniform(0.7, 1.3)
+            rh = int(math.sqrt(area / aspect))
+            rw = int(math.sqrt(area * aspect))
+            rh = max(min(rh, H), 8)
+            rw = max(min(rw, W), 8)
+            y1 = random.randint(0, max(H - rh, 0))
+            x1 = random.randint(0, max(W - rw, 0))
             mask[b, 0, y1:y1 + rh, x1:x1 + rw] = 1.0
     return mask
 
@@ -2385,7 +2389,7 @@ class MiTMulABV8(_AblationBase):
                 zp_t_list, data_samples, self.train_cfg)
             losses.update(add_prefix(t_priv_loss, 't_private_decode'))
 
-        if self.loss_align_weight > 0 and both_present.any():
+        if self.loss_align_weight > 0:
             gt_labels = seg_label.squeeze(1).long()
             pad_mask = self._build_pad_mask(
                 data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
@@ -2700,7 +2704,7 @@ def _complementary_fix(D_rgb_raw, D_t_raw, q_rgb_weight, q_t_weight):
 def _downsample_mask(D, H_k, W_k):
     if D.shape[2] == H_k and D.shape[3] == W_k:
         return D
-    return F.interpolate(D.float(), size=(H_k, W_k), mode='nearest')
+    return F.adaptive_max_pool2d(D.float(), (H_k, W_k))
 
 
 def _forward_branch_pruned(backbone, img, predictor_list, cum_D_prev_list,
@@ -2743,7 +2747,8 @@ def _forward_branch_pruned(backbone, img, predictor_list, cum_D_prev_list,
             if cum_D_prev_list is not None and i < len(cum_D_prev_list) and cum_D_prev_list[i] is not None:
                 prev_D = cum_D_prev_list[i]
                 if prev_D.shape[2:] != (H, W):
-                    prev_D = F.interpolate(prev_D.float(), size=(H, W), mode='nearest')
+                    prev_D = F.adaptive_max_pool2d(
+                        prev_D.float(), (H, W))
                 cum_D = D_raw * prev_D
             else:
                 cum_D = D_raw
@@ -2881,18 +2886,20 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
             D_rgb_raw = D_rgb_fixed
             D_t_raw = D_t_fixed
 
-        if cum_D_rgb_list and i < len(cum_D_rgb_list) and cum_D_rgb_list[i] is not None:
-            prev_D_rgb = cum_D_rgb_list[i]
+        if i > 0 and cum_D_rgb_list[i - 1] is not None:
+            prev_D_rgb = cum_D_rgb_list[i - 1]
             if prev_D_rgb.shape[2:] != (H, W):
-                prev_D_rgb = F.interpolate(prev_D_rgb.float(), size=(H, W), mode='nearest')
+                prev_D_rgb = F.adaptive_max_pool2d(
+                    prev_D_rgb.float(), (H, W))
             cum_D_rgb = D_rgb_raw * prev_D_rgb if D_rgb_raw is not None else None
         else:
             cum_D_rgb = D_rgb_raw
 
-        if cum_D_t_list and i < len(cum_D_t_list) and cum_D_t_list[i] is not None:
-            prev_D_t = cum_D_t_list[i]
+        if i > 0 and cum_D_t_list[i - 1] is not None:
+            prev_D_t = cum_D_t_list[i - 1]
             if prev_D_t.shape[2:] != (H, W):
-                prev_D_t = F.interpolate(prev_D_t.float(), size=(H, W), mode='nearest')
+                prev_D_t = F.adaptive_max_pool2d(
+                    prev_D_t.float(), (H, W))
             cum_D_t = D_t_raw * prev_D_t if D_t_raw is not None else None
         else:
             cum_D_t = D_t_raw
@@ -2988,7 +2995,7 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
             outs.append(x)
         input_rgbt = x
 
-    return outs, all_D_rgb, all_D_t, all_q_rgb, all_q_t
+    return outs, all_D_rgb, all_D_t, all_q_rgb, all_q_t, cum_D_rgb_list, cum_D_t_list
 
 
 class QualityModulatedMambaFusion(nn.Module):
@@ -3048,8 +3055,8 @@ class MiTMulABV9(_AblationBase):
                  gumbel_tau_init: float = 1.0,
                  gumbel_tau_min: float = 0.1,
                  gumbel_tau_decay: float = 0.995,
-                 retention_min: float = 0.3,
-                 retention_max: float = 0.7,
+                 retention_min: float = 0.5,
+                 retention_max: float = 0.95,
                  retention_loss_weight: float = 0.01,
                  phase1_epochs: int = 10,
                  phase2_epochs: int = 20,
@@ -3145,9 +3152,10 @@ class MiTMulABV9(_AblationBase):
         pass
 
     def _get_training_phase(self, epoch):
-        if epoch < self.phase1_epochs:
+        r = min(epoch / max(self.total_epochs, 1), 1.0)
+        if r < 0.1:
             return 1
-        elif epoch < self.phase1_epochs + self.phase2_epochs:
+        elif r < 0.3:
             return 2
         else:
             return 3
@@ -3211,25 +3219,17 @@ class MiTMulABV9(_AblationBase):
         fused = q_rgb_norm * zc_rgb + q_t_norm * zc_t
         return fused
 
-    def _simple_fuse_stage(self, common_feat, priv_feat, fuse_module, D_gen):
-        """Shallow-stage fusion: priv zero-masked, then concat+1x1 conv."""
-        B, C, H, W = common_feat.shape
-        if D_gen.shape[2:] != (H, W):
-            D_gen = F.interpolate(D_gen.float(), size=(H, W), mode='nearest')
-
-        priv_masked = priv_feat * D_gen  # zero out invalid positions
-        enhanced = fuse_module(common_feat, priv_masked)
-        enhanced = enhanced * D_gen       # hard zeroing safety net
+    def _simple_fuse_stage(self, common_feat, priv_feat, fuse_module):
+        enhanced = fuse_module(common_feat, priv_feat)
         return enhanced
 
-    def _mamba_fuse_stage(self, common_feat, priv_feat, fuse_module, D_gen):
-        """Deep-stage fusion: variable-length mamba (no quality modulation)."""
+    def _mamba_fuse_stage(self, common_feat, priv_feat, fuse_module, D_priv):
         B, C, H, W = common_feat.shape
         N_g = H * W
 
-        if D_gen.shape[2:] != (H, W):
-            D_gen = F.interpolate(D_gen.float(), size=(H, W), mode='nearest')
-        D_gen_s = (D_gen.squeeze(1) > 0.5).float()
+        if D_priv.shape[2:] != (H, W):
+            D_priv = F.interpolate(D_priv.float(), size=(H, W), mode='nearest')
+        D_priv_s = (D_priv.squeeze(1) > 0.5).float()
 
         G = common_feat.permute(0, 2, 3, 1).reshape(B, N_g, C)
         P = priv_feat.permute(0, 2, 3, 1).reshape(B, N_g, C)
@@ -3238,18 +3238,17 @@ class MiTMulABV9(_AblationBase):
         cu_seqlens = [0]
 
         for b in range(B):
-            mask_b = D_gen_s[b].reshape(-1)
+            mask_b = D_priv_s[b].reshape(-1)
             valid_idx = mask_b.nonzero(as_tuple=True)[0]
             M_b = valid_idx.shape[0]
 
             if M_b == 0:
-                valid_idx = torch.arange(N_g, device=mask_b.device)
-                M_b = N_g
-
-            p_valid_b = P[b, valid_idx]
-            priv_valid_list.append(p_valid_b)
-
-            cu_seqlens.append(cu_seqlens[-1] + N_g + M_b)
+                priv_valid_list.append(torch.zeros(N_g, C, device=P.device, dtype=P.dtype))
+                cu_seqlens.append(cu_seqlens[-1] + N_g + N_g)
+            else:
+                p_valid_b = P[b, valid_idx]
+                priv_valid_list.append(p_valid_b)
+                cu_seqlens.append(cu_seqlens[-1] + N_g + M_b)
 
         if len(priv_valid_list) > 0 and priv_valid_list[0].shape[0] > 0:
             priv_valid_tokens = torch.cat(priv_valid_list, dim=0)
@@ -3261,10 +3260,6 @@ class MiTMulABV9(_AblationBase):
 
         G_enhanced = fuse_module(G, priv_valid_tokens, H, W, cu_seqlens_tensor)
         G_enhanced = G_enhanced.reshape(B, H, W, C).permute(0, 3, 1, 2)
-
-        if D_gen.shape[2:] != (H, W):
-            D_gen = F.interpolate(D_gen.float(), size=(H, W), mode='nearest')
-        G_enhanced = G_enhanced * D_gen
 
         return G_enhanced
 
@@ -3286,80 +3281,61 @@ class MiTMulABV9(_AblationBase):
 
     def _extract_feat_single(self, input_rgb, input_t):
         B = input_rgb.shape[0]
-        has_rgb = (input_rgb.abs().sum(dim=[1, 2, 3]) > 1e-6)
-        has_t = (input_t.abs().sum(dim=[1, 2, 3]) > 1e-6)
-        both_present = has_rgb & has_t
 
         epoch = self.current_epoch if hasattr(self, 'current_epoch') else 0
         phase = self._get_training_phase(epoch)
         force_all_keep = (phase < 3)
         use_gumbel = self.training and not force_all_keep
 
-        zc_rgb_list = [None] * 4
-        zc_t_list = [None] * 4
-        zp_rgb_list = [None] * 4
-        zp_t_list = [None] * 4
-        D_rgb_list = [None] * 4
-        D_t_list = [None] * 4
-        q_rgb_list = [None] * 4
-        q_t_list = [None] * 4
-        D_rgb_priv_list = [None] * 4
-        D_t_priv_list = [None] * 4
-        q_rgb_priv_list = [None] * 4
-        q_t_priv_list = [None] * 4
+        input_rgbt = torch.cat([input_rgb, input_t], dim=0)
 
-        if both_present.any():
-            input_rgbt = torch.cat([input_rgb, input_t], dim=0)
-
-            zc_rgbt_outs, D_rgb_raw, D_t_raw, q_rgb_raw, q_t_raw = \
-                _forward_common_dual_pruned(
-                    self.backbone, input_rgbt, orig_B=B,
-                    predictors_rgb=self.predictors_common_rgb,
-                    predictors_t=self.predictors_common_t,
-                    gumbel_tau=self.gumbel_tau,
-                    training=use_gumbel,
-                    force_all_keep=force_all_keep)
-
-            zc_rgb_list = [feat[:B] for feat in zc_rgbt_outs]
-            zc_t_list = [feat[B:] for feat in zc_rgbt_outs]
-            D_rgb_list = D_rgb_raw
-            D_t_list = D_t_raw
-            q_rgb_list = q_rgb_raw
-            q_t_list = q_t_raw
-
-        if has_rgb.any():
-            zp_rgb_outs, D_rgb_priv_raw, q_rgb_priv_raw, _ = _forward_branch_pruned(
-                self.private_branch_rgb, input_rgb,
-                self.predictors_priv_rgb,
-                cum_D_prev_list=None,
+        zc_rgbt_outs, D_rgb_raw, D_t_raw, q_rgb_raw, q_t_raw, cum_D_rgb_list, cum_D_t_list = \
+            _forward_common_dual_pruned(
+                self.backbone, input_rgbt, orig_B=B,
+                predictors_rgb=self.predictors_common_rgb,
+                predictors_t=self.predictors_common_t,
                 gumbel_tau=self.gumbel_tau,
-                is_common=False,
                 training=use_gumbel,
                 force_all_keep=force_all_keep)
-            zp_rgb_list = zp_rgb_outs
-            D_rgb_priv_list = D_rgb_priv_raw
-            q_rgb_priv_list = q_rgb_priv_raw
 
-            for i in range(len(zp_rgb_list)):
-                if zp_rgb_list[i] is not None and D_rgb_priv_list[i] is not None:
-                    zp_rgb_list[i] = zp_rgb_list[i] * D_rgb_priv_list[i]
+        zc_rgb_list = [feat[:B] for feat in zc_rgbt_outs]
+        zc_t_list = [feat[B:] for feat in zc_rgbt_outs]
+        D_rgb_list = D_rgb_raw
+        D_t_list = D_t_raw
+        q_rgb_list = q_rgb_raw
+        q_t_list = q_t_raw
 
-        if has_t.any():
-            zp_t_outs, D_t_priv_raw, q_t_priv_raw, _ = _forward_branch_pruned(
-                self.private_branch_t, input_t,
-                self.predictors_priv_t,
-                cum_D_prev_list=None,
-                gumbel_tau=self.gumbel_tau,
-                is_common=False,
-                training=use_gumbel,
-                force_all_keep=force_all_keep)
-            zp_t_list = zp_t_outs
-            D_t_priv_list = D_t_priv_raw
-            q_t_priv_list = q_t_priv_raw
+        zp_rgb_outs, D_rgb_priv_raw, q_rgb_priv_raw, cum_D_rgb_priv_list = _forward_branch_pruned(
+            self.private_branch_rgb, input_rgb,
+            self.predictors_priv_rgb,
+            cum_D_prev_list=None,
+            gumbel_tau=self.gumbel_tau,
+            is_common=False,
+            training=use_gumbel,
+            force_all_keep=force_all_keep)
+        zp_rgb_list = zp_rgb_outs
+        D_rgb_priv_list = D_rgb_priv_raw
+        q_rgb_priv_list = q_rgb_priv_raw
 
-            for i in range(len(zp_t_list)):
-                if zp_t_list[i] is not None and D_t_priv_list[i] is not None:
-                    zp_t_list[i] = zp_t_list[i] * D_t_priv_list[i]
+        for i in range(len(zp_rgb_list)):
+            if zp_rgb_list[i] is not None and D_rgb_priv_list[i] is not None:
+                zp_rgb_list[i] = zp_rgb_list[i] * D_rgb_priv_list[i]
+
+        zp_t_outs, D_t_priv_raw, q_t_priv_raw, cum_D_t_priv_list = _forward_branch_pruned(
+            self.private_branch_t, input_t,
+            self.predictors_priv_t,
+            cum_D_prev_list=None,
+            gumbel_tau=self.gumbel_tau,
+            is_common=False,
+            training=use_gumbel,
+            force_all_keep=force_all_keep)
+        zp_t_list = zp_t_outs
+        D_t_priv_list = D_t_priv_raw
+        q_t_priv_list = q_t_priv_raw
+
+        for i in range(len(zp_t_list)):
+            if zp_t_list[i] is not None and D_t_priv_list[i] is not None:
+                zp_t_list[i] = zp_t_list[i] * D_t_priv_list[i]
 
         num_stages = len(self.embed_dims_list)
         zc_fused_list = []
@@ -3367,25 +3343,14 @@ class MiTMulABV9(_AblationBase):
         t_enhanced_list = []
 
         for i in range(num_stages):
-            if zc_rgb_list[i] is not None and zc_t_list[i] is not None:
-                q_rgb_i = q_rgb_list[i] if q_rgb_list[i] is not None else torch.ones(
-                    B, 1, zc_rgb_list[i].shape[2], zc_rgb_list[i].shape[3],
-                    device=zc_rgb_list[i].device)
-                q_t_i = q_t_list[i] if q_t_list[i] is not None else torch.ones(
-                    B, 1, zc_t_list[i].shape[2], zc_t_list[i].shape[3],
-                    device=zc_t_list[i].device)
-                zc_fused = self._quality_weighted_common_fusion(
-                    zc_rgb_list[i], zc_t_list[i], q_rgb_i, q_t_i)
-            elif zc_rgb_list[i] is not None:
-                zc_fused = zc_rgb_list[i]
-            elif zc_t_list[i] is not None:
-                zc_fused = zc_t_list[i]
-            else:
-                zc_fused = torch.zeros(
-                    B, self.embed_dims_list[i],
-                    zp_rgb_list[i].shape[2] if zp_rgb_list[i] is not None else 1,
-                    zp_rgb_list[i].shape[3] if zp_rgb_list[i] is not None else 1,
-                    device=input_rgb.device)
+            q_rgb_i = q_rgb_list[i] if q_rgb_list[i] is not None else torch.ones(
+                B, 1, zc_rgb_list[i].shape[2], zc_rgb_list[i].shape[3],
+                device=zc_rgb_list[i].device)
+            q_t_i = q_t_list[i] if q_t_list[i] is not None else torch.ones(
+                B, 1, zc_t_list[i].shape[2], zc_t_list[i].shape[3],
+                device=zc_t_list[i].device)
+            zc_fused = self._quality_weighted_common_fusion(
+                zc_rgb_list[i], zc_t_list[i], q_rgb_i, q_t_i)
             zc_fused = self.common_refine[i](zc_fused)
             zc_fused_list.append(zc_fused)
 
@@ -3393,54 +3358,50 @@ class MiTMulABV9(_AblationBase):
                 B, 1, zc_fused.shape[2], zc_fused.shape[3], device=zc_fused.device)
             D_gen_t = D_t_list[i] if D_t_list[i] is not None else torch.ones(
                 B, 1, zc_fused.shape[2], zc_fused.shape[3], device=zc_fused.device)
-            D_gen = torch.min(D_gen_rgb, D_gen_t)
 
-            q_rgb_priv_i = q_rgb_priv_list[i] if q_rgb_priv_list[i] is not None else torch.ones(
+            D_priv_rgb = D_rgb_priv_list[i] if D_rgb_priv_list[i] is not None else torch.ones(
+                B, 1, zc_fused.shape[2], zc_fused.shape[3], device=zc_fused.device)
+            D_priv_t = D_t_priv_list[i] if D_t_priv_list[i] is not None else torch.ones(
                 B, 1, zc_fused.shape[2], zc_fused.shape[3], device=zc_fused.device)
 
-            if zp_rgb_list[i] is not None and zc_fused.shape[2:] == zp_rgb_list[i].shape[2:]:
+            if zc_fused.shape[2:] == zp_rgb_list[i].shape[2:]:
                 if i < 2:
                     rgb_enhanced = self._simple_fuse_stage(
-                        zc_fused, zp_rgb_list[i], self.fuse_rgb[i], D_gen)
+                        zc_fused, zp_rgb_list[i], self.fuse_rgb[i])
                 else:
                     rgb_enhanced = self._mamba_fuse_stage(
-                        zc_fused, zp_rgb_list[i], self.fuse_rgb[i], D_gen)
-            elif zp_rgb_list[i] is not None:
-                rgb_enhanced = zp_rgb_list[i]
+                        zc_fused, zp_rgb_list[i], self.fuse_rgb[i], D_priv_rgb)
             else:
-                rgb_enhanced = zc_fused
+                rgb_enhanced = zp_rgb_list[i]
             rgb_enhanced_list.append(rgb_enhanced)
 
-            q_t_priv_i = q_t_priv_list[i] if q_t_priv_list[i] is not None else torch.ones(
-                B, 1, zc_fused.shape[2], zc_fused.shape[3], device=zc_fused.device)
-
-            if zp_t_list[i] is not None and zc_fused.shape[2:] == zp_t_list[i].shape[2:]:
+            if zc_fused.shape[2:] == zp_t_list[i].shape[2:]:
                 if i < 2:
                     t_enhanced = self._simple_fuse_stage(
-                        zc_fused, zp_t_list[i], self.fuse_t[i], D_gen)
+                        zc_fused, zp_t_list[i], self.fuse_t[i])
                 else:
                     t_enhanced = self._mamba_fuse_stage(
-                        zc_fused, zp_t_list[i], self.fuse_t[i], D_gen)
-            elif zp_t_list[i] is not None:
-                t_enhanced = zp_t_list[i]
+                        zc_fused, zp_t_list[i], self.fuse_t[i], D_priv_t)
             else:
-                t_enhanced = zc_fused
+                t_enhanced = zp_t_list[i]
             t_enhanced_list.append(t_enhanced)
 
         final_fused = self.final_fusion(rgb_enhanced_list, t_enhanced_list, zc_fused_list)
 
         all_D_for_loss = []
-        for d_list in [D_rgb_list, D_t_list, D_rgb_priv_list, D_t_priv_list]:
+        for d_list in [cum_D_rgb_list, cum_D_t_list,
+                       cum_D_rgb_priv_list, cum_D_t_priv_list]:
             all_D_for_loss.extend(d_list)
 
         return (zc_rgb_list, zc_t_list, zp_rgb_list, zp_t_list,
                 zc_fused_list, rgb_enhanced_list, t_enhanced_list,
                 final_fused, q_rgb_list, q_t_list,
-                has_rgb, has_t, both_present,
                 all_D_for_loss,
                 D_rgb_list, D_t_list,
                 D_rgb_priv_list, D_t_priv_list,
-                q_rgb_priv_list, q_t_priv_list)
+                q_rgb_priv_list, q_t_priv_list,
+                cum_D_rgb_list, cum_D_t_list,
+                cum_D_rgb_priv_list, cum_D_t_priv_list)
 
     def loss(self, inputs, data_samples):
         input_rgb = inputs[:, :3, :, :]
@@ -3455,11 +3416,12 @@ class MiTMulABV9(_AblationBase):
         (zc_rgb_list, zc_t_list, zp_rgb_list, zp_t_list,
          zc_fused_list, rgb_enhanced_list, t_enhanced_list,
          final_fused, q_rgb_list, q_t_list,
-         has_rgb, has_t, both_present,
          all_D_for_loss,
          D_rgb_list, D_t_list,
          D_rgb_priv_list, D_t_priv_list,
-         q_rgb_priv_list, q_t_priv_list) = clean_results
+         q_rgb_priv_list, q_t_priv_list,
+         cum_D_rgb_list, cum_D_t_list,
+         cum_D_rgb_priv_list, cum_D_t_priv_list) = clean_results
 
         losses = {}
 
@@ -3486,7 +3448,7 @@ class MiTMulABV9(_AblationBase):
                 zp_t_list, data_samples, self.train_cfg)
             losses.update(add_prefix(t_priv_loss, 't_private_decode'))
 
-        if self.loss_align_weight > 0 and both_present.any():
+        if self.loss_align_weight > 0:
             gt_labels = seg_label.squeeze(1).long()
             pad_mask = self._build_pad_mask(
                 data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
@@ -3516,12 +3478,28 @@ class MiTMulABV9(_AblationBase):
 
         if self.training:
             deg_results = self._train_with_degradation(input_rgb, input_ir)
-            deg_final, deg_rgb_list, deg_t_list, deg_both, deg_zc_fused, \
-                deg_q_rgb_list, deg_q_t_list = deg_results
+            deg_final, deg_rgb_list, deg_t_list, deg_zc_fused, \
+                deg_q_rgb_list, deg_q_t_list, \
+                deg_zp_rgb_list, deg_zp_t_list = deg_results
 
             deg_seg_loss = self.decode_head.loss(
                 deg_final, data_samples, self.train_cfg)
             losses['loss_deg_seg'] = sum(deg_seg_loss.values())
+
+            if self.common_decode_head is not None and deg_zc_fused is not None:
+                deg_common_loss = self.common_decode_head.loss(
+                    deg_zc_fused, data_samples, self.train_cfg)
+                losses['loss_deg_common_decode'] = self.aux_loss_weight * sum(deg_common_loss.values())
+
+            if self.rgb_private_decode_head is not None and deg_zp_rgb_list is not None:
+                deg_rgb_priv_loss = self.rgb_private_decode_head.loss(
+                    deg_zp_rgb_list, data_samples, self.train_cfg)
+                losses['loss_deg_rgb_private_decode'] = self.aux_loss_weight * sum(deg_rgb_priv_loss.values())
+
+            if self.t_private_decode_head is not None and deg_zp_t_list is not None:
+                deg_t_priv_loss = self.t_private_decode_head.loss(
+                    deg_zp_t_list, data_samples, self.train_cfg)
+                losses['loss_deg_t_private_decode'] = self.aux_loss_weight * sum(deg_t_priv_loss.values())
 
             if self.loss_distill_weight > 0 and phase >= 3:
                 clean_logits = self.decode_head.forward(final_fused)
@@ -3585,7 +3563,7 @@ class MiTMulABV9(_AblationBase):
                                                     mode='nearest')
                             q_distill = q_c * q_d
                             diff = F.smooth_l1_loss(
-                                zc_fused_list[i].detach(), deg_zc_fused[i],
+                                zc_fused_list[i], deg_zc_fused[i],
                                 reduction='none')
                             inv_loss = inv_loss + (q_distill * diff).sum() / (q_distill.sum() + 1e-6)
                             count += 1
@@ -3621,11 +3599,13 @@ class MiTMulABV9(_AblationBase):
         return loss / max(count, 1)
 
     def _train_with_degradation(self, input_rgb, input_ir):
-        deg_input_rgb, deg_input_ir = self._generate_degraded_inputs(input_rgb, input_ir)
+        deg_input_rgb, deg_input_ir, _, _ = self._generate_degraded_inputs(
+            input_rgb, input_ir)
 
         deg_results = self._extract_feat_single(deg_input_rgb, deg_input_ir)
-        return (deg_results[7], deg_results[5], deg_results[6], deg_results[12], deg_results[4],
-                deg_results[9], deg_results[10])
+        return (deg_results[7], deg_results[5], deg_results[6], deg_results[4],
+                deg_results[8], deg_results[9],
+                deg_results[2], deg_results[3])
 
     def _generate_degraded_inputs(self, input_rgb, input_ir):
         B, C, H, W = input_rgb.shape
@@ -3637,6 +3617,8 @@ class MiTMulABV9(_AblationBase):
 
         deg_rgb = input_rgb.clone()
         deg_ir = input_ir.clone()
+        deg_type_rgb = ['none'] * B
+        deg_type_t = ['none'] * B
 
         epoch = self.current_epoch if hasattr(self, 'current_epoch') else 0
         r = min(epoch / max(self.total_epochs, 1), 1.0)
@@ -3651,58 +3633,57 @@ class MiTMulABV9(_AblationBase):
             rand = random.random()
             if rand < p_missing:
                 if random.random() < 0.5:
-                    deg_rgb[b] = 0.0
+                    deg_rgb[b:b+1] = _apply_degradation(
+                        input_rgb[b:b+1], 'rgb', rgb_mean, rgb_std,
+                        deg_type='missing', level=5)
+                    deg_type_rgb[b] = 'missing'
                 else:
-                    deg_ir[b] = 0.0
+                    deg_ir[b:b+1] = _apply_degradation(
+                        input_ir[b:b+1], 'thermal', ir_mean, ir_std,
+                        deg_type='missing', level=5)
+                    deg_type_t[b] = 'missing'
             elif rand < p_missing + p_global:
                 level = _sample_level(global_levels)
                 if random.random() < 0.5:
                     deg_rgb[b:b+1] = _apply_degradation(
                         input_rgb[b:b+1], 'rgb', rgb_mean, rgb_std, level=level)
+                    deg_type_rgb[b] = 'global'
                 else:
                     deg_ir[b:b+1] = _apply_degradation(
                         input_ir[b:b+1], 'thermal', ir_mean, ir_std, level=level)
+                    deg_type_t[b] = 'global'
             else:
                 level = _sample_level(local_levels)
-                local_mask = _generate_local_mask(1, H, W, num_regions=3, device=device)
+                local_mask = _generate_local_mask(1, H, W, num_regions=3, device=device, level=level)
                 if random.random() < 0.5:
                     deg_rgb[b:b+1] = _apply_degradation(
                         input_rgb[b:b+1], 'rgb', rgb_mean, rgb_std,
                         level=level, is_local=True, local_mask=local_mask)
+                    deg_type_rgb[b] = 'local'
                 else:
                     deg_ir[b:b+1] = _apply_degradation(
                         input_ir[b:b+1], 'thermal', ir_mean, ir_std,
                         level=level, is_local=True, local_mask=local_mask)
+                    deg_type_t[b] = 'local'
 
-        return deg_rgb, deg_ir
+        return deg_rgb, deg_ir, deg_type_rgb, deg_type_t
 
     def encode_decode(self, inputs, batch_img_metas):
         input_rgb = inputs[:, :3, :, :]
         input_ir = inputs[:, 3:, :, :]
 
-        B = input_rgb.shape[0]
-        has_rgb = (input_rgb.abs().sum(dim=[1, 2, 3]) > 1e-6)
-        has_t = (input_ir.abs().sum(dim=[1, 2, 3]) > 1e-6)
-        both_present = has_rgb & has_t
-
         results = self._extract_feat_single(input_rgb, input_ir)
         (zc_rgb_list, zc_t_list, zp_rgb_list, zp_t_list,
          zc_fused_list, rgb_enhanced_list, t_enhanced_list,
          final_fused, q_rgb_list, q_t_list,
-         has_rgb, has_t, both_present,
          all_D_for_loss,
          D_rgb_list, D_t_list,
          D_rgb_priv_list, D_t_priv_list,
-         q_rgb_priv_list, q_t_priv_list) = results
+         q_rgb_priv_list, q_t_priv_list,
+         cum_D_rgb_list, cum_D_t_list,
+         cum_D_rgb_priv_list, cum_D_t_priv_list) = results
 
-        if both_present.all():
-            feats = final_fused
-        elif has_rgb.all() and not has_t.any():
-            feats = rgb_enhanced_list
-        elif has_t.all() and not has_rgb.any():
-            feats = t_enhanced_list
-        else:
-            feats = final_fused
+        feats = final_fused
 
         if self.with_neck:
             feats = self.neck(feats)

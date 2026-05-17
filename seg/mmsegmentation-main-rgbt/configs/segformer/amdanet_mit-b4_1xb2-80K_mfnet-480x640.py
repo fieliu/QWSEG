@@ -65,7 +65,9 @@ model = dict(
         embed_dim=16,
         norm_cfg=norm_cfg,
         align_corners=False,
-        loss_fusion=dict(type='FusionLoss', loss_weight=1.0)),
+        loss_fusion=dict(type='FusionLoss', loss_weight=1.0,
+                         mean=[123.675, 116.28, 103.53, 123.675, 116.28, 103.53],
+                         std=[58.395, 57.12, 57.375, 58.395, 57.12, 57.375])),
     test_cfg=dict(mode='whole'))
 
 optim_wrapper = dict(

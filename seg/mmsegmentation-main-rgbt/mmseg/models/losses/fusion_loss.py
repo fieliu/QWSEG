@@ -16,7 +16,7 @@ def RGB2YCrCb(input_im):
     Y = torch.unsqueeze(Y, 1)
     Cr = torch.unsqueeze(Cr, 1)
     Cb = torch.unsqueeze(Cb, 1)
-    temp = torch.cat([Y, Cr, Cb], dim=1).cuda()
+    temp = torch.cat([Y, Cr, Cb], dim=1).to(input_im.device)
     out = (
         temp.reshape(
             list(input_im.size())[0],
@@ -39,8 +39,8 @@ def Sobelxy(x):
                 [-1, -2, -1]]
     kernelx = torch.FloatTensor(kernelx).unsqueeze(0).unsqueeze(0)
     kernely = torch.FloatTensor(kernely).unsqueeze(0).unsqueeze(0)
-    weightx = nn.Parameter(data=kernelx, requires_grad=False).cuda()
-    weighty = nn.Parameter(data=kernely, requires_grad=False).cuda()
+    weightx = nn.Parameter(data=kernelx, requires_grad=False).to(x.device)
+    weighty = nn.Parameter(data=kernely, requires_grad=False).to(x.device)
     sobelx = F.conv2d(x, weightx, padding=1)
     sobely = F.conv2d(x, weighty, padding=1)
     return sobelx, sobely
@@ -48,13 +48,32 @@ def Sobelxy(x):
 
 @MODELS.register_module()
 class FusionLoss(nn.Module):
-    def __init__(self, loss_weight=1.0, loss_name='loss_fusion'):
+    def __init__(self, loss_weight=1.0, loss_name='loss_fusion',
+                 mean=None, std=None):
         super().__init__()
         self.l1_loss = nn.L1Loss()
         self.loss_weight = loss_weight
         self._loss_name = loss_name
+        if mean is not None:
+            self.register_buffer('mean', torch.tensor(mean).view(1, -1, 1, 1))
+        else:
+            self.mean = None
+        if std is not None:
+            self.register_buffer('std', torch.tensor(std).view(1, -1, 1, 1))
+        else:
+            self.std = None
+
+    def _denormalize(self, x):
+        if self.mean is not None and self.std is not None:
+            m = self.mean[:, :x.shape[1], :, :]
+            s = self.std[:, :x.shape[1], :, :]
+            x = x * s + m
+        return x.clamp(0, 255) / 255.0
 
     def forward(self, input_vis, input_ir, fuse_output, mask=None):
+        input_vis = self._denormalize(input_vis)
+        input_ir = self._denormalize(input_ir)
+
         if mask is not None:
             Fuse = fuse_output * mask
         else:

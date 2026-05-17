@@ -766,11 +766,7 @@ class TrainVisHook(Hook):
                      final_fused, q_rgb_maps, q_t_maps) = clean_results
 
                     deg_inputs = model._generate_degraded_inputs(input_rgb, input_ir)
-                    if deg_inputs is None:
-                        deg_rgb, deg_t = input_rgb, input_ir
-                        deg_type_rgb, deg_type_t = 'none', 'none'
-                    else:
-                        deg_rgb, deg_t, deg_type_rgb, deg_type_t = deg_inputs
+                    deg_rgb, deg_t, deg_type_rgb, deg_type_t = deg_inputs
                     deg_results = model._extract_feat_single(deg_rgb, deg_t)
                     (zc_rgb_deg, zc_t_deg, zp_rgb_deg, zp_t_deg,
                      zc_fused_deg, rgb_pf_deg, t_pf_deg,
@@ -983,26 +979,24 @@ class TrainVisHook(Hook):
                     (zc_rgb, zc_t, zp_rgb, zp_t,
                      zc_fused, rgb_enh, t_enh,
                      final_fused, q_rgb_maps, q_t_maps,
-                     has_rgb, has_t, both_present,
                      all_D_for_loss,
                      D_rgb_list, D_t_list,
                      D_rgb_priv_list, D_t_priv_list,
-                     q_rgb_priv_list, q_t_priv_list) = clean_results
+                     q_rgb_priv_list, q_t_priv_list,
+                     cum_D_rgb_list, cum_D_t_list,
+                     cum_D_rgb_priv_list, cum_D_t_priv_list) = clean_results
 
                     deg_inputs = model._generate_degraded_inputs(input_rgb, input_ir)
-                    if deg_inputs is None:
-                        deg_rgb, deg_t = input_rgb, input_ir
-                        deg_type_rgb, deg_type_t = 'none', 'none'
-                    else:
-                        deg_rgb, deg_t, deg_type_rgb, deg_type_t = deg_inputs
+                    deg_rgb, deg_t, deg_type_rgb, deg_type_t = deg_inputs
                     deg_results = model._extract_feat_single(deg_rgb, deg_t)
                     (zc_rgb_deg, zc_t_deg, zp_rgb_deg, zp_t_deg,
                      zc_fused_deg, rgb_enh_deg, t_enh_deg,
                      final_fused_deg, q_rgb_deg, q_t_deg,
-                     has_rgb_deg, has_t_deg, both_present_deg,
                      _, D_rgb_deg, D_t_deg,
                      D_rgb_priv_deg, D_t_priv_deg,
-                     q_rgb_priv_deg, q_t_priv_deg) = deg_results
+                     q_rgb_priv_deg, q_t_priv_deg,
+                     cum_D_rgb_deg, cum_D_t_deg,
+                     cum_D_rgb_priv_deg, cum_D_t_priv_deg) = deg_results
 
                 return dict(
                     zc_rgb=zc_rgb, zc_t=zc_t,
@@ -1014,6 +1008,8 @@ class TrainVisHook(Hook):
                     D_rgb=D_rgb_list, D_t=D_t_list,
                     D_rgb_priv=D_rgb_priv_list, D_t_priv=D_t_priv_list,
                     q_rgb_priv=q_rgb_priv_list, q_t_priv=q_t_priv_list,
+                    cum_D_rgb=cum_D_rgb_list, cum_D_t=cum_D_t_list,
+                    cum_D_rgb_priv=cum_D_rgb_priv_list, cum_D_t_priv=cum_D_t_priv_list,
                     deg_rgb_img=deg_rgb, deg_t_img=deg_t,
                     deg_type_rgb=deg_type_rgb[0] if isinstance(deg_type_rgb, list) else deg_type_rgb,
                     deg_type_t=deg_type_t[0] if isinstance(deg_type_t, list) else deg_type_t,
@@ -1026,6 +1022,8 @@ class TrainVisHook(Hook):
                     D_rgb_deg=D_rgb_deg, D_t_deg=D_t_deg,
                     D_rgb_priv_deg=D_rgb_priv_deg, D_t_priv_deg=D_t_priv_deg,
                     q_rgb_priv_deg=q_rgb_priv_deg, q_t_priv_deg=q_t_priv_deg,
+                    cum_D_rgb_deg=cum_D_rgb_deg, cum_D_t_deg=cum_D_t_deg,
+                    cum_D_rgb_priv_deg=cum_D_rgb_priv_deg, cum_D_t_priv_deg=cum_D_t_priv_deg,
                 )
             elif model_type in ('ab_v5', 'ab_v6', 'ab_v7', 'ab_v8'):
                 input_rgb = proc_inputs[:, :3, :, :]
@@ -2313,12 +2311,12 @@ class TrainVisHook(Hook):
     def _create_v9_ablation_quality_vis(self, feats, img_h=None, img_w=None):
         q_rgb_maps = feats['q_rgb_maps']
         q_t_maps = feats['q_t_maps']
-        D_rgb_list = feats['D_rgb']
-        D_t_list = feats['D_t']
+        cum_D_rgb_list = feats.get('cum_D_rgb', feats['D_rgb'])
+        cum_D_t_list = feats.get('cum_D_t', feats['D_t'])
         q_rgb_priv_list = feats['q_rgb_priv']
         q_t_priv_list = feats['q_t_priv']
-        D_rgb_priv_list = feats['D_rgb_priv']
-        D_t_priv_list = feats['D_t_priv']
+        cum_D_rgb_priv_list = feats.get('cum_D_rgb_priv', feats['D_rgb_priv'])
+        cum_D_t_priv_list = feats.get('cum_D_t_priv', feats['D_t_priv'])
 
         if img_h is not None and img_w is not None:
             h, w = img_h, img_w
@@ -2347,10 +2345,10 @@ class TrainVisHook(Hook):
             rgb_priv_hm = _quality_to_red_blue(q_rgb_priv_np, h, w)
             t_priv_hm = _quality_to_red_blue(q_t_priv_np, h, w)
 
-            D_rgb_np = _safe_D_np(D_rgb_list[i], h, w)
-            D_t_np = _safe_D_np(D_t_list[i], h, w)
-            D_rgb_priv_np = _safe_D_np(D_rgb_priv_list[i], h, w)
-            D_t_priv_np = _safe_D_np(D_t_priv_list[i], h, w)
+            D_rgb_np = _safe_D_np(cum_D_rgb_list[i], h, w)
+            D_t_np = _safe_D_np(cum_D_t_list[i], h, w)
+            D_rgb_priv_np = _safe_D_np(cum_D_rgb_priv_list[i], h, w)
+            D_t_priv_np = _safe_D_np(cum_D_t_priv_list[i], h, w)
 
             D_rgb_bw = _threshold_to_bw(
                 (D_rgb_np >= self.mask_threshold).astype(np.float32), h, w)
@@ -2374,12 +2372,12 @@ class TrainVisHook(Hook):
                                              img_w=None):
         q_rgb_deg = feats['q_rgb_deg']
         q_t_deg = feats['q_t_deg']
-        D_rgb_deg = feats['D_rgb_deg']
-        D_t_deg = feats['D_t_deg']
+        cum_D_rgb_deg = feats.get('cum_D_rgb_deg', feats['D_rgb_deg'])
+        cum_D_t_deg = feats.get('cum_D_t_deg', feats['D_t_deg'])
         q_rgb_priv_deg = feats['q_rgb_priv_deg']
         q_t_priv_deg = feats['q_t_priv_deg']
-        D_rgb_priv_deg = feats['D_rgb_priv_deg']
-        D_t_priv_deg = feats['D_t_priv_deg']
+        cum_D_rgb_priv_deg = feats.get('cum_D_rgb_priv_deg', feats['D_rgb_priv_deg'])
+        cum_D_t_priv_deg = feats.get('cum_D_t_priv_deg', feats['D_t_priv_deg'])
 
         if img_h is not None and img_w is not None:
             h, w = img_h, img_w
@@ -2408,10 +2406,10 @@ class TrainVisHook(Hook):
             rgb_priv_hm = _quality_to_red_blue(q_rgb_priv_np, h, w)
             t_priv_hm = _quality_to_red_blue(q_t_priv_np, h, w)
 
-            D_rgb_np = _safe_D_np(D_rgb_deg[i], h, w)
-            D_t_np = _safe_D_np(D_t_deg[i], h, w)
-            D_rgb_priv_np = _safe_D_np(D_rgb_priv_deg[i], h, w)
-            D_t_priv_np = _safe_D_np(D_t_priv_deg[i], h, w)
+            D_rgb_np = _safe_D_np(cum_D_rgb_deg[i], h, w)
+            D_t_np = _safe_D_np(cum_D_t_deg[i], h, w)
+            D_rgb_priv_np = _safe_D_np(cum_D_rgb_priv_deg[i], h, w)
+            D_t_priv_np = _safe_D_np(cum_D_t_priv_deg[i], h, w)
 
             D_rgb_bw = _threshold_to_bw(
                 (D_rgb_np >= self.mask_threshold).astype(np.float32), h, w)

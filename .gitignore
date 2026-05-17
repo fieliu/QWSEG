@@ -1,0 +1,103 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution
+*.egg-info/
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Pytorch model weights
+*.pth
+*.pt
+
+# Pretrained models & third-party code
+pretrain/
+**/pretrain/
+
+# Training outputs
+work_dirs/
+**/work_dirs/
+
+# Logs / server logs
+*.log
+sever_log/
+**/sever_log/
+
+# Visualization outputs
+vis_data/
+**/vis_data/
+
+# Profile traces
+*.prof
+profile_*.json
+
+# Cache / mim
+.cache/
+**/.mim/
+
+# Build artifacts
+build/
+**/build/
+*.so
+
+# Data (symlink or local)
+data/
+**/data/
+
+# Docs & papers (generated files)
+paper/
+*.docx
+
+# Images (not code)
+*.png
+*.jpg
+*.jpeg
+
+# Archives
+*.zip
+*.tar
+*.gz
+
+# Temporary / OS files
+*.tmp
+*:Zone.Identifier
+
+# Claude local config
+.claude/
+
+# Eval outputs
+eval/
+**/eval/
+
+# Static assets (docs/demo/resources)
+resources/
+**/resources/
+demo/
+**/demo/
+docs/
+**/docs/
+
+# Third-party projects
+projects/
+**/projects/
+
+# Notebooks (often with embedded images)
+*.ipynb

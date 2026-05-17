@@ -1,0 +1,80 @@
+"""
+RGB-T语义分割 - V4 QualityPruning (解耦 + 退化增强 + 质量网络) - FMB 480x480
+
+架构说明：
+- 在V3基础上加入质量网络 (QualityNetwork)
+- 质量网络：双分支(RGB/Thermal独立)，多尺度局部差异感知，逐token质量评分
+- 损失：V2全部损失 + 质量锚定损失(MSE) + 空间多样性损失 + 高退化天花板损失
+- 训练时使用RGBTModalDegradation退化数据增强管道（与鲁棒性测试一致）
+- 训练epoch: 300
+- 数据集：FMB_ALL (15类)
+- 输入尺寸：480x480
+"""
+
+_base_ = [
+    './mae-base_upernet_rgbt_v2_disentangle_8xb2-amp-200e_fmb-480x480.py',
+]
+
+custom_imports = dict(
+    imports=['mmseg.models.backbones.lightweight_mae_branch',
+             'mmseg.models.segmentors.rgbt_v1_baseline',
+             'mmseg.models.segmentors.rgbt_v2_disentangle',
+             'mmseg.models.segmentors.rgbt_v4_quality_pruning',
+             'mmseg.models.utils.quality_network',
+             'mmseg.datasets.fmb',
+             'mmseg.datasets.transforms.loading',
+             'mmseg.datasets.transforms.rgbt_augmentation'],
+    allow_failed_imports=False)
+
+crop_size = (480, 480)
+
+model = dict(
+    type='RGBTv4QualityPruning',
+    quality_network=dict(
+        type='QualityNetwork',
+        embed_dim=768,
+        proj_dim=128,
+        num_heads=4,
+        num_scales=3),
+    loss_quality_weight=0.1,
+    loss_anchor_weight=0.5,
+    quality_prune_threshold=0.3,
+)
+
+train_pipeline = [
+    dict(type='LoadRGBTImageFromFile',
+         ir_replace_src='FMB_ALL/FMB',
+         ir_replace_dst='FMB_ALL/FMB_T'),
+    dict(type='LoadAnnotations', reduce_zero_label=False),
+    dict(
+        type='RandomResize',
+        scale=(1600, 480),
+        ratio_range=(0.5, 2.0),
+        keep_ratio=True),
+    dict(type='RandomCrop', crop_size=crop_size, cat_max_ratio=0.75),
+    dict(type='RandomFlip', prob=0.5),
+    dict(type='PackSegInputs')
+]
+
+max_epochs = 300
+
+train_dataloader = dict(
+    dataset=dict(pipeline=train_pipeline))
+
+param_scheduler = [
+    dict(
+        type='LinearLR', start_factor=0.001, by_epoch=True, begin=0,
+        end=4),
+    dict(
+        type='PolyLR',
+        eta_min=0.0,
+        power=1.0,
+        begin=4,
+        end=max_epochs,
+        by_epoch=True)
+]
+
+train_cfg = dict(
+    type='EpochBasedTrainLoop',
+    max_epochs=max_epochs,
+    val_interval=10)

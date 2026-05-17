@@ -1,0 +1,686 @@
+import logging
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import List, Optional
+from mmengine.logging import print_log
+
+from mmseg.registry import MODELS
+from mmseg.utils import (ConfigType, OptConfigType, OptMultiConfig,
+                         OptSampleList, SampleList, add_prefix)
+from .base import BaseSegmentor
+from .rgbt_v2_disentangle import (compute_hsic, CrossAttentionFusion)
+from ..utils.quality_network_v2 import QualityNetworkV2
+from ..utils.quality_network import (HighDegCeilingLoss, QualityAnchorLoss,
+                                      SpatialDiversityLoss)
+
+
+def compute_quality_guided_alignment(zc_rgb, zc_t, q_rgb, q_t, temperature=0.07):
+    B, N, D = zc_rgb.shape
+    zc_rgb_norm = F.normalize(zc_rgb, dim=-1)
+    zc_t_norm = F.normalize(zc_t, dim=-1)
+
+    quality_weight = (q_rgb + q_t) / 2.0
+
+    sim = (zc_rgb_norm * zc_t_norm).sum(dim=-1)
+
+    pos_sim = sim * quality_weight
+    neg_sim = sim * (1 - quality_weight)
+
+    loss = -pos_sim.mean() + neg_sim.mean() * 0.1
+    loss = loss / temperature
+
+    return loss
+
+
+def compute_quality_weighted_invariance(zc_rgb, zc_t, q_rgb, q_t, stage_weights=None):
+    B, N, D = zc_rgb.shape
+    zc_rgb_norm = F.normalize(zc_rgb, dim=-1)
+    zc_t_norm = F.normalize(zc_t, dim=-1)
+
+    quality_weight = (q_rgb + q_t) / 2.0
+
+    cos_sim = (zc_rgb_norm * zc_t_norm).sum(dim=-1)
+    cos_dist = 1 - cos_sim
+
+    weighted_cos_dist = cos_dist * quality_weight
+    loss = weighted_cos_dist.mean()
+
+    return loss
+
+
+class GumbelSoftmaxMask(nn.Module):
+
+    def __init__(self, initial_tau=1.0, min_tau=0.1, anneal_rate=0.01):
+        super().__init__()
+        self.tau = initial_tau
+        self.min_tau = min_tau
+        self.anneal_rate = anneal_rate
+
+    def forward(self, quality_scores, hard=False):
+        keep_logits = torch.log(quality_scores.clamp(min=1e-6))
+        drop_logits = torch.log((1 - quality_scores).clamp(min=1e-6))
+        logits = torch.stack([keep_logits, drop_logits], dim=-1)
+
+        mask = F.gumbel_softmax(logits, tau=self.tau, hard=hard)
+        keep_mask = mask[..., 0]
+
+        return keep_mask
+
+    def anneal(self, epoch):
+        self.tau = max(self.min_tau,
+                       self.tau * math.exp(-self.anneal_rate * epoch))
+
+
+@MODELS.register_module()
+class RGBTv5QualityJoint(BaseSegmentor):
+
+    def __init__(self,
+                 universal_branch: ConfigType,
+                 private_branch_rgb: ConfigType,
+                 private_branch_t: ConfigType,
+                 quality_network: ConfigType,
+                 decode_head: ConfigType,
+                 zc_seg_head: ConfigType,
+                 neck: OptConfigType = None,
+                 auxiliary_head: OptConfigType = None,
+                 train_cfg: OptConfigType = None,
+                 test_cfg: OptConfigType = None,
+                 data_preprocessor: OptConfigType = None,
+                 pretrained: Optional[str] = None,
+                 init_cfg: OptMultiConfig = None,
+                 quality_pretrained: Optional[str] = None,
+                 loss_seg_zc_weight=0.3,
+                 loss_modal_weight=0.2,
+                 loss_disentangle_weights=(0.1, 0.2, 0.3, 0.4),
+                 loss_invariance_weight=0.001,
+                 loss_quality_reg_weight=0.05,
+                 quality_prune_threshold=0.3,
+                 early_epoch=30,
+                 mid_epoch=60,
+                 gumbel_initial_tau=1.0,
+                 gumbel_min_tau=0.1,
+                 gumbel_anneal_rate=0.01,
+                 invariance_stage_weights=(0.5, 0.7, 1.0, 1.5)):
+        super().__init__(
+            data_preprocessor=data_preprocessor, init_cfg=init_cfg)
+
+        if pretrained is not None:
+            universal_branch['pretrained'] = pretrained
+
+        self.universal_branch = MODELS.build(universal_branch)
+        self.private_branch_rgb = MODELS.build(private_branch_rgb)
+        self.private_branch_t = MODELS.build(private_branch_t)
+        self.quality_network = MODELS.build(quality_network)
+
+        if neck is not None:
+            self.neck = MODELS.build(neck)
+
+        self._init_decode_head(decode_head)
+        self._init_zc_seg_head(zc_seg_head)
+        self._init_auxiliary_head(auxiliary_head)
+
+        num_stages = 4
+        self.cross_attn_rgb = nn.ModuleList(
+            [CrossAttentionFusion(embed_dim=768)
+             for _ in range(num_stages)])
+        self.cross_attn_t = nn.ModuleList(
+            [CrossAttentionFusion(embed_dim=768)
+             for _ in range(num_stages)])
+
+        self.loss_seg_zc_weight = loss_seg_zc_weight
+        self.loss_modal_weight = loss_modal_weight
+        self.loss_disentangle_weights = list(loss_disentangle_weights)
+        self.loss_invariance_weight = loss_invariance_weight
+        self.loss_quality_reg_weight = loss_quality_reg_weight
+
+        self.quality_prune_threshold = quality_prune_threshold
+        self.early_epoch = early_epoch
+        self.mid_epoch = mid_epoch
+        self.invariance_stage_weights = list(invariance_stage_weights)
+
+        self.gumbel_mask = GumbelSoftmaxMask(
+            initial_tau=gumbel_initial_tau,
+            min_tau=gumbel_min_tau,
+            anneal_rate=gumbel_anneal_rate)
+
+        self.quality_ceiling_fn = HighDegCeilingLoss(ceiling=0.15)
+        self.quality_anchor_fn = QualityAnchorLoss(
+            clean_target=0.8, deg_target=0.15)
+        self.spatial_diversity_fn = SpatialDiversityLoss(min_std=0.08)
+
+        self.train_cfg = train_cfg
+        self.test_cfg = test_cfg
+
+        self._current_epoch = 0
+
+        if quality_pretrained is not None:
+            self._load_quality_pretrained(quality_pretrained)
+
+        assert self.with_decode_head
+
+    def init_weights(self):
+        if self.init_cfg is not None and 'checkpoint' in self.init_cfg:
+            checkpoint_path = self.init_cfg['checkpoint']
+            print_log(
+                f'Loading checkpoint from: {checkpoint_path}',
+                logger='current')
+
+            try:
+                ckpt = torch.load(checkpoint_path, map_location='cpu')
+                if 'state_dict' in ckpt:
+                    state_dict = ckpt['state_dict']
+                elif 'model' in ckpt:
+                    state_dict = ckpt['model']
+                else:
+                    state_dict = ckpt
+
+                new_state_dict = {}
+                loaded_keys = []
+                skipped_keys = []
+
+                for k, v in state_dict.items():
+                    if k.startswith('backbone.'):
+                        new_key = 'universal_branch.' + k
+                    elif k.startswith('neck.'):
+                        new_key = 'universal_branch.' + k
+                    elif k.startswith('decode_head.'):
+                        new_key = 'universal_branch.' + k
+                    elif k.startswith('auxiliary_head.'):
+                        continue
+                    else:
+                        new_key = k
+
+                    if new_key in self.state_dict().keys():
+                        if self.state_dict()[new_key].shape == v.shape:
+                            new_state_dict[new_key] = v
+                            loaded_keys.append(new_key)
+                        else:
+                            skipped_keys.append(
+                                (new_key, v.shape,
+                                 self.state_dict()[new_key].shape))
+
+                print_log(
+                    f'Loaded {len(loaded_keys)} keys from checkpoint',
+                    logger='current')
+                if skipped_keys:
+                    print_log(
+                        f'Skipped {len(skipped_keys)} keys due to shape '
+                        f'mismatch:', logger='current')
+                    for key, src_shape, dst_shape in skipped_keys[:10]:
+                        print_log(
+                            f'  {key}: {src_shape} -> {dst_shape}',
+                            logger='current')
+
+                self.load_state_dict(new_state_dict, strict=False)
+
+                print_log(
+                    'Successfully initialized universal branch from checkpoint',
+                    logger='current')
+
+            except Exception as e:
+                print_log(
+                    f'Failed to load checkpoint: {e}', logger='current',
+                    level=logging.WARNING)
+                super().init_weights()
+        else:
+            super().init_weights()
+
+    def _load_quality_pretrained(self, path):
+        import os
+        if not os.path.exists(path):
+            return
+        ckpt = torch.load(path, map_location='cpu')
+        if 'model_state_dict' in ckpt:
+            state_dict = ckpt['model_state_dict']
+        else:
+            state_dict = ckpt
+        quality_state = {}
+        for k, v in state_dict.items():
+            if k.startswith('quality_network.'):
+                quality_state[k.replace('quality_network.', '')] = v
+            else:
+                quality_state[k] = v
+        missing, unexpected = self.quality_network.load_state_dict(
+            quality_state, strict=False)
+        if missing:
+            logging.getLogger(__name__).warning(
+                f'Quality network missing keys: {missing}')
+        if unexpected:
+            logging.getLogger(__name__).warning(
+                f'Quality network unexpected keys: {unexpected}')
+
+    def set_epoch(self, epoch):
+        self._current_epoch = epoch
+
+    def _init_decode_head(self, decode_head: ConfigType) -> None:
+        self.decode_head = MODELS.build(decode_head)
+        self.align_corners = self.decode_head.align_corners
+        self.num_classes = self.decode_head.num_classes
+        self.out_channels = self.decode_head.out_channels
+
+    def _init_zc_seg_head(self, zc_seg_head: ConfigType) -> None:
+        self.zc_seg_head = MODELS.build(zc_seg_head)
+
+    def _init_auxiliary_head(self, auxiliary_head: OptConfigType) -> None:
+        if auxiliary_head is not None:
+            if isinstance(auxiliary_head, list):
+                self.auxiliary_head = nn.ModuleList()
+                for head_cfg in auxiliary_head:
+                    self.auxiliary_head.append(MODELS.build(head_cfg))
+            else:
+                self.auxiliary_head = MODELS.build(auxiliary_head)
+
+    def _get_shared_embeddings(self, x):
+        backbone = self.universal_branch.backbone
+        tokens, hw_shape = backbone.patch_embed(x)
+        return tokens, hw_shape
+
+    def _add_cls_pos_embed(self, tokens):
+        backbone = self.universal_branch.backbone
+        B = tokens.shape[0]
+        cls_tokens = backbone.cls_token.expand(B, -1, -1)
+        tokens = torch.cat((cls_tokens, tokens), dim=1)
+        tokens = tokens + backbone.pos_embed
+        return tokens
+
+    def _run_universal_stages(self, tokens, hw_shape):
+        backbone = self.universal_branch.backbone
+        outs = []
+        for i, layer in enumerate(backbone.layers):
+            tokens = layer(tokens)
+            if i == len(backbone.layers) - 1:
+                if backbone.final_norm:
+                    tokens = backbone.norm1(tokens)
+            if i in backbone.out_indices:
+                out = tokens[:, 1:]
+                B_out, _, C = out.shape
+                out = out.reshape(B_out, hw_shape[0], hw_shape[1],
+                                  C).permute(0, 3, 1, 2).contiguous()
+                outs.append(out)
+        return outs
+
+    def _get_pruning_strategy(self):
+        epoch = self._current_epoch
+        if epoch < self.early_epoch:
+            return 'soft_mask'
+        elif epoch < self.mid_epoch:
+            return 'gumbel'
+        else:
+            return 'mask_attention'
+
+    def _apply_token_pruning(self, tokens, quality_scores, hw_shape):
+        strategy = self._get_pruning_strategy()
+
+        if strategy == 'soft_mask':
+            weights = quality_scores.unsqueeze(-1)
+            pruned_tokens = tokens * weights
+            return pruned_tokens, quality_scores
+
+        elif strategy == 'gumbel':
+            keep_mask = self.gumbel_mask(quality_scores, hard=False)
+            pruned_tokens = tokens * keep_mask.unsqueeze(-1)
+            return pruned_tokens, keep_mask
+
+        elif strategy == 'mask_attention':
+            keep_mask = (quality_scores >= self.quality_prune_threshold).float()
+            pruned_tokens = tokens * keep_mask.unsqueeze(-1)
+            return pruned_tokens, keep_mask
+
+        return tokens, quality_scores
+
+    def extract_feat(self, inputs: torch.Tensor):
+        B, C, H, W = inputs.shape
+        assert C == 6, f'Input should be 6-channel (RGB+Thermal), got {C}'
+
+        input_rgb = inputs[:, :3, :, :]
+        input_ir = inputs[:, 3:, :, :]
+
+        rgb_tokens, hw_shape = self._get_shared_embeddings(input_rgb)
+        t_tokens, _ = self._get_shared_embeddings(input_ir)
+
+        rgb_tokens_with_cls = self._add_cls_pos_embed(rgb_tokens)
+        t_tokens_with_cls = self._add_cls_pos_embed(t_tokens)
+
+        zp_rgb_list = self.private_branch_rgb(rgb_tokens_with_cls, hw_shape)
+        zp_t_list = self.private_branch_t(t_tokens_with_cls, hw_shape)
+
+        tokens_combined = torch.cat(
+            [rgb_tokens_with_cls, t_tokens_with_cls], dim=0)
+        zc_combined = self._run_universal_stages(
+            tokens_combined, hw_shape)
+        zc_rgb_list = [f[:B] for f in zc_combined]
+        zc_t_list = [f[B:] for f in zc_combined]
+
+        zc_rgb_tokens = zc_rgb_list[-1].flatten(2).transpose(1, 2)
+        zc_t_tokens = zc_t_list[-1].flatten(2).transpose(1, 2)
+        q_rgb = self.quality_network.forward_rgb(zc_rgb_tokens)
+        q_t = self.quality_network.forward_thermal(zc_t_tokens)
+
+        num_stages = len(zc_rgb_list)
+        assert len(zp_rgb_list) == num_stages
+
+        zc_fused_feats = []
+        for i in range(num_stages):
+            zc_fused_feats.append(zc_rgb_list[i] + zc_t_list[i])
+
+        rgb_keep_mask = (q_rgb >= self.quality_prune_threshold).float()
+        t_keep_mask = (q_t >= self.quality_prune_threshold).float()
+
+        fused_feats = []
+        for i in range(num_stages):
+            H_i, W_i = zc_rgb_list[i].shape[-2:]
+            zc_sum_tokens = zc_fused_feats[i].flatten(2).transpose(1, 2)
+            zp_rgb_tokens = zp_rgb_list[i].flatten(2).transpose(1, 2)
+            zp_t_tokens = zp_t_list[i].flatten(2).transpose(1, 2)
+
+            pruned_zp_rgb = zp_rgb_tokens * rgb_keep_mask.unsqueeze(-1)
+            pruned_zp_t = zp_t_tokens * t_keep_mask.unsqueeze(-1)
+
+            fused_rgb_tokens = self.cross_attn_rgb[i](
+                zc_sum_tokens, pruned_zp_rgb, pruned_zp_rgb)
+            fused_t_tokens = self.cross_attn_t[i](
+                fused_rgb_tokens, pruned_zp_t, pruned_zp_t)
+
+            fused_feat_i = fused_t_tokens.permute(
+                0, 2, 1).reshape(B, 768, H_i, W_i)
+            fused_feats.append(fused_feat_i)
+
+        if self.with_neck:
+            fused_feats = self.neck(fused_feats)
+            zc_fused_feats_neck = self.neck(zc_fused_feats)
+        else:
+            zc_fused_feats_neck = zc_fused_feats
+
+        return (zc_rgb_list, zc_t_list, zp_rgb_list, zp_t_list,
+                zc_fused_feats_neck, fused_feats, q_rgb, q_t)
+
+    def extract_feat_train(self, inputs: torch.Tensor):
+        B, C, H, W = inputs.shape
+        assert C == 6, f'Input should be 6-channel (RGB+Thermal), got {C}'
+
+        input_rgb = inputs[:, :3, :, :]
+        input_ir = inputs[:, 3:, :, :]
+
+        rgb_tokens, hw_shape = self._get_shared_embeddings(input_rgb)
+        t_tokens, _ = self._get_shared_embeddings(input_ir)
+
+        rgb_tokens_with_cls = self._add_cls_pos_embed(rgb_tokens)
+        t_tokens_with_cls = self._add_cls_pos_embed(t_tokens)
+
+        zp_rgb_list = self.private_branch_rgb(rgb_tokens_with_cls, hw_shape)
+        zp_t_list = self.private_branch_t(t_tokens_with_cls, hw_shape)
+
+        tokens_combined = torch.cat(
+            [rgb_tokens_with_cls, t_tokens_with_cls], dim=0)
+        zc_combined = self._run_universal_stages(
+            tokens_combined, hw_shape)
+        zc_rgb_list = [f[:B] for f in zc_combined]
+        zc_t_list = [f[B:] for f in zc_combined]
+
+        zc_rgb_tokens = zc_rgb_list[-1].flatten(2).transpose(1, 2)
+        zc_t_tokens = zc_t_list[-1].flatten(2).transpose(1, 2)
+        q_rgb = self.quality_network.forward_rgb(zc_rgb_tokens)
+        q_t = self.quality_network.forward_thermal(zc_t_tokens)
+
+        num_stages = len(zc_rgb_list)
+        assert len(zp_rgb_list) == num_stages
+
+        zc_fused_feats = []
+        for i in range(num_stages):
+            zc_fused_feats.append(zc_rgb_list[i] + zc_t_list[i])
+
+        fused_feats = []
+        for i in range(num_stages):
+            H_i, W_i = zc_rgb_list[i].shape[-2:]
+            zc_sum_tokens = zc_fused_feats[i].flatten(2).transpose(1, 2)
+            zp_rgb_tokens = zp_rgb_list[i].flatten(2).transpose(1, 2)
+            zp_t_tokens = zp_t_list[i].flatten(2).transpose(1, 2)
+
+            pruned_zp_rgb, rgb_weights = self._apply_token_pruning(
+                zp_rgb_tokens, q_rgb, hw_shape)
+            pruned_zp_t, t_weights = self._apply_token_pruning(
+                zp_t_tokens, q_t, hw_shape)
+
+            fused_rgb_tokens = self.cross_attn_rgb[i](
+                zc_sum_tokens, pruned_zp_rgb, pruned_zp_rgb)
+            fused_t_tokens = self.cross_attn_t[i](
+                fused_rgb_tokens, pruned_zp_t, pruned_zp_t)
+
+            fused_feat_i = fused_t_tokens.permute(
+                0, 2, 1).reshape(B, 768, H_i, W_i)
+            fused_feats.append(fused_feat_i)
+
+        if self.with_neck:
+            fused_feats = self.neck(fused_feats)
+            zc_fused_feats_neck = self.neck(zc_fused_feats)
+        else:
+            zc_fused_feats_neck = zc_fused_feats
+
+        return (zc_rgb_list, zc_t_list, zp_rgb_list, zp_t_list,
+                zc_fused_feats_neck, fused_feats, q_rgb, q_t)
+
+    def encode_decode(self, inputs, batch_img_metas):
+        results = self.extract_feat(inputs)
+        fused_feats = results[5]
+        seg_logits = self.decode_head.predict(
+            fused_feats, batch_img_metas, self.test_cfg)
+        return seg_logits
+
+    def _decode_head_forward_train(self, inputs, data_samples):
+        losses = dict()
+        loss_decode = self.decode_head.loss(
+            inputs, data_samples, self.train_cfg)
+        losses.update(add_prefix(loss_decode, 'decode'))
+        return losses
+
+    def _zc_seg_head_forward_train(self, zc_fused_feats, data_samples):
+        losses = dict()
+        loss_zc = self.zc_seg_head.loss(
+            zc_fused_feats, data_samples, self.train_cfg)
+        loss_val = loss_zc.get('loss_ce', list(loss_zc.values())[0])
+        losses['loss_seg_zc'] = loss_val
+        return losses
+
+    def _auxiliary_head_forward_train(self, inputs, data_samples):
+        losses = dict()
+        if isinstance(self.auxiliary_head, nn.ModuleList):
+            for idx, aux_head in enumerate(self.auxiliary_head):
+                loss_aux = aux_head.loss(
+                    inputs, data_samples, self.train_cfg)
+                losses.update(add_prefix(loss_aux, f'aux_{idx}'))
+        else:
+            loss_aux = self.auxiliary_head.loss(
+                inputs, data_samples, self.train_cfg)
+            losses.update(add_prefix(loss_aux, 'aux'))
+        return losses
+
+    def loss(self, inputs: torch.Tensor,
+             data_samples: SampleList) -> dict:
+        for ds in data_samples:
+            if hasattr(ds, 'metainfo') and 'epoch' in ds.metainfo:
+                self.set_epoch(ds.metainfo['epoch'])
+                break
+
+        if self._current_epoch >= self.early_epoch:
+            self.gumbel_mask.anneal(self._current_epoch - self.early_epoch)
+
+        (zc_rgb_list, zc_t_list, zp_rgb_list, zp_t_list,
+         zc_fused_feats, fused_feats,
+         q_rgb, q_t) = self.extract_feat_train(inputs)
+
+        losses = dict()
+
+        loss_decode = self._decode_head_forward_train(
+            fused_feats, data_samples)
+        losses.update(loss_decode)
+
+        with torch.no_grad():
+            zc_fused_feats_detached = [f.detach() for f in zc_fused_feats]
+        loss_zc = self._zc_seg_head_forward_train(
+            zc_fused_feats_detached, data_samples)
+        losses['loss_seg_zc'] = loss_zc['loss_seg_zc'] * \
+            self.loss_seg_zc_weight
+
+        num_stages = len(zc_rgb_list)
+        for i in range(num_stages):
+            zc_rgb_tokens_i = zc_rgb_list[i].flatten(2).transpose(1, 2)
+            zc_t_tokens_i = zc_t_list[i].flatten(2).transpose(1, 2)
+            zp_rgb_tokens_i = zp_rgb_list[i].flatten(2).transpose(1, 2)
+            zp_t_tokens_i = zp_t_list[i].flatten(2).transpose(1, 2)
+
+            w = self.loss_disentangle_weights[i] \
+                if i < len(self.loss_disentangle_weights) \
+                else self.loss_disentangle_weights[-1]
+
+            loss_hsic_rgb = compute_hsic(zc_rgb_tokens_i, zp_rgb_tokens_i)
+            loss_hsic_t = compute_hsic(zc_t_tokens_i, zp_t_tokens_i)
+            losses[f'loss_disentangle_s{i}'] = \
+                (loss_hsic_rgb + loss_hsic_t) * w
+
+            loss_align_i = compute_quality_guided_alignment(
+                zc_rgb_tokens_i, zc_t_tokens_i, q_rgb, q_t)
+            losses[f'loss_modal_s{i}'] = loss_align_i * \
+                self.loss_modal_weight
+
+        loss_invariance = torch.tensor(0.0, device=inputs.device)
+        for i in range(num_stages):
+            zc_rgb_tokens_i = zc_rgb_list[i].flatten(2).transpose(1, 2)
+            zc_t_tokens_i = zc_t_list[i].flatten(2).transpose(1, 2)
+
+            stage_w = self.invariance_stage_weights[i] \
+                if i < len(self.invariance_stage_weights) \
+                else self.invariance_stage_weights[-1]
+
+            loss_inv_i = compute_quality_weighted_invariance(
+                zc_rgb_tokens_i, zc_t_tokens_i, q_rgb, q_t)
+            loss_invariance = loss_invariance + loss_inv_i * stage_w
+
+        losses['loss_invariance'] = loss_invariance * \
+            self.loss_invariance_weight
+
+        B = q_rgb.shape[0]
+        rgb_degraded_mask = torch.zeros(B, dtype=torch.bool,
+                                        device=inputs.device)
+        thermal_degraded_mask = torch.zeros(B, dtype=torch.bool,
+                                            device=inputs.device)
+        for i, data_sample in enumerate(data_samples):
+            meta = data_sample.metainfo
+            if meta.get('rgb_degradation', 'clean') != 'clean':
+                rgb_degraded_mask[i] = True
+            if meta.get('thermal_degradation', 'clean') != 'clean':
+                thermal_degraded_mask[i] = True
+
+        loss_anchor = torch.tensor(0.0, device=inputs.device)
+        if (~rgb_degraded_mask).any() and rgb_degraded_mask.any():
+            q_rgb_clean = q_rgb[~rgb_degraded_mask]
+            q_rgb_deg = q_rgb[rgb_degraded_mask]
+            loss_c, loss_d = self.quality_anchor_fn(q_rgb_clean, q_rgb_deg)
+            loss_anchor = loss_anchor + loss_c + loss_d
+        elif (~rgb_degraded_mask).any():
+            q_rgb_clean = q_rgb[~rgb_degraded_mask]
+            loss_c, _ = self.quality_anchor_fn(q_rgb_clean)
+            loss_anchor = loss_anchor + loss_c
+
+        if (~thermal_degraded_mask).any() and thermal_degraded_mask.any():
+            q_t_clean = q_t[~thermal_degraded_mask]
+            q_t_deg = q_t[thermal_degraded_mask]
+            loss_c, loss_d = self.quality_anchor_fn(q_t_clean, q_t_deg)
+            loss_anchor = loss_anchor + loss_c + loss_d
+        elif (~thermal_degraded_mask).any():
+            q_t_clean = q_t[~thermal_degraded_mask]
+            loss_c, _ = self.quality_anchor_fn(q_t_clean)
+            loss_anchor = loss_anchor + loss_c
+
+        losses['loss_anchor'] = loss_anchor * self.loss_quality_reg_weight
+
+        loss_spatial_div = (self.spatial_diversity_fn(q_rgb) +
+                            self.spatial_diversity_fn(q_t))
+        losses['loss_spatial_div'] = loss_spatial_div * \
+            self.loss_quality_reg_weight
+
+        if rgb_degraded_mask.any():
+            loss_ceiling = self.quality_ceiling_fn(q_rgb[rgb_degraded_mask])
+            losses['loss_quality_ceiling'] = loss_ceiling * \
+                self.loss_quality_reg_weight
+        if thermal_degraded_mask.any():
+            loss_ceiling = self.quality_ceiling_fn(
+                q_t[thermal_degraded_mask])
+            losses['loss_quality_ceiling_t'] = loss_ceiling * \
+                self.loss_quality_reg_weight
+
+        if self.with_auxiliary_head:
+            loss_aux = self._auxiliary_head_forward_train(
+                fused_feats, data_samples)
+            losses.update(loss_aux)
+
+        return losses
+
+    def predict(self, inputs, data_samples=None):
+        if data_samples is not None:
+            batch_img_metas = [ds.metainfo for ds in data_samples]
+        else:
+            batch_img_metas = [
+                dict(ori_shape=inputs.shape[2:],
+                     img_shape=inputs.shape[2:],
+                     pad_shape=inputs.shape[2:],
+                     padding_size=[0, 0, 0, 0])
+            ] * inputs.shape[0]
+        seg_logits = self.inference(inputs, batch_img_metas)
+        return self.postprocess_result(seg_logits, data_samples)
+
+    def _forward(self, inputs, data_samples=None):
+        results = self.extract_feat(inputs)
+        fused_feats = results[5]
+        return self.decode_head.forward(fused_feats)
+
+    def whole_inference(self, inputs, batch_img_metas):
+        return self.encode_decode(inputs, batch_img_metas)
+
+    def slide_inference(self, inputs, batch_img_metas):
+        h_stride, w_stride = self.test_cfg.stride
+        h_crop, w_crop = self.test_cfg.crop_size
+        batch_size, _, h_img, w_img = inputs.size()
+        out_channels = self.out_channels
+        h_grids = max(h_img - h_crop + h_stride - 1, 0) // h_stride + 1
+        w_grids = max(w_img - w_crop + w_stride - 1, 0) // w_stride + 1
+        preds = inputs.new_zeros(
+            (batch_size, out_channels, h_img, w_img))
+        count_mat = inputs.new_zeros(
+            (batch_size, 1, h_img, w_img))
+        for h_idx in range(h_grids):
+            for w_idx in range(w_grids):
+                y1 = h_idx * h_stride
+                x1 = w_idx * w_stride
+                y2 = min(y1 + h_crop, h_img)
+                x2 = min(x1 + w_crop, w_img)
+                y1 = max(y2 - h_crop, 0)
+                x1 = max(x2 - w_crop, 0)
+                crop_img = inputs[:, :, y1:y2, x1:x2]
+                batch_img_metas[0]['img_shape'] = crop_img.shape[2:]
+                crop_seg_logit = self.encode_decode(
+                    crop_img, batch_img_metas)
+                preds += F.pad(crop_seg_logit,
+                               (int(x1), int(preds.shape[3] - x2),
+                                int(y1), int(preds.shape[2] - y2)))
+                count_mat[:, :, y1:y2, x1:x2] += 1
+        assert (count_mat == 0).sum() == 0
+        return preds / count_mat
+
+    def inference(self, inputs, batch_img_metas):
+        assert self.test_cfg.mode in ['slide', 'whole']
+        ori_shape = batch_img_metas[0]['ori_shape']
+        assert all(_['ori_shape'] == ori_shape for _ in batch_img_metas)
+        if self.test_cfg.mode == 'slide':
+            return self.slide_inference(inputs, batch_img_metas)
+        return self.whole_inference(inputs, batch_img_metas)
+
+    def merge_lora(self):
+        if hasattr(self.universal_branch, 'merge_lora'):
+            self.universal_branch.merge_lora()
+
+    def get_lora_info(self):
+        if hasattr(self.universal_branch, 'get_lora_info'):
+            return self.universal_branch.get_lora_info()
+        return {}

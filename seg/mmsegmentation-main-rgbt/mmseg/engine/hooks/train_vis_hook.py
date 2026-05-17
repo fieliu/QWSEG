@@ -522,6 +522,7 @@ class TrainVisHook(Hook):
         loss_str = self._get_loss_summary(runner)
 
         was_training = model.training
+        model.current_epoch = epoch
         model.eval()
 
         try:

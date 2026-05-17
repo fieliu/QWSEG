@@ -721,6 +721,76 @@ def _generate_local_mask(B, H, W, num_regions=3, device='cpu'):
     return mask
 
 
+def _lerp(a, b, t):
+    return a + (b - a) * t
+
+
+def _get_degradation_schedule(r):
+    if r < 0.1:
+        t = r / 0.1
+        p_local = 1.0
+        p_global = 0.0
+        p_missing = 0.0
+        local_levels = {2: _lerp(0.7, 0.7, t), 3: _lerp(0.3, 0.3, t),
+                        4: 0.0, 5: 0.0}
+        global_levels = {2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
+    elif r < 0.3:
+        t = (r - 0.1) / 0.2
+        p_local = _lerp(1.0, 0.8, t)
+        p_global = _lerp(0.0, 0.2, t)
+        p_missing = 0.0
+        local_levels = {2: _lerp(0.7, 0.1, t), 3: _lerp(0.3, 0.5, t),
+                        4: _lerp(0.0, 0.4, t), 5: 0.0}
+        global_levels = {2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
+    elif r < 0.5:
+        t = (r - 0.3) / 0.2
+        p_local = _lerp(0.8, 0.6, t)
+        p_global = 0.2
+        p_missing = _lerp(0.0, 0.2, t)
+        local_levels = {2: 0.0, 3: _lerp(0.5, 0.3, t),
+                        4: 0.4, 5: _lerp(0.0, 0.3, t)}
+        global_levels = {2: _lerp(1.0, 0.5, t), 3: _lerp(0.0, 0.5, t),
+                         4: 0.0, 5: 0.0}
+    elif r < 0.7:
+        t = (r - 0.5) / 0.2
+        p_local = _lerp(0.6, 0.3, t)
+        p_global = _lerp(0.2, 0.25, t)
+        p_missing = _lerp(0.2, 0.45, t)
+        local_levels = {2: 0.0, 3: 0.2, 4: 0.4, 5: 0.4}
+        global_levels = {2: 0.3, 3: 0.4, 4: 0.3, 5: 0.0}
+    elif r < 0.9:
+        p_local = 0.25
+        p_global = 0.25
+        p_missing = 0.5
+        local_levels = {2: 0.0, 3: 0.1, 4: 0.4, 5: 0.5}
+        global_levels = {2: 0.2, 3: 0.4, 4: 0.3, 5: 0.1}
+    else:
+        p_local = 0.25
+        p_global = 0.25
+        p_missing = 0.5
+        local_levels = {2: 0.0, 3: 0.1, 4: 0.4, 5: 0.5}
+        global_levels = {2: 0.2, 3: 0.4, 4: 0.3, 5: 0.1}
+    return {
+        'p_local': p_local, 'p_global': p_global, 'p_missing': p_missing,
+        'local_levels': local_levels, 'global_levels': global_levels,
+    }
+
+
+def _sample_level(level_dist):
+    levels = []
+    probs = []
+    for lv in [2, 3, 4, 5]:
+        p = level_dist.get(lv, 0.0)
+        if p > 0:
+            levels.append(lv)
+            probs.append(p)
+    if not levels:
+        return 2
+    total = sum(probs)
+    probs = [p / total for p in probs]
+    return random.choices(levels, weights=probs, k=1)[0]
+
+
 def _compute_feature_variance_penalty(feat):
     B, C, H, W = feat.shape
     feat_mean = feat.mean(dim=[2, 3], keepdim=True)
@@ -2991,9 +3061,7 @@ class MiTMulABV9(_AblationBase):
                  loss_distill_weight: float = 0.3,
                  distill_temperature: float = 4.0,
                  aux_loss_weight: float = 0.3,
-                 missing_ratio: float = 0.3,
-                 global_deg_ratio: float = 0.3,
-                 local_deg_ratio: float = 0.4,
+                 total_epochs: int = 200,
                  mamba_layers: int = 2,
                  mamba_d_state: int = 16,
                  mamba_d_conv: int = 4,
@@ -3069,9 +3137,7 @@ class MiTMulABV9(_AblationBase):
         self.loss_distill_weight = loss_distill_weight
         self.distill_temperature = distill_temperature
         self.aux_loss_weight = aux_loss_weight
-        self.missing_ratio = missing_ratio
-        self.global_deg_ratio = global_deg_ratio
-        self.local_deg_ratio = local_deg_ratio
+        self.total_epochs = total_epochs
 
         self._reset_parameters()
 
@@ -3450,65 +3516,81 @@ class MiTMulABV9(_AblationBase):
 
         if self.training:
             deg_results = self._train_with_degradation(input_rgb, input_ir)
-            if deg_results is not None:
-                deg_final, deg_rgb_list, deg_t_list, deg_both, deg_zc_fused, \
-                    deg_q_rgb_list, deg_q_t_list = deg_results
+            deg_final, deg_rgb_list, deg_t_list, deg_both, deg_zc_fused, \
+                deg_q_rgb_list, deg_q_t_list = deg_results
 
-                deg_seg_loss = self.decode_head.loss(
-                    deg_final, data_samples, self.train_cfg)
-                losses['loss_deg_seg'] = sum(deg_seg_loss.values())
+            deg_seg_loss = self.decode_head.loss(
+                deg_final, data_samples, self.train_cfg)
+            losses['loss_deg_seg'] = sum(deg_seg_loss.values())
 
-                if self.loss_distill_weight > 0 and phase >= 3:
-                    clean_logits = self.decode_head.forward(final_fused)
-                    deg_logits = self.decode_head.forward(deg_final)
-                    T = self.distill_temperature
-                    teacher_prob = F.softmax(clean_logits.detach() / T, dim=1)
-                    student_log_prob = F.log_softmax(deg_logits / T, dim=1)
-                    kl_loss = F.kl_div(student_log_prob, teacher_prob,
-                                       reduction='batchmean')
-                    losses['loss_distill'] = self.loss_distill_weight * (T * T) * kl_loss
+            if self.loss_distill_weight > 0 and phase >= 3:
+                clean_logits = self.decode_head.forward(final_fused)
+                deg_logits = self.decode_head.forward(deg_final)
+                T = self.distill_temperature
+                teacher_prob = F.softmax(clean_logits.detach() / T, dim=1)
+                student_log_prob = F.log_softmax(deg_logits / T, dim=1)
+                kl_per_pixel = F.kl_div(student_log_prob, teacher_prob,
+                                        reduction='none').sum(dim=1)
+                deg_conf = torch.max(
+                    deg_q_rgb_list[-1] if deg_q_rgb_list[-1] is not None else torch.ones(
+                        B, 1, kl_per_pixel.shape[1], kl_per_pixel.shape[2],
+                        device=kl_per_pixel.device),
+                    deg_q_t_list[-1] if deg_q_t_list[-1] is not None else torch.ones(
+                        B, 1, kl_per_pixel.shape[1], kl_per_pixel.shape[2],
+                        device=kl_per_pixel.device))
+                deg_conf_s = deg_conf.squeeze(1)
+                if deg_conf_s.shape != kl_per_pixel.shape:
+                    deg_conf_s = F.interpolate(
+                        deg_conf_s.unsqueeze(1).float(), size=kl_per_pixel.shape[1:],
+                        mode='nearest').squeeze(1)
+                mask = (deg_conf_s > self.quality_threshold).float()
+                if mask.sum() > 0:
+                    kl_masked = (kl_per_pixel * mask).sum() / mask.sum()
+                else:
+                    kl_masked = kl_per_pixel.mean()
+                losses['loss_distill'] = self.loss_distill_weight * (T * T) * kl_masked
 
-                if self.loss_invariant_weight > 0 and phase >= 3:
-                    q_fused_clean = []
-                    q_fused_degraded = []
-                    for i in range(len(zc_fused_list)):
-                        q_c = torch.max(
-                            q_rgb_list[i] if q_rgb_list[i] is not None else torch.ones(
-                                B, 1, zc_fused_list[i].shape[2], zc_fused_list[i].shape[3],
-                                device=zc_fused_list[i].device),
-                            q_t_list[i] if q_t_list[i] is not None else torch.ones(
-                                B, 1, zc_fused_list[i].shape[2], zc_fused_list[i].shape[3],
-                                device=zc_fused_list[i].device))
-                        q_d = torch.max(
-                            deg_q_rgb_list[i] if deg_q_rgb_list[i] is not None else torch.ones(
-                                B, 1, zc_fused_list[i].shape[2], zc_fused_list[i].shape[3],
-                                device=zc_fused_list[i].device),
-                            deg_q_t_list[i] if deg_q_t_list[i] is not None else torch.ones(
-                                B, 1, zc_fused_list[i].shape[2], zc_fused_list[i].shape[3],
-                                device=zc_fused_list[i].device))
-                        q_fused_clean.append(q_c)
-                        q_fused_degraded.append(q_d)
-                    inv_loss = torch.tensor(0.0, device=zc_fused_list[0].device)
-                    count = 0
-                    for i in range(len(zc_fused_list)):
-                        if zc_fused_list[i] is not None and deg_zc_fused[i] is not None:
-                            if zc_fused_list[i].shape == deg_zc_fused[i].shape:
-                                q_c = q_fused_clean[i]
-                                q_d = q_fused_degraded[i]
-                                if q_c.shape[2:] != zc_fused_list[i].shape[2:]:
-                                    q_c = F.interpolate(q_c, size=zc_fused_list[i].shape[2:],
-                                                        mode='nearest')
-                                if q_d.shape[2:] != zc_fused_list[i].shape[2:]:
-                                    q_d = F.interpolate(q_d, size=zc_fused_list[i].shape[2:],
-                                                        mode='nearest')
-                                q_distill = q_c * q_d
-                                diff = F.smooth_l1_loss(
-                                    zc_fused_list[i].detach(), deg_zc_fused[i],
-                                    reduction='none')
-                                inv_loss = inv_loss + (q_distill * diff).sum() / (q_distill.sum() + 1e-6)
-                                count += 1
-                    if count > 0:
-                        losses['loss_inv'] = self.loss_invariant_weight * inv_loss / count
+            if self.loss_invariant_weight > 0 and phase >= 3:
+                q_fused_clean = []
+                q_fused_degraded = []
+                for i in range(len(zc_fused_list)):
+                    q_c = torch.max(
+                        q_rgb_list[i] if q_rgb_list[i] is not None else torch.ones(
+                            B, 1, zc_fused_list[i].shape[2], zc_fused_list[i].shape[3],
+                            device=zc_fused_list[i].device),
+                        q_t_list[i] if q_t_list[i] is not None else torch.ones(
+                            B, 1, zc_fused_list[i].shape[2], zc_fused_list[i].shape[3],
+                            device=zc_fused_list[i].device))
+                    q_d = torch.max(
+                        deg_q_rgb_list[i] if deg_q_rgb_list[i] is not None else torch.ones(
+                            B, 1, zc_fused_list[i].shape[2], zc_fused_list[i].shape[3],
+                            device=zc_fused_list[i].device),
+                        deg_q_t_list[i] if deg_q_t_list[i] is not None else torch.ones(
+                            B, 1, zc_fused_list[i].shape[2], zc_fused_list[i].shape[3],
+                            device=zc_fused_list[i].device))
+                    q_fused_clean.append(q_c)
+                    q_fused_degraded.append(q_d)
+                inv_loss = torch.tensor(0.0, device=zc_fused_list[0].device)
+                count = 0
+                for i in range(len(zc_fused_list)):
+                    if zc_fused_list[i] is not None and deg_zc_fused[i] is not None:
+                        if zc_fused_list[i].shape == deg_zc_fused[i].shape:
+                            q_c = q_fused_clean[i]
+                            q_d = q_fused_degraded[i]
+                            if q_c.shape[2:] != zc_fused_list[i].shape[2:]:
+                                q_c = F.interpolate(q_c, size=zc_fused_list[i].shape[2:],
+                                                    mode='nearest')
+                            if q_d.shape[2:] != zc_fused_list[i].shape[2:]:
+                                q_d = F.interpolate(q_d, size=zc_fused_list[i].shape[2:],
+                                                    mode='nearest')
+                            q_distill = q_c * q_d
+                            diff = F.smooth_l1_loss(
+                                zc_fused_list[i].detach(), deg_zc_fused[i],
+                                reduction='none')
+                            inv_loss = inv_loss + (q_distill * diff).sum() / (q_distill.sum() + 1e-6)
+                            count += 1
+                if count > 0:
+                    losses['loss_inv'] = self.loss_invariant_weight * inv_loss / count
 
         return losses
 
@@ -3539,12 +3621,7 @@ class MiTMulABV9(_AblationBase):
         return loss / max(count, 1)
 
     def _train_with_degradation(self, input_rgb, input_ir):
-        B, C, H, W = input_rgb.shape
-        device = input_rgb.device
-        deg_result = self._generate_degraded_inputs(input_rgb, input_ir)
-        if deg_result is None:
-            return None
-        deg_input_rgb, deg_input_ir = deg_result[0], deg_result[1]
+        deg_input_rgb, deg_input_ir = self._generate_degraded_inputs(input_rgb, input_ir)
 
         deg_results = self._extract_feat_single(deg_input_rgb, deg_input_ir)
         return (deg_results[7], deg_results[5], deg_results[6], deg_results[12], deg_results[4],
@@ -3560,33 +3637,44 @@ class MiTMulABV9(_AblationBase):
 
         deg_rgb = input_rgb.clone()
         deg_ir = input_ir.clone()
-        deg_type_rgb = ['none'] * B
-        deg_type_t = ['none'] * B
-        any_deg = False
+
+        epoch = self.current_epoch if hasattr(self, 'current_epoch') else 0
+        r = min(epoch / max(self.total_epochs, 1), 1.0)
+        schedule = _get_degradation_schedule(r)
+        p_local = schedule['p_local']
+        p_global = schedule['p_global']
+        p_missing = schedule['p_missing']
+        local_levels = schedule['local_levels']
+        global_levels = schedule['global_levels']
 
         for b in range(B):
-            if random.random() < self.missing_ratio:
+            rand = random.random()
+            if rand < p_missing:
                 if random.random() < 0.5:
                     deg_rgb[b] = 0.0
-                    deg_type_rgb[b] = 'missing'
                 else:
                     deg_ir[b] = 0.0
-                    deg_type_t[b] = 'missing'
-                any_deg = True
-            elif random.random() < self.global_deg_ratio:
+            elif rand < p_missing + p_global:
+                level = _sample_level(global_levels)
                 if random.random() < 0.5:
-                    deg_rgb[b] = _apply_degradation(
-                        input_rgb[b:b+1], 'rgb', rgb_mean, rgb_std)
-                    deg_type_rgb[b] = 'degraded'
+                    deg_rgb[b:b+1] = _apply_degradation(
+                        input_rgb[b:b+1], 'rgb', rgb_mean, rgb_std, level=level)
                 else:
-                    deg_ir[b] = _apply_degradation(
-                        input_ir[b:b+1], 'thermal', ir_mean, ir_std)
-                    deg_type_t[b] = 'degraded'
-                any_deg = True
+                    deg_ir[b:b+1] = _apply_degradation(
+                        input_ir[b:b+1], 'thermal', ir_mean, ir_std, level=level)
+            else:
+                level = _sample_level(local_levels)
+                local_mask = _generate_local_mask(1, H, W, num_regions=3, device=device)
+                if random.random() < 0.5:
+                    deg_rgb[b:b+1] = _apply_degradation(
+                        input_rgb[b:b+1], 'rgb', rgb_mean, rgb_std,
+                        level=level, is_local=True, local_mask=local_mask)
+                else:
+                    deg_ir[b:b+1] = _apply_degradation(
+                        input_ir[b:b+1], 'thermal', ir_mean, ir_std,
+                        level=level, is_local=True, local_mask=local_mask)
 
-        if not any_deg:
-            return None
-        return deg_rgb, deg_ir, deg_type_rgb, deg_type_t
+        return deg_rgb, deg_ir
 
     def encode_decode(self, inputs, batch_img_metas):
         input_rgb = inputs[:, :3, :, :]

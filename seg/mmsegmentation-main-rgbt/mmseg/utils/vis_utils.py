@@ -42,6 +42,22 @@ def _pad_to_size(img, target_h, target_w, pad_value=0):
     return pad
 
 
+def _quality_to_red_blue(q_np, h, w):
+    q_resized = cv2.resize(q_np, (w, h), interpolation=cv2.INTER_LINEAR)
+    q_clipped = np.clip(q_resized, 0.0, 1.0)
+    r = (q_clipped * 255).astype(np.uint8)
+    b = ((1.0 - q_clipped) * 255).astype(np.uint8)
+    g = np.zeros_like(r)
+    return np.stack([r, g, b], axis=-1)
+
+
+def _threshold_to_bw(mask_np, h, w):
+    mask_resized = cv2.resize(mask_np, (w, h), interpolation=cv2.INTER_NEAREST)
+    mask_clipped = np.clip(mask_resized, 0.0, 1.0)
+    v = (mask_clipped * 255).astype(np.uint8)
+    return np.stack([v, v, v], axis=-1)
+
+
 def _make_cell(img, cell_h, cell_w, short_side=250):
     h, w = img.shape[:2]
     if h < w:

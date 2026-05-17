@@ -3380,7 +3380,6 @@ class MiTMulABV9(_AblationBase):
         if self.loss_align_weight > 0 and both_present.any():
             gt_labels = seg_label.squeeze(1).long()
             loss_contrast = 0.0
-            loss_smooth = 0.0
             count = 0
             for i in range(len(zc_rgb_list)):
                 if zc_rgb_list[i] is not None and zc_t_list[i] is not None:
@@ -3395,13 +3394,9 @@ class MiTMulABV9(_AblationBase):
                         q_rgb_i, q_t_i,
                         tau_q=0.3, tau_c=self.contrast_tau,
                         num_samples=self.contrast_num_samples)
-                    loss_smooth += _compute_smooth_l1_alignment_loss(
-                        zc_rgb_list[i], zc_t_list[i], q_rgb_i, q_t_i,
-                        threshold=0.3)
                     count += 1
             if count > 0:
                 losses['loss_align'] = (loss_contrast / count) * self.loss_align_weight
-                losses['loss_smooth_align'] = (loss_smooth / count) * self.loss_smooth_align_weight
 
         if self.retention_loss_weight > 0:
             ret_loss = self._compute_retention_loss(all_D_for_loss)
@@ -3410,7 +3405,8 @@ class MiTMulABV9(_AblationBase):
         if self.training:
             deg_results = self._train_with_degradation(input_rgb, input_ir)
             if deg_results is not None:
-                deg_final, deg_rgb_list, deg_t_list, deg_both, deg_zc_fused = deg_results
+                deg_final, deg_rgb_list, deg_t_list, deg_both, deg_zc_fused, \
+                    deg_q_rgb_list, deg_q_t_list = deg_results
 
                 deg_seg_loss = self.decode_head.loss(
                     deg_final, data_samples, self.train_cfg)
@@ -3427,28 +3423,42 @@ class MiTMulABV9(_AblationBase):
                     losses['loss_distill'] = self.loss_distill_weight * (T * T) * kl_loss
 
                 if self.loss_invariant_weight > 0 and phase >= 3:
-                    q_fused_clean = [
-                        torch.max(
+                    q_fused_clean = []
+                    q_fused_degraded = []
+                    for i in range(len(zc_fused_list)):
+                        q_c = torch.max(
                             q_rgb_list[i] if q_rgb_list[i] is not None else torch.ones(
                                 B, 1, zc_fused_list[i].shape[2], zc_fused_list[i].shape[3],
                                 device=zc_fused_list[i].device),
                             q_t_list[i] if q_t_list[i] is not None else torch.ones(
                                 B, 1, zc_fused_list[i].shape[2], zc_fused_list[i].shape[3],
                                 device=zc_fused_list[i].device))
-                        for i in range(len(zc_fused_list))]
+                        q_d = torch.max(
+                            deg_q_rgb_list[i] if deg_q_rgb_list[i] is not None else torch.ones(
+                                B, 1, zc_fused_list[i].shape[2], zc_fused_list[i].shape[3],
+                                device=zc_fused_list[i].device),
+                            deg_q_t_list[i] if deg_q_t_list[i] is not None else torch.ones(
+                                B, 1, zc_fused_list[i].shape[2], zc_fused_list[i].shape[3],
+                                device=zc_fused_list[i].device))
+                        q_fused_clean.append(q_c)
+                        q_fused_degraded.append(q_d)
                     inv_loss = torch.tensor(0.0, device=zc_fused_list[0].device)
                     count = 0
                     for i in range(len(zc_fused_list)):
                         if zc_fused_list[i] is not None and deg_zc_fused[i] is not None:
                             if zc_fused_list[i].shape == deg_zc_fused[i].shape:
                                 q_c = q_fused_clean[i]
+                                q_d = q_fused_degraded[i]
                                 if q_c.shape[2:] != zc_fused_list[i].shape[2:]:
                                     q_c = F.interpolate(q_c, size=zc_fused_list[i].shape[2:],
                                                         mode='nearest')
+                                if q_d.shape[2:] != zc_fused_list[i].shape[2:]:
+                                    q_d = F.interpolate(q_d, size=zc_fused_list[i].shape[2:],
+                                                        mode='nearest')
+                                q_distill = q_c * q_d
                                 diff = F.smooth_l1_loss(
                                     zc_fused_list[i].detach(), deg_zc_fused[i],
                                     reduction='none')
-                                q_distill = q_c
                                 inv_loss = inv_loss + (q_distill * diff).sum() / (q_distill.sum() + 1e-6)
                                 count += 1
                     if count > 0:
@@ -3491,7 +3501,8 @@ class MiTMulABV9(_AblationBase):
         deg_input_rgb, deg_input_ir = deg_result[0], deg_result[1]
 
         deg_results = self._extract_feat_single(deg_input_rgb, deg_input_ir)
-        return (deg_results[7], deg_results[5], deg_results[6], deg_results[12], deg_results[4])
+        return (deg_results[7], deg_results[5], deg_results[6], deg_results[12], deg_results[4],
+                deg_results[9], deg_results[10])
 
     def _generate_degraded_inputs(self, input_rgb, input_ir):
         B, C, H, W = input_rgb.shape

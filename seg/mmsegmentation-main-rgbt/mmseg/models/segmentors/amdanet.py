@@ -140,7 +140,7 @@ class AMDANet(BaseSegmentor):
             ] * inputs.shape[0]
 
         seg_logits = self.encode_decode(inputs, batch_img_metas)
-        return seg_logits
+        return self.postprocess_result(seg_logits, data_samples)
 
     @property
     def with_fuse_head(self):

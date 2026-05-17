@@ -119,7 +119,7 @@ class EncoderDecoderMult(BaseSegmentor):
 
         seg_logits = self.encode_decode(inputs, batch_img_metas)
 
-        return seg_logits
+        return self.postprocess_result(seg_logits, data_samples)
 
     @property
     def with_auxiliary_head(self):

@@ -29,7 +29,7 @@ class RGBTSwinTransformer(BaseModule):
                  frozen_stages=-1,
                  share_start_idx=4,
                  fusion_type='MAX',
-                 thr_in_channels=1,
+                 thr_in_channels=3,
                  init_cfg=None,
                  **kwargs):
         super().__init__(init_cfg=init_cfg)

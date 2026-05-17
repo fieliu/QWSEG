@@ -155,7 +155,6 @@ model = dict(
         frozen_stages=-1,
         share_start_idx=4,
         fusion_type='ADD',
-        thr_in_channels=3,
         init_cfg=dict(
             type='Pretrained',
             checkpoint='./pretrain/swin_large_patch4_window7_224_22k_20220412-aeecf2aa.pth')),

@@ -74,6 +74,25 @@ class _AblationBase(BaseSegmentor):
         ]
         return torch.stack(gt_semantic_segs, dim=0)
 
+    @staticmethod
+    def _build_pad_mask(data_samples, h, w, device):
+        valid_mask = torch.ones(len(data_samples), h, w, dtype=torch.bool,
+                                device=device)
+        for i, ds in enumerate(data_samples):
+            ps = ds.metainfo.get('padding_size', [0, 0, 0, 0])
+            pl, pr, pt, pb = ps
+            if pb > 0 or pr > 0:
+                valid_mask[i, pt:h - pb, pl:w - pr] = True
+                if pt > 0:
+                    valid_mask[i, :pt, :] = False
+                if pb > 0:
+                    valid_mask[i, h - pb:, :] = False
+                if pl > 0:
+                    valid_mask[i, :, :pl] = False
+                if pr > 0:
+                    valid_mask[i, :, w - pr:] = False
+        return valid_mask
+
     def whole_inference(self, inputs, batch_img_metas):
         return self.encode_decode(inputs, batch_img_metas)
 
@@ -711,7 +730,7 @@ def _compute_feature_variance_penalty(feat):
 
 def _compute_cross_modal_contrastive_loss(feat_rgb, feat_t, labels, q_rgb, q_t,
                                           tau_q=0.3, tau_c=0.07,
-                                          num_samples=512):
+                                          num_samples=512, pad_mask=None):
     B, C, H, W = feat_rgb.shape
     if q_rgb.shape[2:] != (H, W):
         q_rgb = F.interpolate(q_rgb, size=(H, W), mode='nearest')
@@ -724,6 +743,13 @@ def _compute_cross_modal_contrastive_loss(feat_rgb, feat_t, labels, q_rgb, q_t,
     q_rgb_s = q_rgb.squeeze(1)
     q_t_s = q_t.squeeze(1)
     quality_mask = (labels > 0) & (q_rgb_s > tau_q) & (q_t_s > tau_q)
+    if pad_mask is not None:
+        if pad_mask.shape[1:] != (H, W):
+            pm = F.interpolate(pad_mask.float().unsqueeze(1), size=(H, W),
+                               mode='nearest').squeeze(1).bool()
+        else:
+            pm = pad_mask
+        quality_mask = quality_mask & pm
 
     f_rgb = F.normalize(feat_rgb, dim=1)
     f_t = F.normalize(feat_t, dim=1)
@@ -804,7 +830,8 @@ def _compute_cross_modal_contrastive_loss(feat_rgb, feat_t, labels, q_rgb, q_t,
     return loss
 
 
-def _compute_smooth_l1_alignment_loss(feat_rgb, feat_t, q_rgb, q_t, threshold=0.3):
+def _compute_smooth_l1_alignment_loss(feat_rgb, feat_t, q_rgb, q_t, threshold=0.3,
+                                      pad_mask=None):
     B, C, H, W = feat_rgb.shape
     if q_rgb.shape[2:] != (H, W):
         q_rgb = F.interpolate(q_rgb, size=(H, W), mode='nearest')
@@ -813,6 +840,13 @@ def _compute_smooth_l1_alignment_loss(feat_rgb, feat_t, q_rgb, q_t, threshold=0.
     q_rgb_s = q_rgb.squeeze(1)
     q_t_s = q_t.squeeze(1)
     valid_mask = (q_rgb_s > threshold) & (q_t_s > threshold)
+    if pad_mask is not None:
+        if pad_mask.shape[1:] != (H, W):
+            pm = F.interpolate(pad_mask.float().unsqueeze(1), size=(H, W),
+                               mode='nearest').squeeze(1).bool()
+        else:
+            pm = pad_mask
+        valid_mask = valid_mask & pm
     q_min = torch.min(q_rgb_s, q_t_s)
     q_gap = torch.abs(q_rgb_s - q_t_s)
     weight = q_min * (1.0 - q_gap) * valid_mask.float()
@@ -1642,6 +1676,9 @@ class MiTMulABV3(_AblationBase):
 
         gt_labels = self._stack_batch_gt(data_samples).squeeze(1)
 
+        pad_mask = self._build_pad_mask(
+            data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
+
         num_stages = len(zc_rgb_clean)
         loss_contrast_total = 0.0
         loss_smooth_total = 0.0
@@ -1652,10 +1689,12 @@ class MiTMulABV3(_AblationBase):
                     zc_rgb_clean[i], zc_t_clean[i], gt_labels,
                     q_rgb_clean[i], q_t_clean[i],
                     tau_q=self.quality_threshold, tau_c=self.contrast_tau,
-                    num_samples=self.contrast_num_samples)
+                    num_samples=self.contrast_num_samples,
+                    pad_mask=pad_mask)
                 loss_smooth_total += _compute_smooth_l1_alignment_loss(
                     zc_rgb_clean[i], zc_t_clean[i], q_rgb_clean[i], q_t_clean[i],
-                    threshold=self.quality_threshold)
+                    threshold=self.quality_threshold,
+                    pad_mask=pad_mask)
                 count += 1
         if count > 0:
             losses['loss_align'] = (loss_contrast_total / count) * self.loss_align_weight
@@ -2278,6 +2317,8 @@ class MiTMulABV8(_AblationBase):
 
         if self.loss_align_weight > 0 and both_present.any():
             gt_labels = seg_label.squeeze(1).long()
+            pad_mask = self._build_pad_mask(
+                data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
             loss_contrast = 0.0
             loss_smooth = 0.0
             count = 0
@@ -2287,10 +2328,12 @@ class MiTMulABV8(_AblationBase):
                         zc_rgb_list[i], zc_t_list[i], gt_labels,
                         q_rgb_maps[i], q_t_maps[i],
                         tau_q=self.quality_threshold, tau_c=self.contrast_tau,
-                        num_samples=self.contrast_num_samples)
+                        num_samples=self.contrast_num_samples,
+                        pad_mask=pad_mask)
                     loss_smooth += _compute_smooth_l1_alignment_loss(
                         zc_rgb_list[i], zc_t_list[i], q_rgb_maps[i], q_t_maps[i],
-                        threshold=self.quality_threshold)
+                        threshold=self.quality_threshold,
+                        pad_mask=pad_mask)
                     count += 1
             if count > 0:
                 losses['loss_align'] = (loss_contrast / count) * self.loss_align_weight
@@ -3379,6 +3422,8 @@ class MiTMulABV9(_AblationBase):
 
         if self.loss_align_weight > 0 and both_present.any():
             gt_labels = seg_label.squeeze(1).long()
+            pad_mask = self._build_pad_mask(
+                data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
             loss_contrast = 0.0
             count = 0
             for i in range(len(zc_rgb_list)):
@@ -3393,7 +3438,8 @@ class MiTMulABV9(_AblationBase):
                         zc_rgb_list[i], zc_t_list[i], gt_labels,
                         q_rgb_i, q_t_i,
                         tau_q=0.3, tau_c=self.contrast_tau,
-                        num_samples=self.contrast_num_samples)
+                        num_samples=self.contrast_num_samples,
+                        pad_mask=pad_mask)
                     count += 1
             if count > 0:
                 losses['loss_align'] = (loss_contrast / count) * self.loss_align_weight
@@ -3953,6 +3999,9 @@ class MiTMulABV7(_AblationBase):
 
         gt_labels = self._stack_batch_gt(data_samples).squeeze(1)
 
+        pad_mask = self._build_pad_mask(
+            data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
+
         num_stages = len(zc_rgb_clean)
         loss_contrast_total = 0.0
         loss_smooth_total = 0.0
@@ -3963,10 +4012,12 @@ class MiTMulABV7(_AblationBase):
                     zc_rgb_clean[i], zc_t_clean[i], gt_labels,
                     q_rgb_clean[i], q_t_clean[i],
                     tau_q=self.quality_threshold, tau_c=self.contrast_tau,
-                    num_samples=self.contrast_num_samples)
+                    num_samples=self.contrast_num_samples,
+                    pad_mask=pad_mask)
                 loss_smooth_total += _compute_smooth_l1_alignment_loss(
                     zc_rgb_clean[i], zc_t_clean[i], q_rgb_clean[i], q_t_clean[i],
-                    threshold=self.quality_threshold)
+                    threshold=self.quality_threshold,
+                    pad_mask=pad_mask)
                 count += 1
         if count > 0:
             losses['loss_align'] = (loss_contrast_total / count) * self.loss_align_weight
@@ -4474,6 +4525,9 @@ class MiTMulABV6(_AblationBase):
 
         gt_labels = self._stack_batch_gt(data_samples).squeeze(1)
 
+        pad_mask = self._build_pad_mask(
+            data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
+
         num_stages = len(zc_rgb_clean)
         loss_contrast_total = 0.0
         loss_smooth_total = 0.0
@@ -4484,10 +4538,12 @@ class MiTMulABV6(_AblationBase):
                     zc_rgb_clean[i], zc_t_clean[i], gt_labels,
                     q_rgb_clean[i], q_t_clean[i],
                     tau_q=self.quality_threshold, tau_c=self.contrast_tau,
-                    num_samples=self.contrast_num_samples)
+                    num_samples=self.contrast_num_samples,
+                    pad_mask=pad_mask)
                 loss_smooth_total += _compute_smooth_l1_alignment_loss(
                     zc_rgb_clean[i], zc_t_clean[i], q_rgb_clean[i], q_t_clean[i],
-                    threshold=self.quality_threshold)
+                    threshold=self.quality_threshold,
+                    pad_mask=pad_mask)
                 count += 1
         if count > 0:
             losses['loss_align'] = (loss_contrast_total / count) * self.loss_align_weight
@@ -4999,6 +5055,9 @@ class MiTMulABV5(_AblationBase):
 
         gt_labels = self._stack_batch_gt(data_samples).squeeze(1)
 
+        pad_mask = self._build_pad_mask(
+            data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
+
         num_stages = len(zc_rgb_clean)
         loss_contrast_total = 0.0
         loss_smooth_total = 0.0
@@ -5009,10 +5068,12 @@ class MiTMulABV5(_AblationBase):
                     zc_rgb_clean[i], zc_t_clean[i], gt_labels,
                     q_rgb_clean[i], q_t_clean[i],
                     tau_q=self.quality_threshold, tau_c=self.contrast_tau,
-                    num_samples=self.contrast_num_samples)
+                    num_samples=self.contrast_num_samples,
+                    pad_mask=pad_mask)
                 loss_smooth_total += _compute_smooth_l1_alignment_loss(
                     zc_rgb_clean[i], zc_t_clean[i], q_rgb_clean[i], q_t_clean[i],
-                    threshold=self.quality_threshold)
+                    threshold=self.quality_threshold,
+                    pad_mask=pad_mask)
                 count += 1
         if count > 0:
             losses['loss_align'] = (loss_contrast_total / count) * self.loss_align_weight
@@ -5864,6 +5925,9 @@ class MiTMulABV3Replace(_AblationBase):
 
         gt_labels = self._stack_batch_gt(data_samples).squeeze(1)
 
+        pad_mask = self._build_pad_mask(
+            data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
+
         num_stages = len(zc_rgb_clean)
         loss_contrast_total = 0.0
         loss_smooth_total = 0.0
@@ -5874,10 +5938,12 @@ class MiTMulABV3Replace(_AblationBase):
                     zc_rgb_clean[i], zc_t_clean[i], gt_labels,
                     q_rgb_clean[i], q_t_clean[i],
                     tau_q=self.quality_threshold, tau_c=self.contrast_tau,
-                    num_samples=self.contrast_num_samples)
+                    num_samples=self.contrast_num_samples,
+                    pad_mask=pad_mask)
                 loss_smooth_total += _compute_smooth_l1_alignment_loss(
                     zc_rgb_clean[i], zc_t_clean[i], q_rgb_clean[i], q_t_clean[i],
-                    threshold=self.quality_threshold)
+                    threshold=self.quality_threshold,
+                    pad_mask=pad_mask)
                 count += 1
         if count > 0:
             losses['loss_align'] = (loss_contrast_total / count) * self.loss_align_weight
@@ -6348,6 +6414,9 @@ class MiTMulABV4(_AblationBase):
 
         gt_labels = self._stack_batch_gt(data_samples).squeeze(1)
 
+        pad_mask = self._build_pad_mask(
+            data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
+
         num_stages = len(zc_rgb_clean)
         loss_contrast_total = 0.0
         loss_smooth_total = 0.0
@@ -6358,10 +6427,12 @@ class MiTMulABV4(_AblationBase):
                     zc_rgb_clean[i], zc_t_clean[i], gt_labels,
                     q_rgb_clean[i], q_t_clean[i],
                     tau_q=self.quality_threshold, tau_c=self.contrast_tau,
-                    num_samples=self.contrast_num_samples)
+                    num_samples=self.contrast_num_samples,
+                    pad_mask=pad_mask)
                 loss_smooth_total += _compute_smooth_l1_alignment_loss(
                     zc_rgb_clean[i], zc_t_clean[i], q_rgb_clean[i], q_t_clean[i],
-                    threshold=self.quality_threshold)
+                    threshold=self.quality_threshold,
+                    pad_mask=pad_mask)
                 count += 1
         if count > 0:
             losses['loss_align'] = (loss_contrast_total / count) * self.loss_align_weight
@@ -6734,6 +6805,9 @@ class MiTMulABV2(_AblationBase):
 
         gt_labels = self._stack_batch_gt(data_samples).squeeze(1)
 
+        pad_mask = self._build_pad_mask(
+            data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
+
         num_stages = len(zc_rgb_list)
         loss_contrast_total = 0.0
         loss_smooth_total = 0.0
@@ -6744,10 +6818,12 @@ class MiTMulABV2(_AblationBase):
                     zc_rgb_list[i], zc_t_list[i], gt_labels,
                     q_rgb_maps[i], q_t_maps[i],
                     tau_q=self.quality_threshold, tau_c=self.contrast_tau,
-                    num_samples=self.contrast_num_samples)
+                    num_samples=self.contrast_num_samples,
+                    pad_mask=pad_mask)
                 loss_smooth_total += _compute_smooth_l1_alignment_loss(
                     zc_rgb_list[i], zc_t_list[i], q_rgb_maps[i], q_t_maps[i],
-                    threshold=self.quality_threshold)
+                    threshold=self.quality_threshold,
+                    pad_mask=pad_mask)
                 count += 1
         if count > 0:
             losses['loss_align'] = (loss_contrast_total / count) * self.loss_align_weight
@@ -6975,6 +7051,9 @@ class MiTMulABV1(_AblationBase):
 
         gt_labels = self._stack_batch_gt(data_samples).squeeze(1)
 
+        pad_mask = self._build_pad_mask(
+            data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
+
         num_stages = len(zc_rgb_list)
         loss_contrast_total = 0.0
         loss_smooth_total = 0.0
@@ -6985,10 +7064,12 @@ class MiTMulABV1(_AblationBase):
                     zc_rgb_list[i], zc_t_list[i], gt_labels,
                     q_rgb_maps[i], q_t_maps[i],
                     tau_q=self.quality_threshold, tau_c=self.contrast_tau,
-                    num_samples=self.contrast_num_samples)
+                    num_samples=self.contrast_num_samples,
+                    pad_mask=pad_mask)
                 loss_smooth_total += _compute_smooth_l1_alignment_loss(
                     zc_rgb_list[i], zc_t_list[i], q_rgb_maps[i], q_t_maps[i],
-                    threshold=self.quality_threshold)
+                    threshold=self.quality_threshold,
+                    pad_mask=pad_mask)
                 count += 1
         if count > 0:
             losses['loss_align'] = (loss_contrast_total / count) * self.loss_align_weight

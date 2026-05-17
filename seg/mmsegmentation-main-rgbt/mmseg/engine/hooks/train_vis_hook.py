@@ -553,10 +553,25 @@ class TrainVisHook(Hook):
             return single_input.to(torch.float32) / 255.0, None
 
         try:
+            saved_meta = []
+            if single_sample:
+                for ds in single_sample:
+                    meta = ds.metainfo
+                    saved_meta.append({
+                        k: meta[k] for k in
+                        ['ori_shape', 'img_shape', 'pad_shape', 'padding_size']
+                        if k in meta})
+
             batch = {'inputs': single_input}
             if single_sample:
                 batch['data_samples'] = single_sample
             proc_data = model.data_preprocessor(batch, False)
+
+            if single_sample and saved_meta:
+                for ds, sm in zip(proc_data.get('data_samples', single_sample),
+                                  saved_meta):
+                    ds.set_metainfo(sm)
+
             return proc_data.get('inputs', None), proc_data
         except Exception as e:
             runner.logger.warning(f'data_preprocessor failed for sample {b_idx}: {e}')
@@ -1070,25 +1085,14 @@ class TrainVisHook(Hook):
         pred_seg = np.zeros((h, w), dtype=np.uint8)
         try:
             with torch.no_grad():
-                if single_sample and len(single_sample) > 0:
-                    batch_img_metas = [single_sample[0].metainfo]
-                else:
-                    batch_img_metas = [dict(
-                        ori_shape=proc_inputs.shape[2:],
-                        img_shape=proc_inputs.shape[2:],
-                        pad_shape=proc_inputs.shape[2:],
-                        padding_size=[0, 0, 0, 0])]
-                results = model.predict(proc_inputs, single_sample)
-                if isinstance(results, list) and len(results) > 0:
-                    r = results[0]
-                    if hasattr(r, 'pred_sem_seg'):
-                        pred_data = r.pred_sem_seg.data
-                        if isinstance(pred_data, torch.Tensor):
-                            pred_seg = pred_data.squeeze().cpu().numpy().astype(np.uint8)
-                else:
-                    seg_logits = model.encode_decode(proc_inputs, batch_img_metas)
-                    if isinstance(seg_logits, torch.Tensor):
-                        pred_seg = seg_logits.argmax(dim=1).squeeze().cpu().numpy()
+                batch_img_metas = [dict(
+                    ori_shape=proc_inputs.shape[2:],
+                    img_shape=proc_inputs.shape[2:],
+                    pad_shape=proc_inputs.shape[2:],
+                    padding_size=[0, 0, 0, 0])]
+                seg_logits = model.encode_decode(proc_inputs, batch_img_metas)
+                if isinstance(seg_logits, torch.Tensor):
+                    pred_seg = seg_logits.argmax(dim=1).squeeze().cpu().numpy()
         except Exception as e:
             runner.logger.warning(f'Prediction failed: {e}')
         return pred_seg
@@ -1857,6 +1861,23 @@ class TrainVisHook(Hook):
         label_seg = self._get_label(single_sample, proc_inputs.shape[-2],
                                     proc_inputs.shape[-1])
         pred_seg = self._get_prediction(model, proc_inputs, single_sample, runner)
+
+        pad_left = pad_right = pad_top = pad_bottom = 0
+        if single_sample and len(single_sample) > 0:
+            ps = single_sample[0].metainfo.get('padding_size', [0, 0, 0, 0])
+            pad_left, pad_right, pad_top, pad_bottom = ps
+
+        if pad_bottom > 0 or pad_right > 0:
+            H, W = rgb_vis.shape[:2]
+            rgb_vis = rgb_vis[pad_top:H - pad_bottom, pad_left:W - pad_right]
+            t_vis = t_vis[pad_top:H - pad_bottom, pad_left:W - pad_right]
+            if label_seg.shape[0] == H and label_seg.shape[1] == W:
+                label_seg = label_seg[pad_top:H - pad_bottom,
+                                      pad_left:W - pad_right]
+            if pred_seg.shape[0] == H and pred_seg.shape[1] == W:
+                pred_seg = pred_seg[pad_top:H - pad_bottom,
+                                    pad_left:W - pad_right]
+
         label_vis, pred_vis = self._render_seg(label_seg, pred_seg, palette)
 
         feat_rows, q_grid, deg_feat_rows = self._build_feat_vis(
@@ -1941,6 +1962,17 @@ class TrainVisHook(Hook):
             deg_input = torch.cat([deg_rgb_t, deg_t_t], dim=1)
             deg_pred_seg = self._get_prediction(
                 model, deg_input, single_sample, runner)
+            if pad_bottom > 0 or pad_right > 0:
+                dH, dW = deg_rgb_vis.shape[:2]
+                if dH == H and dW == W:
+                    deg_rgb_vis = deg_rgb_vis[pad_top:dH - pad_bottom,
+                                              pad_left:dW - pad_right]
+                    deg_t_vis = deg_t_vis[pad_top:dH - pad_bottom,
+                                          pad_left:dW - pad_right]
+                dpH, dpW = deg_pred_seg.shape[:2]
+                if dpH == H and dpW == W:
+                    deg_pred_seg = deg_pred_seg[pad_top:dpH - pad_bottom,
+                                                pad_left:dpW - pad_right]
             _, deg_pred_vis = self._render_seg(label_seg, deg_pred_seg, palette)
 
             deg_decoder_preds = self._get_decoder_predictions(
@@ -2009,6 +2041,17 @@ class TrainVisHook(Hook):
             deg_input = torch.cat([deg_rgb_t, deg_t_t], dim=1)
             deg_pred_seg = self._get_prediction(
                 model, deg_input, single_sample, runner)
+            if pad_bottom > 0 or pad_right > 0:
+                dH, dW = deg_rgb_vis.shape[:2]
+                if dH == H and dW == W:
+                    deg_rgb_vis = deg_rgb_vis[pad_top:dH - pad_bottom,
+                                              pad_left:dW - pad_right]
+                    deg_t_vis = deg_t_vis[pad_top:dH - pad_bottom,
+                                          pad_left:dW - pad_right]
+                dpH, dpW = deg_pred_seg.shape[:2]
+                if dpH == H and dpW == W:
+                    deg_pred_seg = deg_pred_seg[pad_top:dpH - pad_bottom,
+                                                pad_left:dpW - pad_right]
             _, deg_pred_vis = self._render_seg(label_seg, deg_pred_seg, palette)
 
             deg_decoder_preds = self._get_decoder_predictions(
@@ -2054,6 +2097,17 @@ class TrainVisHook(Hook):
             deg_input = torch.cat([deg_rgb_t, deg_t_t], dim=1)
             deg_pred_seg = self._get_prediction(
                 model, deg_input, single_sample, runner)
+            if pad_bottom > 0 or pad_right > 0:
+                dH, dW = deg_rgb_vis.shape[:2]
+                if dH == H and dW == W:
+                    deg_rgb_vis = deg_rgb_vis[pad_top:dH - pad_bottom,
+                                              pad_left:dW - pad_right]
+                    deg_t_vis = deg_t_vis[pad_top:dH - pad_bottom,
+                                          pad_left:dW - pad_right]
+                dpH, dpW = deg_pred_seg.shape[:2]
+                if dpH == H and dpW == W:
+                    deg_pred_seg = deg_pred_seg[pad_top:dpH - pad_bottom,
+                                                pad_left:dpW - pad_right]
             _, deg_pred_vis = self._render_seg(label_seg, deg_pred_seg, palette)
 
             deg_decoder_preds = self._get_decoder_predictions(
@@ -2099,6 +2153,17 @@ class TrainVisHook(Hook):
             deg_input = torch.cat([deg_rgb_t, deg_t_t], dim=1)
             deg_pred_seg = self._get_prediction(
                 model, deg_input, single_sample, runner)
+            if pad_bottom > 0 or pad_right > 0:
+                dH, dW = deg_rgb_vis.shape[:2]
+                if dH == H and dW == W:
+                    deg_rgb_vis = deg_rgb_vis[pad_top:dH - pad_bottom,
+                                              pad_left:dW - pad_right]
+                    deg_t_vis = deg_t_vis[pad_top:dH - pad_bottom,
+                                          pad_left:dW - pad_right]
+                dpH, dpW = deg_pred_seg.shape[:2]
+                if dpH == H and dpW == W:
+                    deg_pred_seg = deg_pred_seg[pad_top:dpH - pad_bottom,
+                                                pad_left:dpW - pad_right]
             _, deg_pred_vis = self._render_seg(label_seg, deg_pred_seg, palette)
 
             deg_decoder_preds = self._get_decoder_predictions(
@@ -2141,6 +2206,17 @@ class TrainVisHook(Hook):
             deg_input = torch.cat([deg_rgb_t, deg_t_t], dim=1)
             deg_pred_seg = self._get_prediction(
                 model, deg_input, single_sample, runner)
+            if pad_bottom > 0 or pad_right > 0:
+                dH, dW = deg_rgb_vis.shape[:2]
+                if dH == H and dW == W:
+                    deg_rgb_vis = deg_rgb_vis[pad_top:dH - pad_bottom,
+                                              pad_left:dW - pad_right]
+                    deg_t_vis = deg_t_vis[pad_top:dH - pad_bottom,
+                                          pad_left:dW - pad_right]
+                dpH, dpW = deg_pred_seg.shape[:2]
+                if dpH == H and dpW == W:
+                    deg_pred_seg = deg_pred_seg[pad_top:dpH - pad_bottom,
+                                                pad_left:dpW - pad_right]
             _, deg_pred_vis = self._render_seg(label_seg, deg_pred_seg, palette)
 
             deg_decoder_preds = self._get_decoder_predictions(

@@ -509,44 +509,50 @@ class RGBXTransformer(BaseModule):
                 clean_sd[nk] = v
 
             model_sd = self.state_dict()
-
-            stage_map = {
-                '1': '0', '2': '1', '3': '2', '4': '3'
-            }
-
             key_map = {}
+            in_proj_pending = {}
+
             for pretrained_key, pretrained_val in clean_sd.items():
-                if pretrained_key.startswith('layers.'):
-                    parts = pretrained_key.split('.')
-                    stage_idx = parts[1]
-                    sub_idx = parts[2]
+                if not pretrained_key.startswith('layers.'):
+                    continue
+                parts = pretrained_key.split('.')
+                stage_idx = int(parts[1])
+                sub_idx = parts[2]
+                model_stage = stage_idx + 1
 
-                    if stage_idx not in stage_map:
+                if sub_idx == '0':
+                    rest = '.'.join(parts[3:])
+                    rest = rest.replace('projection.', 'proj.')
+                    new_key = f'patch_embed{model_stage}.{rest}'
+                    extra_key = f'extra_patch_embed{model_stage}.{rest}'
+                elif sub_idx == '1':
+                    block_idx = parts[3]
+                    rest = '.'.join(parts[4:])
+                    mapped, splits = self._map_block_subkey(rest, pretrained_val)
+                    if mapped is None:
                         continue
-                    new_stage = stage_map[stage_idx]
-
-                    if sub_idx == '0':
-                        new_key = f'patch_embed{new_stage}.{pretrained_key[len("layers." + stage_idx + ".0."):]}'
-                        new_key = new_key.replace('projection.', 'proj.')
-                        extra_key = f'extra_patch_embed{new_stage}.{pretrained_key[len("layers." + stage_idx + ".0."):]}'
-                        extra_key = extra_key.replace('projection.', 'proj.')
-                    elif sub_idx == '1':
-                        block_local_idx = parts[3]
-                        rest = '.'.join(parts[4:])
-                        new_key = f'block{new_stage}.{block_local_idx}.{rest}'
-                        extra_key = f'extra_block{new_stage}.{block_local_idx}.{rest}'
-                    elif sub_idx == '2':
-                        rest = '.'.join(parts[3:])
-                        new_key = f'norm{new_stage}.{rest}'
-                        extra_key = f'extra_norm{new_stage}.{rest}'
-                    else:
+                    if splits is not None:
+                        for split_key, split_val in splits:
+                            nk = f'block{model_stage}.{block_idx}.{split_key}'
+                            ek = f'extra_block{model_stage}.{block_idx}.{split_key}'
+                            if nk in model_sd and model_sd[nk].shape == split_val.shape:
+                                key_map[nk] = split_val
+                            if ek in model_sd and model_sd[ek].shape == split_val.shape:
+                                key_map[ek] = split_val
                         continue
+                    new_key = f'block{model_stage}.{block_idx}.{mapped}'
+                    extra_key = f'extra_block{model_stage}.{block_idx}.{mapped}'
+                elif sub_idx == '2':
+                    rest = '.'.join(parts[3:])
+                    new_key = f'norm{model_stage}.{rest}'
+                    extra_key = f'extra_norm{model_stage}.{rest}'
+                else:
+                    continue
 
-                    if new_key in model_sd and model_sd[new_key].shape == pretrained_val.shape:
-                        key_map[new_key] = pretrained_val
-
-                    if extra_key in model_sd and model_sd[extra_key].shape == pretrained_val.shape:
-                        key_map[extra_key] = pretrained_val
+                if new_key in model_sd and model_sd[new_key].shape == pretrained_val.shape:
+                    key_map[new_key] = pretrained_val
+                if extra_key in model_sd and model_sd[extra_key].shape == pretrained_val.shape:
+                    key_map[extra_key] = pretrained_val
 
             model_sd.update(key_map)
             self.load_state_dict(model_sd, strict=False)
@@ -557,6 +563,38 @@ class RGBXTransformer(BaseModule):
             loaded_extra = sum(1 for k in key_map if k.startswith('extra_'))
             logger.info(f'RGBXTransformer: loaded {loaded_rgb} keys to rgb branch, '
                         f'{loaded_extra} keys to extra branch')
+
+    @staticmethod
+    def _map_block_subkey(rest, pretrained_val):
+        if rest == 'attn.attn.in_proj_weight':
+            dim = pretrained_val.shape[0] // 3
+            q_val = pretrained_val[:dim]
+            kv_val = pretrained_val[dim:]
+            return None, [
+                ('attn.q.weight', q_val),
+                ('attn.kv.weight', kv_val),
+            ]
+        if rest == 'attn.attn.in_proj_bias':
+            dim = pretrained_val.shape[0] // 3
+            q_val = pretrained_val[:dim]
+            kv_val = pretrained_val[dim:]
+            return None, [
+                ('attn.q.bias', q_val),
+                ('attn.kv.bias', kv_val),
+            ]
+        if rest.startswith('attn.attn.out_proj.'):
+            param_type = rest.split('.')[-1]
+            return f'attn.proj.{param_type}', None
+        if rest.startswith('ffn.layers.0.'):
+            param_type = rest.split('.')[-1]
+            return f'mlp.fc1.{param_type}', None
+        if rest.startswith('ffn.layers.1.'):
+            param_type = rest.split('.')[-1]
+            return f'mlp.dwconv.dwconv.{param_type}', None
+        if rest.startswith('ffn.layers.4.'):
+            param_type = rest.split('.')[-1]
+            return f'mlp.fc2.{param_type}', None
+        return rest, None
 
     def forward_features(self, x_rgb, x_e):
         B = x_rgb.shape[0]

@@ -351,16 +351,15 @@ class BIMixVisionTransformer(BaseModule):
             else:
                 state_dict = ckpt
 
-            # strip 'backbone.' prefix
             clean_sd = {}
             for k, v in state_dict.items():
                 nk = k.replace('backbone.', '', 1) if k.startswith('backbone.') else k
                 clean_sd[nk] = v
 
             model_sd = self.state_dict()
+            key_map = {}
 
-            def _map_branch(branch_prefix):
-                loaded = {}
+            for branch_prefix in ('layers_rgb.', 'layers_x.'):
                 for model_key, model_val in model_sd.items():
                     if not model_key.startswith(branch_prefix):
                         continue
@@ -373,21 +372,92 @@ class BIMixVisionTransformer(BaseModule):
                     except ValueError:
                         continue
 
-                    pretrained_key = 'layers.' + str(stage) + '.' + '.'.join(parts[1:])
-                    if pretrained_key in clean_sd and clean_sd[pretrained_key].shape == model_val.shape:
-                        loaded[model_key] = clean_sd[pretrained_key]
-                return loaded
+                    sub = parts[1]
+                    pretrained_key = None
 
-            rgb_load = _map_branch('layers_rgb.')
-            x_load = _map_branch('layers_x.')
-            model_sd.update(rgb_load)
-            model_sd.update(x_load)
+                    if sub == '0':
+                        rest = '.'.join(parts[2:])
+                        rest = rest.replace('proj.', 'projection.')
+                        pretrained_key = f'layers.{stage}.0.{rest}'
+                    elif sub == '1':
+                        blk_idx = parts[2]
+                        rest = '.'.join(parts[3:])
+                        mapped = self._map_attn_subkey(rest, model_val)
+                        if mapped is None:
+                            continue
+                        pretrained_key = f'layers.{stage}.1.{blk_idx}.{mapped}'
+                    elif sub == '2':
+                        rest = '.'.join(parts[2:])
+                        pretrained_key = f'layers.{stage}.2.{rest}'
+                    else:
+                        continue
+
+                    if pretrained_key and pretrained_key in clean_sd and \
+                            clean_sd[pretrained_key].shape == model_val.shape:
+                        key_map[model_key] = clean_sd[pretrained_key]
+
+            # Handle in_proj split: q/kv from pretrained in_proj
+            for branch_prefix in ('layers_rgb.', 'layers_x.'):
+                for model_key, model_val in model_sd.items():
+                    if not model_key.startswith(branch_prefix):
+                        continue
+                    suffix = model_key[len(branch_prefix):]
+                    parts = suffix.strip('.').split('.')
+                    if len(parts) < 4:
+                        continue
+                    try:
+                        stage = int(parts[0])
+                    except ValueError:
+                        continue
+                    if parts[1] != '1':
+                        continue
+                    blk_idx = parts[2]
+                    if len(parts) >= 5 and parts[3] == 'attn':
+                        if parts[4] == 'q' and model_key not in key_map:
+                            in_proj_key = f'layers.{stage}.1.{blk_idx}.attn.attn.in_proj_weight'
+                            if in_proj_key in clean_sd:
+                                ip_val = clean_sd[in_proj_key]
+                                dim = ip_val.shape[0] // 3
+                                if model_val.shape == ip_val[:dim].shape:
+                                    key_map[model_key] = ip_val[:dim]
+                        elif parts[4] == 'kv' and model_key not in key_map:
+                            in_proj_key_w = f'layers.{stage}.1.{blk_idx}.attn.attn.in_proj_weight'
+                            if in_proj_key_w in clean_sd:
+                                ip_val = clean_sd[in_proj_key_w]
+                                dim = ip_val.shape[0] // 3
+                                kv_val = ip_val[dim:]
+                                if model_val.shape == kv_val.shape:
+                                    key_map[model_key] = kv_val
+                        elif parts[4] == 'proj' and model_key not in key_map:
+                            out_proj_key = f'layers.{stage}.1.{blk_idx}.attn.attn.out_proj.{parts[5]}'
+                            if out_proj_key in clean_sd and \
+                                    clean_sd[out_proj_key].shape == model_val.shape:
+                                key_map[model_key] = clean_sd[out_proj_key]
+                        elif parts[4] == 'q' and len(parts) >= 6 and parts[5] == 'bias' and model_key not in key_map:
+                            in_proj_key = f'layers.{stage}.1.{blk_idx}.attn.attn.in_proj_bias'
+                            if in_proj_key in clean_sd:
+                                ip_val = clean_sd[in_proj_key]
+                                dim = ip_val.shape[0] // 3
+                                if model_val.shape == ip_val[:dim].shape:
+                                    key_map[model_key] = ip_val[:dim]
+                        elif parts[4] == 'kv' and len(parts) >= 6 and parts[5] == 'bias' and model_key not in key_map:
+                            in_proj_key = f'layers.{stage}.1.{blk_idx}.attn.attn.in_proj_bias'
+                            if in_proj_key in clean_sd:
+                                ip_val = clean_sd[in_proj_key]
+                                dim = ip_val.shape[0] // 3
+                                kv_val = ip_val[dim:]
+                                if model_val.shape == kv_val.shape:
+                                    key_map[model_key] = kv_val
+
+            model_sd.update(key_map)
             self.load_state_dict(model_sd, strict=False)
 
             import logging
             logger = logging.getLogger(__name__)
-            logger.info(f'BIMixVisionTransformer: loaded {len(rgb_load)} keys to rgb branch, '
-                        f'{len(x_load)} keys to x branch')
+            loaded_rgb = sum(1 for k in key_map if k.startswith('layers_rgb.'))
+            loaded_x = sum(1 for k in key_map if k.startswith('layers_x.'))
+            logger.info(f'BIMixVisionTransformer: loaded {loaded_rgb} keys to rgb branch, '
+                        f'{loaded_x} keys to x branch')
         elif self.init_cfg is None:
             for m in self.modules():
                 if isinstance(m, nn.Linear):
@@ -403,6 +473,15 @@ class BIMixVisionTransformer(BaseModule):
                     normal_init(m, mean=0, std=math.sqrt(2.0 / fan_out), bias=0)
         else:
             super().init_weights()
+
+    @staticmethod
+    def _map_attn_subkey(rest, model_val):
+        if rest.startswith('attn.q.') or rest.startswith('attn.kv.'):
+            return None
+        if rest.startswith('attn.proj.'):
+            param_type = rest.split('.')[-1]
+            return f'attn.attn.out_proj.{param_type}'
+        return rest
 
     def forward(self, x):
         x, x_modal = x[:, :3, :, :], x[:, 3:, :, :]

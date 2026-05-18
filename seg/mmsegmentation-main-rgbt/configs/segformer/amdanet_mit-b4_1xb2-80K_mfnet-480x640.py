@@ -47,7 +47,8 @@ model = dict(
         sr_ratios=[8, 4, 2, 1],
         init_cfg=dict(
             type='Pretrained',
-            checkpoint='./pretrain/segformer_mit-b4_512x512_160k_ade20k.pth')),
+            checkpoint='./pretrain/segformer_mit-b4_512x512_160k_ade20k.pth',
+            prefix='backbone.')),
 
     decode_head=dict(
         type='SegDecoderHead',

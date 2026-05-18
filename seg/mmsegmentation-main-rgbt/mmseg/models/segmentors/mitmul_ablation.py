@@ -3173,7 +3173,7 @@ class MiTMulABV9(_AblationBase):
                               self.predictors_priv_rgb, self.predictors_priv_t]:
                 for pred in pred_list:
                     for p in pred.shared.parameters():
-                        p.requires_grad = False
+                        p.requires_grad = True
                     for p in pred.gate_head.parameters():
                         p.requires_grad = False
                     for p in pred.weight_head.parameters():

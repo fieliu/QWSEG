@@ -358,34 +358,28 @@ class BIMixVisionTransformer(BaseModule):
                 clean_sd[nk] = v
 
             model_sd = self.state_dict()
-            # Map pretrained single-branch weights to both RGB and X branches
-            # by structural index: stage i + block j + param suffix
+
             def _map_branch(branch_prefix):
                 loaded = {}
                 for model_key, model_val in model_sd.items():
                     if not model_key.startswith(branch_prefix):
                         continue
-                    # e.g. layers_rgb.0.1.0.norm1.weight
-                    # extract: 0 (stage), 1 (block idx within stage), 0 (sub-block), norm1.weight
-                    suffix = model_key[len(branch_prefix):]  # .0.1.0.norm1.weight
+                    suffix = model_key[len(branch_prefix):]
                     parts = suffix.strip('.').split('.')
-                    if len(parts) < 4:
+                    if len(parts) < 2:
                         continue
                     try:
                         stage = int(parts[0])
-                        block_idx = int(parts[1])
                     except ValueError:
                         continue
-                    # Build pretrained key suffix: block{stage+1}.{block_idx}.<rest>
-                    pretrained_suffix = '.'.join([f'block{stage+1}', str(block_idx)] + parts[2:])
-                    for pk, pv in clean_sd.items():
-                        if pk.endswith(pretrained_suffix) and pv.shape == model_val.shape:
-                            loaded[model_key] = pv
-                            break
+
+                    pretrained_key = 'layers.' + str(stage) + '.' + '.'.join(parts[1:])
+                    if pretrained_key in clean_sd and clean_sd[pretrained_key].shape == model_val.shape:
+                        loaded[model_key] = clean_sd[pretrained_key]
                 return loaded
 
-            rgb_load = _map_branch('layers_rgb')
-            x_load = _map_branch('layers_x')
+            rgb_load = _map_branch('layers_rgb.')
+            x_load = _map_branch('layers_x.')
             model_sd.update(rgb_load)
             model_sd.update(x_load)
             self.load_state_dict(model_sd, strict=False)
@@ -411,7 +405,9 @@ class BIMixVisionTransformer(BaseModule):
             super().init_weights()
 
     def forward(self, x):
-        x, x_modal = x[:, :3, :, :], x[:, 3:6, :, :]
+        x, x_modal = x[:, :3, :, :], x[:, 3:, :, :]
+        if x_modal.shape[1] == 1:
+            x_modal = x_modal.repeat(1, 3, 1, 1)
         teacher = []
         rgb = []
         thermal = []

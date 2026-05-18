@@ -49,7 +49,7 @@ def Sobelxy(x):
 @MODELS.register_module()
 class FusionLoss(nn.Module):
     def __init__(self, loss_weight=1.0, loss_name='loss_fusion',
-                 mean=None, std=None):
+                 mean=None, std=None, ir_mean=None, ir_std=None):
         super().__init__()
         self.l1_loss = nn.L1Loss()
         self.loss_weight = loss_weight
@@ -62,17 +62,31 @@ class FusionLoss(nn.Module):
             self.register_buffer('std', torch.tensor(std).view(1, -1, 1, 1))
         else:
             self.std = None
+        if ir_mean is not None:
+            self.register_buffer('ir_mean', torch.tensor(ir_mean).view(1, -1, 1, 1))
+        else:
+            self.ir_mean = None
+        if ir_std is not None:
+            self.register_buffer('ir_std', torch.tensor(ir_std).view(1, -1, 1, 1))
+        else:
+            self.ir_std = None
 
-    def _denormalize(self, x):
-        if self.mean is not None and self.std is not None:
-            m = self.mean[:, :x.shape[1], :, :]
-            s = self.std[:, :x.shape[1], :, :]
+    def _denormalize(self, x, is_ir=False):
+        if is_ir:
+            m = self.ir_mean
+            s = self.ir_std
+        else:
+            m = self.mean
+            s = self.std
+        if m is not None and s is not None:
+            m = m[:, :x.shape[1], :, :]
+            s = s[:, :x.shape[1], :, :]
             x = x * s + m
         return x.clamp(0, 255) / 255.0
 
     def forward(self, input_vis, input_ir, fuse_output, mask=None):
-        input_vis = self._denormalize(input_vis)
-        input_ir = self._denormalize(input_ir)
+        input_vis = self._denormalize(input_vis, is_ir=False)
+        input_ir = self._denormalize(input_ir, is_ir=True)
 
         if mask is not None:
             Fuse = fuse_output * mask

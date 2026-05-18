@@ -1,5 +1,5 @@
 _base_ = [
-    '../_base_/datasets/mfnet_ab_480x640.py',
+    '../_base_/datasets/mfnet_ab_240x320.py',
     '../_base_/default_runtime.py',
 ]
 
@@ -11,7 +11,7 @@ custom_imports = dict(
              'mmseg.datasets.transforms.rgbt_augmentation'],
     allow_failed_imports=False)
 
-crop_size = (480, 640)
+crop_size = (240, 320)
 num_classes = 9
 num_layers = [3, 4, 6, 3]
 
@@ -74,7 +74,6 @@ model = dict(
     common_decode_head=_segformer_head,
     rgb_private_decode_head=_segformer_head,
     t_private_decode_head=_segformer_head,
-    prune_mid_channels=32,  # kept for API compat, unused by QualityPredictor
     gumbel_tau_init=1.0,
     gumbel_tau_min=0.1,
     gumbel_tau_decay=0.995,
@@ -83,6 +82,7 @@ model = dict(
     retention_loss_weight=5.0,
     phase1_epochs=10,
     phase2_epochs=20,
+    skip_phases=True,
     loss_align_weight=0.1,
     contrast_tau=0.07,
     contrast_num_samples=512,
@@ -91,12 +91,15 @@ model = dict(
     loss_distill_weight=0.3,
     distill_temperature=4.0,
     aux_loss_weight=0.3,
-    total_epochs=200,
+    total_epochs=50,
     mamba_layers=2,
     mamba_d_state=16,
     mamba_d_conv=4,
     mamba_expand=2,
-    test_cfg=dict(mode='slide', crop_size=crop_size, stride=(320, 427)))
+    missing_ratio=0.3,
+    global_deg_ratio=0.3,
+    local_deg_ratio=0.4,
+    test_cfg=dict(mode='whole'))
 
 custom_keys = {
     'backbone': dict(lr_mult=0.1, decay_mult=1.0),
@@ -145,17 +148,17 @@ optim_wrapper = dict(
         norm_decay_mult=0.0))
 
 param_scheduler = [
-    dict(type='LinearLR', start_factor=1e-6, by_epoch=True, begin=0, end=10),
+    dict(type='LinearLR', start_factor=1e-6, by_epoch=True, begin=0, end=2),
     dict(
         type='PolyLR',
         eta_min=0.0,
         power=1.0,
-        begin=10,
-        end=200,
+        begin=2,
+        end=50,
         by_epoch=True),
 ]
 
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=200, val_interval=5)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=50, val_interval=2)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
@@ -164,9 +167,9 @@ default_hooks = dict(
     logger=dict(type='LoggerHook', interval=20, log_metric_by_epoch=True),
     param_scheduler=dict(type='ParamSchedulerHook'),
     checkpoint=dict(
-        type='CheckpointHook', by_epoch=True, interval=5,
+        type='CheckpointHook', by_epoch=True, interval=10,
         save_best='mIoU'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
     visualization=dict(type='SegVisualizationHook'))
 
-custom_hooks = [dict(type='TrainVisHook', interval=5, num_samples=2)]
+custom_hooks = [dict(type='TrainVisHook', interval=2, num_samples=2)]

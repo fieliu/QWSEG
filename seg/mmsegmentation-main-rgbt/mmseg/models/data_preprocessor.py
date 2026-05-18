@@ -115,6 +115,9 @@ class SegDataPreProcessor(BaseDataPreprocessor):
             for _input in inputs:
                 if _input.size(0) == 3:
                     converted_inputs.append(_input[[2, 1, 0], ...])
+                elif _input.size(0) == 4:
+                    converted_inputs.append(
+                        torch.cat([_input[[2, 1, 0], ...], _input[3:, ...]], dim=0))
                 elif _input.size(0) == 6:
                     converted_inputs.append(
                         torch.cat([_input[[2, 1, 0], ...], _input[3:, ...]], dim=0))

@@ -1,11 +1,10 @@
 _base_ = [
-    '../_base_/datasets/mfnet_480x640.py',
+    '../_base_/datasets/mfnet_ab_480x640.py',
     '../_base_/default_runtime.py',
 ]
 
 custom_imports = dict(
-    imports=['mmseg.models.segmentors.crm_mask2former',
-             'mmseg.models.backbones.rgbt_swin',
+    imports=['mmseg.models.segmentors.swin_quality_mask2former',
              'mmseg.engine',
              'mmseg.datasets.mfnet',
              'mmseg.datasets.transforms.loading',
@@ -18,13 +17,53 @@ depths = [2, 2, 6, 2]
 
 data_preprocessor = dict(
     type='SegDataPreProcessor',
-    mean=[123.675, 116.28, 103.53, 127.0],
-    std=[58.395, 57.12, 57.375, 60.0],
-    bgr_to_rgb=True,
+    mean=[123.675, 116.28, 103.53, 123.675, 116.28, 103.53],
+    std=[58.395, 57.12, 57.375, 58.395, 57.12, 57.375],
+    bgr_to_rgb=False,
     pad_val=0,
     seg_pad_val=255,
     size=crop_size,
     test_cfg=dict(size_divisor=32))
+
+swin_common = dict(
+    type='SwinTransformer',
+    embed_dims=96,
+    depths=depths,
+    num_heads=[3, 6, 12, 24],
+    window_size=7,
+    mlp_ratio=4,
+    qkv_bias=True,
+    qk_scale=None,
+    drop_rate=0.,
+    attn_drop_rate=0.,
+    drop_path_rate=0.3,
+    patch_norm=True,
+    out_indices=(0, 1, 2, 3),
+    with_cp=False,
+    frozen_stages=-1,
+    init_cfg=dict(
+        type='Pretrained',
+        checkpoint='./pretrain/swin_tiny_patch4_window7_224_20220317-1cdeb081.pth'))
+
+swin_private = dict(
+    type='SwinTransformer',
+    embed_dims=96,
+    depths=depths,
+    num_heads=[3, 6, 12, 24],
+    window_size=7,
+    mlp_ratio=4,
+    qkv_bias=True,
+    qk_scale=None,
+    drop_rate=0.,
+    attn_drop_rate=0.,
+    drop_path_rate=0.3,
+    patch_norm=True,
+    out_indices=(0, 1, 2, 3),
+    with_cp=False,
+    frozen_stages=-1,
+    init_cfg=dict(
+        type='Pretrained',
+        checkpoint='./pretrain/swin_tiny_patch4_window7_224_20220317-1cdeb081.pth'))
 
 _mask2former_head = dict(
     type='Mask2FormerHead',
@@ -134,76 +173,123 @@ _mask2former_head = dict(
         sampler=dict(type='mmdet.MaskPseudoSampler')))
 
 model = dict(
-    type='CRMMask2Former',
+    type='QualityGatedSwinMask2Former',
     data_preprocessor=data_preprocessor,
     pretrained=None,
-    backbone=dict(
-        type='RGBTSwinTransformer',
-        embed_dims=96,
-        depths=depths,
-        num_heads=[3, 6, 12, 24],
-        window_size=7,
-        mlp_ratio=4,
-        qkv_bias=True,
-        qk_scale=None,
-        drop_rate=0.,
-        attn_drop_rate=0.,
-        drop_path_rate=0.3,
-        patch_norm=True,
-        out_indices=(0, 1, 2, 3),
-        with_cp=False,
-        frozen_stages=-1,
-        share_start_idx=4,
-        fusion_type='MAX',
-        thr_in_channels=1,
-        init_cfg=dict(
-            type='Pretrained',
-            checkpoint='./pretrain/swin_tiny_patch4_window7_224_20220317-1cdeb081.pth')),
+    backbone=swin_common,
+    private_branch_rgb=swin_private,
+    private_branch_t=swin_private,
     decode_head=_mask2former_head,
-    mws_weight=1.0,
-    sdc_weight=1.0,
-    sdn_weight=1.0,
-    mask_enabled=True,
-    mask_size=(256, 320),
-    mask_patch_size=32,
-    model_patch_size=4,
-    mask_ratio=0.5,
-    mask_type='patch',
-    mask_strategy='rand_comp',
-    train_cfg=dict(),
+    common_decode_head=dict(
+        type='FCNHead',
+        in_channels=768,
+        channels=256,
+        num_classes=num_classes,
+        num_convs=2,
+        in_index=-1,
+        concat_input=True,
+        loss_decode=[
+            dict(type='CrossEntropyLoss', loss_name='loss_ce'),
+            dict(type='DiceLoss', use_sigmoid=False, activate=True, loss_name='loss_dice'),
+        ]),
+    rgb_private_decode_head=dict(
+        type='FCNHead',
+        in_channels=768,
+        channels=256,
+        num_classes=num_classes,
+        num_convs=2,
+        in_index=-1,
+        concat_input=True,
+        loss_decode=[
+            dict(type='CrossEntropyLoss', loss_name='loss_ce'),
+            dict(type='DiceLoss', use_sigmoid=False, activate=True, loss_name='loss_dice'),
+        ]),
+    t_private_decode_head=dict(
+        type='FCNHead',
+        in_channels=768,
+        channels=256,
+        num_classes=num_classes,
+        num_convs=2,
+        in_index=-1,
+        concat_input=True,
+        loss_decode=[
+            dict(type='CrossEntropyLoss', loss_name='loss_ce'),
+            dict(type='DiceLoss', use_sigmoid=False, activate=True, loss_name='loss_dice'),
+        ]),
+    gumbel_tau_init=1.0,
+    gumbel_tau_min=0.1,
+    gumbel_tau_decay=0.995,
+    retention_min=0.5,
+    retention_max=0.95,
+    retention_loss_weight=5.0,
+    phase1_epochs=20,
+    phase2_epochs=60,
+    loss_align_weight=0.1,
+    contrast_tau=0.07,
+    contrast_num_samples=512,
+    loss_smooth_align_weight=0.3,
+    loss_invariant_weight=0.03,
+    loss_distill_weight=0.3,
+    distill_temperature=4.0,
+    aux_loss_weight=0.3,
+    total_epochs=200,
+    mamba_d_state=16,
+    mamba_d_conv=4,
+    mamba_expand=2,
+    missing_ratio=0.3,
+    global_deg_ratio=0.3,
+    local_deg_ratio=0.4,
     test_cfg=dict(mode='whole'))
 
 backbone_norm_multi = dict(lr_mult=0.1, decay_mult=0.0)
 backbone_embed_multi = dict(lr_mult=0.1, decay_mult=0.0)
-embed_multi = dict(lr_mult=1.0, decay_mult=0.0)
 custom_keys = {
     'backbone': dict(lr_mult=0.1, decay_mult=1.0),
+    'private_branch_rgb': dict(lr_mult=0.1, decay_mult=1.0),
+    'private_branch_t': dict(lr_mult=0.1, decay_mult=1.0),
     'backbone.patch_embed.norm': backbone_norm_multi,
     'backbone.norm': backbone_norm_multi,
     'absolute_pos_embed': backbone_embed_multi,
     'relative_position_bias_table': backbone_embed_multi,
-    'query_embed': embed_multi,
-    'query_feat': embed_multi,
-    'level_embed': embed_multi
 }
 custom_keys.update({
-    f'backbone.rgb_branch.stages.{stage_id}.blocks.{block_id}.norm': backbone_norm_multi
+    f'backbone.stages.{stage_id}.blocks.{block_id}.norm': backbone_norm_multi
     for stage_id, num_blocks in enumerate(depths)
     for block_id in range(num_blocks)
 })
 custom_keys.update({
-    f'backbone.rgb_branch.stages.{stage_id}.downsample.norm': backbone_norm_multi
+    f'backbone.stages.{stage_id}.downsample.norm': backbone_norm_multi
     for stage_id in range(len(depths) - 1)
 })
 custom_keys.update({
-    f'backbone.thr_branch.stages.{stage_id}.blocks.{block_id}.norm': backbone_norm_multi
+    f'private_branch_rgb.stages.{stage_id}.blocks.{block_id}.norm': backbone_norm_multi
     for stage_id, num_blocks in enumerate(depths)
     for block_id in range(num_blocks)
 })
 custom_keys.update({
-    f'backbone.thr_branch.stages.{stage_id}.downsample.norm': backbone_norm_multi
+    f'private_branch_rgb.stages.{stage_id}.downsample.norm': backbone_norm_multi
     for stage_id in range(len(depths) - 1)
 })
+custom_keys.update({
+    f'private_branch_t.stages.{stage_id}.blocks.{block_id}.norm': backbone_norm_multi
+    for stage_id, num_blocks in enumerate(depths)
+    for block_id in range(num_blocks)
+})
+custom_keys.update({
+    f'private_branch_t.stages.{stage_id}.downsample.norm': backbone_norm_multi
+    for stage_id in range(len(depths) - 1)
+})
+
+predictor_keys = {}
+for pred_name in ['predictors_common_rgb', 'predictors_common_t',
+                  'predictors_priv_rgb', 'predictors_priv_t']:
+    predictor_keys[f'{pred_name}'] = dict(lr_mult=5.0, decay_mult=1.0)
+    for stage_id in range(4):
+        for sub in ['local_conv1', 'local_conv2', 'fuse_conv1', 'fuse_conv2',
+                    'gate_head', 'weight_head']:
+            predictor_keys[f'{pred_name}.{stage_id}.{sub}'] = dict(lr_mult=5.0, decay_mult=1.0)
+
+custom_keys.update(predictor_keys)
 
 optimizer = dict(
     type='AdamW', lr=0.0001, weight_decay=0.05, eps=1e-8, betas=(0.9, 0.999))
@@ -216,26 +302,26 @@ optim_wrapper = dict(
         norm_decay_mult=0.0))
 
 param_scheduler = [
-    dict(type='LinearLR', start_factor=1e-6, by_epoch=False, begin=0, end=1500),
+    dict(type='LinearLR', start_factor=1e-6, by_epoch=True, begin=0, end=4),
     dict(
         type='PolyLR',
         eta_min=0.0,
         power=0.9,
-        begin=1500,
-        end=80000,
-        by_epoch=False),
+        begin=4,
+        end=200,
+        by_epoch=True),
 ]
 
-train_cfg = dict(type='IterBasedTrainLoop', max_iters=80000, val_interval=5000)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=200, val_interval=5)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
 default_hooks = dict(
     timer=dict(type='IterTimerHook'),
-    logger=dict(type='LoggerHook', interval=50, log_metric_by_epoch=False),
+    logger=dict(type='LoggerHook', interval=50, log_metric_by_epoch=True),
     param_scheduler=dict(type='ParamSchedulerHook'),
     checkpoint=dict(
-        type='CheckpointHook', by_epoch=False, interval=5000,
+        type='CheckpointHook', by_epoch=True, interval=5,
         save_best='mIoU'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
     visualization=dict(type='SegVisualizationHook'))

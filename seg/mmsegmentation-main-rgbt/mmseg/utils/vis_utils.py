@@ -213,6 +213,10 @@ def detect_model_type(model):
         return 'ab_v8'
     if type_name == 'MiTMulABV9':
         return 'ab_v9'
+    if type_name == 'QualityGatedMiTMamba':
+        return 'mit_quality_mamba'
+    if type_name == 'QualityGatedSwinMask2Former':
+        return 'swin_quality_mask2former'
     return 'unknown'
 
 

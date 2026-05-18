@@ -2646,29 +2646,59 @@ class MiTMulABV8(_AblationBase):
 
 
 
-class TokenPrunePredictor(nn.Module):
-    def __init__(self, in_channels, mid_channels=32):
-        super().__init__()
-        self.shared = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, 1, bias=False),
-            nn.ReLU(inplace=True))
-        self.gate_head = nn.Conv2d(mid_channels, 2, 1, bias=True)
-        self.weight_head = nn.Conv2d(mid_channels, 1, 1, bias=True)
+class QualityPredictor(nn.Module):
+    """Per-stage quality predictor with masked global context.
 
-    def forward(self, x):
-        feat = self.shared(x)
-        gate_logits = self.gate_head(feat)
-        q_weight = torch.sigmoid(self.weight_head(feat))
+    Input: x [B, C, H, W] feature map, mask [B, 1, H, W] hard mask (detached).
+    Output: gate_logits [B, 2, H, W], q_weight [B, 1, H, W] clamped to [1e-7, 1-1e-7].
+    """
+
+    def __init__(self, in_channels):
+        super().__init__()
+        hidden = min(128, max(64, in_channels // 2))
+        self.hidden = hidden
+        self.local_conv1 = nn.Conv2d(in_channels, hidden, 1, bias=False)
+        self.local_conv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
+        self.fuse_conv1 = nn.Conv2d(hidden * 2, hidden, 1, bias=False)
+        self.fuse_conv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
+        self.gate_head = nn.Conv2d(hidden, 2, 1, bias=True)
+        self.weight_head = nn.Conv2d(hidden, 1, 1, bias=True)
+
+    def forward(self, x, mask):
+        # local feature extraction
+        local = F.gelu(self.local_conv1(x))
+        local = F.gelu(self.local_conv2(local))
+
+        # masked global pooling (mask detached to prevent predictor from
+        # manipulating it directly)
+        mask_d = mask.detach()
+        mask_sum = mask_d.sum(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+        global_feat = (local * mask_d).sum(dim=(2, 3), keepdim=True) / mask_sum
+        global_feat = global_feat.expand(-1, -1, x.shape[2], x.shape[3])
+
+        # local-global fusion
+        fused = torch.cat([local, global_feat], dim=1)
+        fused = F.gelu(self.fuse_conv1(fused))
+        fused = F.gelu(self.fuse_conv2(fused))
+
+        # dual heads
+        gate_logits = self.gate_head(fused)
+        q_weight = torch.sigmoid(self.weight_head(fused)).clamp(1e-7, 1 - 1e-7)
         return gate_logits, q_weight
+
+
+# Keep old name as alias for backward compatibility
+TokenPrunePredictor = QualityPredictor
 
 
 def _gumbel_softmax_hard(gate_logits, tau=1.0, training=True):
     B, C2, H, W = gate_logits.shape
-    gate_logits_2d = gate_logits.permute(0, 2, 3, 1).reshape(-1, 2)
+    # AMP safety: clamp logits before softmax
+    gate_logits_2d = gate_logits.permute(0, 2, 3, 1).reshape(-1, 2).clamp(-10, 10)
     if training:
         y_soft = F.gumbel_softmax(gate_logits_2d, tau=tau, hard=False)
     else:
-        y_soft = F.softmax(gate_logits_2d / tau, dim=-1)
+        y_soft = F.softmax(gate_logits_2d / max(tau, 0.01), dim=-1).clamp(1e-7, 1 - 1e-7)
     hard_idx = y_soft.argmax(dim=-1, keepdim=True)
     hard_onehot = torch.zeros_like(y_soft).scatter_(1, hard_idx, 1.0)
     if training:
@@ -2710,7 +2740,8 @@ def _downsample_mask(D, H_k, W_k):
 def _forward_branch_pruned(backbone, img, predictor_list, cum_D_prev_list,
                            gumbel_tau, is_common,
                            other_D_list=None, other_q_list=None,
-                           training=True, force_all_keep=False):
+                           training=True, force_all_keep=False,
+                           phase=3):
     outs = []
     all_D_raw = []
     all_q_weight = []
@@ -2726,12 +2757,21 @@ def _forward_branch_pruned(backbone, img, predictor_list, cum_D_prev_list,
         q_weight = None
         cum_D = None
 
+        prev_mask = cum_D if cum_D is not None else \
+            torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
+
         if force_all_keep:
             D_raw = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
-            q_weight = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
+            if phase == 1:
+                q_weight = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
+            elif i < len(predictor_list) and predictor_list[i] is not None:
+                x_2d = nlc_to_nchw(x, hw_shape)
+                _, q_weight = predictor_list[i](x_2d.detach(), prev_mask)
+            else:
+                q_weight = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
         elif i < len(predictor_list) and predictor_list[i] is not None:
             x_2d = nlc_to_nchw(x, hw_shape)
-            gate_logits, q_weight = predictor_list[i](x_2d.detach())
+            gate_logits, q_weight = predictor_list[i](x_2d.detach(), prev_mask)
             D_raw, _ = _gumbel_softmax_hard(
                 gate_logits, tau=gumbel_tau, training=training)
 
@@ -2841,7 +2881,7 @@ def _forward_branch_pruned(backbone, img, predictor_list, cum_D_prev_list,
 def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
                                 predictors_rgb, predictors_t,
                                 gumbel_tau, training=True,
-                                force_all_keep=False):
+                                force_all_keep=False, phase=3):
     outs = []
     all_D_rgb = []
     all_D_t = []
@@ -2863,21 +2903,34 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
         cum_D_rgb = None
         cum_D_t = None
 
+        prev_mask_rgb = cum_D_rgb if cum_D_rgb is not None else \
+            torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
+        prev_mask_t = cum_D_t if cum_D_t is not None else \
+            torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
+
         if force_all_keep:
             D_rgb_raw = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
             D_t_raw = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
-            q_rgb = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
-            q_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
+            if phase == 1:
+                q_rgb = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
+                q_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
+            elif i < len(predictors_rgb) and predictors_rgb[i] is not None:
+                x_2d = nlc_to_nchw(x, hw_shape)
+                _, q_rgb = predictors_rgb[i](x_2d[:orig_B].detach(), prev_mask_rgb)
+                _, q_t = predictors_t[i](x_2d[orig_B:].detach(), prev_mask_t)
+            else:
+                q_rgb = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
+                q_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
         elif i < len(predictors_rgb) and predictors_rgb[i] is not None:
             x_2d = nlc_to_nchw(x, hw_shape)
             x_rgb_2d = x_2d[:orig_B]
             x_t_2d = x_2d[orig_B:]
 
-            gate_logits_rgb, q_rgb = predictors_rgb[i](x_rgb_2d.detach())
+            gate_logits_rgb, q_rgb = predictors_rgb[i](x_rgb_2d.detach(), prev_mask_rgb)
             D_rgb_raw, _ = _gumbel_softmax_hard(
                 gate_logits_rgb, tau=gumbel_tau, training=training)
 
-            gate_logits_t, q_t = predictors_t[i](x_t_2d.detach())
+            gate_logits_t, q_t = predictors_t[i](x_t_2d.detach(), prev_mask_t)
             D_t_raw, _ = _gumbel_softmax_hard(
                 gate_logits_t, tau=gumbel_tau, training=training)
 
@@ -3069,6 +3122,7 @@ class MiTMulABV9(_AblationBase):
                  distill_temperature: float = 4.0,
                  aux_loss_weight: float = 0.3,
                  total_epochs: int = 200,
+                 quality_threshold: float = 0.3,
                  mamba_layers: int = 2,
                  mamba_d_state: int = 16,
                  mamba_d_conv: int = 4,
@@ -3095,16 +3149,16 @@ class MiTMulABV9(_AblationBase):
         self.embed_dims_list = [embed_dims_base * h for h in num_heads]
 
         self.predictors_common_rgb = nn.ModuleList([
-            TokenPrunePredictor(ch, prune_mid_channels)
+            QualityPredictor(ch)
             for ch in self.embed_dims_list])
         self.predictors_common_t = nn.ModuleList([
-            TokenPrunePredictor(ch, prune_mid_channels)
+            QualityPredictor(ch)
             for ch in self.embed_dims_list])
         self.predictors_priv_rgb = nn.ModuleList([
-            TokenPrunePredictor(ch, prune_mid_channels)
+            QualityPredictor(ch)
             for ch in self.embed_dims_list])
         self.predictors_priv_t = nn.ModuleList([
-            TokenPrunePredictor(ch, prune_mid_channels)
+            QualityPredictor(ch)
             for ch in self.embed_dims_list])
 
         self.fuse_rgb = nn.ModuleList()
@@ -3145,6 +3199,7 @@ class MiTMulABV9(_AblationBase):
         self.distill_temperature = distill_temperature
         self.aux_loss_weight = aux_loss_weight
         self.total_epochs = total_epochs
+        self.quality_threshold = quality_threshold
 
         self._reset_parameters()
 
@@ -3296,7 +3351,7 @@ class MiTMulABV9(_AblationBase):
                 predictors_t=self.predictors_common_t,
                 gumbel_tau=self.gumbel_tau,
                 training=use_gumbel,
-                force_all_keep=force_all_keep)
+                force_all_keep=force_all_keep, phase=phase)
 
         zc_rgb_list = [feat[:B] for feat in zc_rgbt_outs]
         zc_t_list = [feat[B:] for feat in zc_rgbt_outs]
@@ -3521,11 +3576,8 @@ class MiTMulABV9(_AblationBase):
                     deg_conf_s = F.interpolate(
                         deg_conf_s.unsqueeze(1).float(), size=kl_per_pixel.shape[1:],
                         mode='nearest').squeeze(1)
-                mask = (deg_conf_s > self.quality_threshold).float()
-                if mask.sum() > 0:
-                    kl_masked = (kl_per_pixel * mask).sum() / mask.sum()
-                else:
-                    kl_masked = kl_per_pixel.mean()
+                weight = deg_conf_s.clamp(min=1e-6)
+                kl_masked = (kl_per_pixel * weight).sum() / weight.sum()
                 losses['loss_distill'] = self.loss_distill_weight * (T * T) * kl_masked
 
             if self.loss_invariant_weight > 0 and phase >= 3:
@@ -7189,3 +7241,286 @@ class MiTMulABV1(_AblationBase):
 
 
 
+
+
+def _quality_mask_to_swin_bias(D_2d, window_size, shift_size, eps=1e-9):
+    """Convert per-pixel quality mask to Swin window-level attention bias."""
+    B, _, H, W = D_2d.shape
+    D = D_2d.squeeze(1)
+    pad_r = (window_size - W % window_size) % window_size
+    pad_b = (window_size - H % window_size) % window_size
+    if pad_r > 0 or pad_b > 0:
+        D = F.pad(D, (0, pad_r, 0, pad_b), value=1.0)
+    H_pad, W_pad = D.shape[1], D.shape[2]
+    if shift_size > 0:
+        D = torch.roll(D, shifts=(-shift_size, -shift_size), dims=(1, 2))
+    wh = window_size
+    nW_h, nW_w = H_pad // wh, W_pad // wh
+    D_windows = D.reshape(B, nW_h, wh, nW_w, wh)
+    D_windows = D_windows.permute(0, 1, 3, 2, 4).contiguous()
+    D_windows = D_windows.view(-1, wh * wh)
+    bias = torch.log(D_windows + eps)
+    return bias.view(-1, 1, 1, wh * wh)
+
+
+def _forward_swin_quality_pruned(swin_branch, img, predictors,
+                                  gumbel_tau, training=True,
+                                  force_all_keep=False, phase=3):
+    """Forward a single Swin branch with per-block quality attention masking."""
+    window_size = 7
+    outs, all_D_raw, all_q_weight, cum_D_list = [], [], [], []
+    stages = swin_branch.stages
+    x, (H, W) = swin_branch.patch_embed(img)
+    B_tok = x.shape[0]
+    cum_D = None
+    for i, stage in enumerate(stages):
+        blocks, downsample = stage.blocks, stage.downsample
+        D_raw = q_weight = None
+        prev_mask = cum_D if cum_D is not None else \
+            torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
+        if force_all_keep:
+            D_raw = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
+            if phase == 1:
+                q_weight = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
+            elif i < len(predictors) and predictors[i] is not None:
+                x_2d = x.reshape(B_tok, H, W, -1).permute(0, 3, 1, 2)
+                _, q_weight = predictors[i](x_2d.detach(), prev_mask)
+            else:
+                q_weight = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
+        elif i < len(predictors) and predictors[i] is not None:
+            x_2d = x.reshape(B_tok, H, W, -1).permute(0, 3, 1, 2)
+            gate_logits, q_weight = predictors[i](x_2d.detach(), prev_mask)
+            D_raw, _ = _gumbel_softmax_hard(gate_logits, tau=gumbel_tau, training=training)
+        if D_raw is None:
+            D_raw = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
+        if q_weight is None:
+            q_weight = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
+        if cum_D is not None:
+            if cum_D.shape[2:] != (H, W):
+                cum_D = F.interpolate(cum_D.float(), size=(H, W), mode='nearest')
+            cum_D = D_raw * cum_D
+        else:
+            cum_D = D_raw
+        all_D_raw.append(D_raw)
+        all_q_weight.append(q_weight)
+        cum_D_list.append(cum_D)
+        for j, block in enumerate(blocks):
+            shift_size = 0 if (j % 2 == 0) else window_size // 2
+            quality_bias = None
+            if cum_D is not None:
+                quality_bias = _quality_mask_to_swin_bias(cum_D, window_size, shift_size)
+            x = block(x, (H, W), attn_mask=quality_bias)
+            if cum_D is not None:
+                x = x * cum_D.view(B_tok, H * W, 1)
+        x_norm = swin_branch.norm(x) if hasattr(swin_branch, 'norm') else x
+        stage_out = x_norm.view(B_tok, H, W, -1).permute(0, 3, 1, 2)
+        outs.append(stage_out)
+        if downsample is not None:
+            x = downsample(x, (H, W))
+            H, W = (H + 1) // 2, (W + 1) // 2
+    return outs, all_D_raw, all_q_weight, cum_D_list
+
+
+def _forward_swin_common_quality(swin_backbone, rgb_img, t_img, orig_B,
+                                  predictors_rgb, predictors_t,
+                                  gumbel_tau, training=True,
+                                  force_all_keep=False, phase=3):
+    """Forward RGBTSwinTransformer with quality masking on both branches."""
+    rgb_outs, D_rgb, q_rgb, cum_rgb = _forward_swin_quality_pruned(
+        swin_backbone.rgb_branch, rgb_img, predictors_rgb,
+        gumbel_tau, training=training,
+        force_all_keep=force_all_keep, phase=phase)
+    t_outs, D_t, q_t, cum_t = _forward_swin_quality_pruned(
+        swin_backbone.thr_branch, t_img, predictors_t,
+        gumbel_tau, training=training,
+        force_all_keep=force_all_keep, phase=phase)
+    return rgb_outs, t_outs, D_rgb, D_t, q_rgb, q_t, cum_rgb, cum_t
+
+
+@MODELS.register_module()
+class SwinV9Mask2Former(_AblationBase):
+    """V9 architecture with Swin backbone + Mask2Former decoder.
+
+    Key differences from MiTMulABV9:
+    - Swin backbone (window attention) instead of MiT (spatial-reduction attn)
+    - Quality mask is converted to per-window attention bias (no max-pooling)
+    - Shifted-window blocks apply the same cyclic shift to the quality mask
+    - Mask2FormerHead as main decoder
+    - SegformerHeads as auxiliary decoders
+    """
+
+    def __init__(self, backbone, decode_head,
+                 common_decode_head=None, rgb_private_decode_head=None,
+                 t_private_decode_head=None, neck=None, auxiliary_head=None,
+                 train_cfg=None, test_cfg=None, data_preprocessor=None,
+                 pretrained=None, prune_mid_channels=32,
+                 gumbel_tau_init=1.0, gumbel_tau_min=0.1, gumbel_tau_decay=0.995,
+                 retention_min=0.3, retention_max=0.7, retention_loss_weight=0.01,
+                 phase1_epochs=10, phase2_epochs=20, total_epochs=200,
+                 loss_align_weight=0.1, contrast_tau=0.07, contrast_num_samples=512,
+                 loss_smooth_align_weight=0.3, loss_invariant_weight=0.03,
+                 loss_distill_weight=0.3, distill_temperature=4.0,
+                 aux_loss_weight=0.3, missing_ratio=0.3,
+                 global_deg_ratio=0.3, local_deg_ratio=0.4,
+                 fusion_type='ADD', init_cfg=None):
+        super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
+        if pretrained is not None:
+            backbone['pretrained'] = pretrained
+        self.backbone = MODELS.build(backbone)
+        if neck is not None:
+            self.neck = MODELS.build(neck)
+        self._init_decode_head(decode_head)
+        self._init_aux_heads(common_decode_head, rgb_private_decode_head,
+                             t_private_decode_head, auxiliary_head)
+        self.train_cfg, self.test_cfg, self.fusion_type = train_cfg, test_cfg, fusion_type
+        assert self.with_decode_head
+
+        embed_dims = backbone.get('embed_dims', 128)
+        depths = backbone.get('depths', [2, 2, 18, 2])
+        self.embed_dims_list = [embed_dims * (2 ** i) for i in range(len(depths))]
+
+        self.predictors_common_rgb = nn.ModuleList([
+            QualityPredictor(ch) for ch in self.embed_dims_list])
+        self.predictors_common_t = nn.ModuleList([
+            QualityPredictor(ch) for ch in self.embed_dims_list])
+
+        for k, v in dict(gumbel_tau=gumbel_tau_init, gumbel_tau_min=gumbel_tau_min,
+            gumbel_tau_decay=gumbel_tau_decay, retention_min=retention_min,
+            retention_max=retention_max, retention_loss_weight=retention_loss_weight,
+            phase1_epochs=phase1_epochs, phase2_epochs=phase2_epochs,
+            total_epochs=total_epochs, loss_align_weight=loss_align_weight,
+            contrast_tau=contrast_tau, contrast_num_samples=contrast_num_samples,
+            loss_smooth_align_weight=loss_smooth_align_weight,
+            loss_invariant_weight=loss_invariant_weight,
+            loss_distill_weight=loss_distill_weight,
+            distill_temperature=distill_temperature, aux_loss_weight=aux_loss_weight,
+            missing_ratio=missing_ratio, global_deg_ratio=global_deg_ratio,
+            local_deg_ratio=local_deg_ratio).items():
+            setattr(self, k, v)
+
+    def _get_training_phase(self, epoch):
+        r = min(epoch / max(self.total_epochs, 1), 1.0)
+        if r < 0.1: return 1
+        elif r < 0.3: return 2
+        else: return 3
+
+    def _update_training_phase(self, epoch):
+        phase = self._get_training_phase(epoch)
+        for pred_list in [self.predictors_common_rgb, self.predictors_common_t]:
+            for pred in pred_list:
+                if phase == 1:
+                    for p in pred.parameters(): p.requires_grad = False
+                elif phase == 2:
+                    for p in pred.shared.parameters(): p.requires_grad = True
+                    for p in pred.gate_head.parameters(): p.requires_grad = False
+                    for p in pred.weight_head.parameters(): p.requires_grad = True
+                else:
+                    for p in pred.parameters(): p.requires_grad = True
+        if self.training and phase >= 3:
+            self.gumbel_tau = max(self.gumbel_tau * self.gumbel_tau_decay, self.gumbel_tau_min)
+        return phase
+
+    def _compute_retention_loss(self, all_D_raw):
+        loss = torch.tensor(0.0, device=all_D_raw[0].device if all_D_raw[0] is not None else 'cpu')
+        cnt = 0
+        for D in all_D_raw:
+            if D is None: continue
+            r = D.mean()
+            if r < self.retention_min: loss = loss + (self.retention_min - r) ** 2
+            elif r > self.retention_max: loss = loss + (r - self.retention_max) ** 2
+            cnt += 1
+        return loss / max(cnt, 1)
+
+    def _decode_head_predict_logits(self, feats, head=None):
+        if head is None: head = self.decode_head
+        return head.predict(feats, [dict(ori_shape=feats[0].shape[2:], img_shape=feats[0].shape[2:])] * feats[0].shape[0], self.test_cfg)
+
+    def init_weights(self):
+        self.backbone.init_weights()
+        if self.init_cfg is not None: super().init_weights()
+
+    def _extract_feat_single(self, input_rgb, input_t):
+        B = input_rgb.shape[0]
+        epoch = self.current_epoch if hasattr(self, 'current_epoch') else 0
+        phase = self._get_training_phase(epoch)
+        force_all_keep = (phase < 3)
+        use_gumbel = self.training and not force_all_keep
+        rgb_outs, t_outs, D_r, D_t, q_r, q_t, cum_r, cum_t = \
+            _forward_swin_common_quality(
+                self.backbone, input_rgb, input_t, orig_B=B,
+                predictors_rgb=self.predictors_common_rgb,
+                predictors_t=self.predictors_common_t,
+                gumbel_tau=self.gumbel_tau, training=use_gumbel,
+                force_all_keep=force_all_keep, phase=phase)
+        return rgb_outs, t_outs, D_r, D_t, q_r, q_t, cum_r, cum_t
+
+    def loss(self, inputs, data_samples):
+        input_rgb, input_ir = inputs[:, :3, :, :], inputs[:, 3:, :, :]
+        B = input_rgb.shape[0]
+        epoch = self.current_epoch if hasattr(self, 'current_epoch') else 0
+        phase = self._get_training_phase(epoch)
+        self._update_training_phase(epoch)
+        zc_rgb, zc_t, D_r, D_t, q_r, q_t, cum_r, cum_t = \
+            self._extract_feat_single(input_rgb, input_ir)
+        fused = [torch.max(zc_rgb[i], zc_t[i]) if self.fusion_type == 'MAX'
+                 else (zc_rgb[i] + zc_t[i]) / 2.0 for i in range(len(zc_rgb))]
+        losses = {}
+        seg_label = self._stack_batch_gt(data_samples)
+        for ds in data_samples:
+            if hasattr(ds, 'gt_sem_seg'):
+                ds.gt_sem_seg.data = ds.gt_sem_seg.data.squeeze(0)
+        main_loss = self.decode_head.loss(fused, data_samples, self.train_cfg)
+        losses.update(add_prefix(main_loss, 'decode'))
+        if self.common_decode_head is not None:
+            losses.update(add_prefix(
+                self.common_decode_head.loss(fused, data_samples, self.train_cfg),
+                'common_decode'))
+        if self.rgb_private_decode_head is not None:
+            losses.update(add_prefix(
+                self.rgb_private_decode_head.loss(zc_rgb, data_samples, self.train_cfg),
+                'rgb_private_decode'))
+        if self.t_private_decode_head is not None:
+            losses.update(add_prefix(
+                self.t_private_decode_head.loss(zc_t, data_samples, self.train_cfg),
+                't_private_decode'))
+        if self.loss_align_weight > 0:
+            gt_labels = seg_label.squeeze(1).long()
+            lc, cnt = 0.0, 0
+            for i in range(len(zc_rgb)):
+                if zc_rgb[i] is not None and zc_t[i] is not None:
+                    qr = q_r[i] if q_r[i] is not None else \
+                        torch.ones(B, 1, zc_rgb[i].shape[2], zc_rgb[i].shape[3], device=zc_rgb[i].device)
+                    qt = q_t[i] if q_t[i] is not None else \
+                        torch.ones(B, 1, zc_t[i].shape[2], zc_t[i].shape[3], device=zc_t[i].device)
+                    lc += _compute_cross_modal_contrastive_loss(
+                        zc_rgb[i], zc_t[i], gt_labels, qr, qt,
+                        tau_q=0.3, tau_c=self.contrast_tau, num_samples=self.contrast_num_samples)
+                    cnt += 1
+            if cnt > 0: losses['loss_align'] = (lc / cnt) * self.loss_align_weight
+        if self.retention_loss_weight > 0:
+            all_D = []
+            for dl in [D_r, D_t, cum_r, cum_t]:
+                all_D.extend(dl)
+            losses['loss_retention'] = self.retention_loss_weight * self._compute_retention_loss(all_D)
+        return losses
+
+    def encode_decode(self, inputs, batch_img_metas):
+        input_rgb, input_ir = inputs[:, :3, :, :], inputs[:, 3:, :, :]
+        rgb, t = self._extract_feat_single(input_rgb, input_ir)[:2]
+        fused = [(rgb[i] + t[i]) / 2.0 for i in range(len(rgb))]
+        if self.with_neck: fused = self.neck(fused)
+        return self.decode_head.predict(fused, batch_img_metas, self.test_cfg)
+
+    def extract_feat(self, inputs):
+        input_rgb, input_t = inputs[:, :3, :, :], inputs[:, 3:, :, :]
+        rgb, t = self._extract_feat_single(input_rgb, input_t)[:2]
+        fused = [(rgb[i] + t[i]) / 2.0 for i in range(len(rgb))]
+        if self.with_neck: fused = self.neck(fused)
+        return fused
+
+    def _forward(self, inputs, data_samples=None):
+        input_rgb, input_t = inputs[:, :3, :, :], inputs[:, 3:, :, :]
+        rgb, t = self._extract_feat_single(input_rgb, input_t)[:2]
+        fused = [(rgb[i] + t[i]) / 2.0 for i in range(len(rgb))]
+        if self.with_neck: fused = self.neck(fused)
+        return self.decode_head.forward(fused)

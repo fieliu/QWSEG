@@ -80,7 +80,9 @@ class AMDANet(BaseSegmentor):
         out_vision, out_semantic = self.extract_feat(inputs)
 
         x_rgb = inputs[:, :3, :, :]
-        x_modal = inputs[:, 3:6, :, :]
+        x_modal = inputs[:, 3:, :, :]
+        if x_modal.shape[1] == 1:
+            x_modal = x_modal.repeat(1, 3, 1, 1)
         original_input = [x_rgb, x_modal]
 
         losses = dict()

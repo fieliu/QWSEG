@@ -191,6 +191,7 @@ def _compute_cell_size(short_side, aspect_ratio=1.0):
     return cell_h, cell_w
 
 
+
 def _compose_vis(rgb_vis, t_vis, feat_rows, label_vis, pred_vis,
                  short_side=250, title=None,
                  deg_rgb_vis=None, deg_t_vis=None,
@@ -710,6 +711,12 @@ class TrainVisHook(Hook):
                             zp_rgb=zp_rgb, zp_t=zp_t,
                             fused=fused_feats,
                             q_rgb_maps=q_rgb_maps, q_t_maps=q_t_maps)
+            elif model_type in ('mit_quality_mamba', 'swin_quality_mask2former'):
+                input_rgb = proc_inputs[:, :3, :, :]
+                input_ir = proc_inputs[:, 3:, :, :]
+                input_rgbt = torch.cat([input_rgb, input_ir], dim=0)
+                feats = model.extract_feat_vis(input_rgbt)
+                return feats
             elif model_type == 'v7_quality_adaptive':
                 input_rgb = proc_inputs[:, :3, :, :]
                 input_ir = proc_inputs[:, 3:, :, :]
@@ -1176,6 +1183,50 @@ class TrainVisHook(Hook):
                             cv2.cvtColor(cv2.applyColorMap(pred, cv2.COLORMAP_VIRIDIS),
                                          cv2.COLOR_BGR2RGB)
                         decoder_preds[7] = pred_vis
+
+                if hasattr(model, 'decode_head') and not hasattr(model, 'common_decode_head'):
+                    if zc_fused_key in feats:
+                        zc_fused_feats = feats[zc_fused_key]
+                        if model.with_neck:
+                            zc_fused_feats = model.neck(zc_fused_feats)
+                        logits = model._decode_head_predict_logits(zc_fused_feats)
+                        if isinstance(logits, torch.Tensor):
+                            pred = logits.argmax(dim=1).squeeze().cpu().numpy()
+                            pred_vis = _apply_palette(pred, palette) if palette else \
+                                cv2.cvtColor(cv2.applyColorMap(pred, cv2.COLORMAP_VIRIDIS),
+                                             cv2.COLOR_BGR2RGB)
+                            decoder_preds[2] = pred_vis
+                    if rgb_pf_key in feats:
+                        rgb_pf_feats = feats[rgb_pf_key]
+                        if model.with_neck:
+                            rgb_pf_feats = model.neck(rgb_pf_feats)
+                        logits = model._decode_head_predict_logits(rgb_pf_feats)
+                        if isinstance(logits, torch.Tensor):
+                            pred = logits.argmax(dim=1).squeeze().cpu().numpy()
+                            pred_vis = _apply_palette(pred, palette) if palette else \
+                                cv2.cvtColor(cv2.applyColorMap(pred, cv2.COLORMAP_VIRIDIS),
+                                             cv2.COLOR_BGR2RGB)
+                            decoder_preds[5] = pred_vis
+                    if t_pf_key in feats:
+                        t_pf_feats = feats[t_pf_key]
+                        if model.with_neck:
+                            t_pf_feats = model.neck(t_pf_feats)
+                        logits = model._decode_head_predict_logits(t_pf_feats)
+                        if isinstance(logits, torch.Tensor):
+                            pred = logits.argmax(dim=1).squeeze().cpu().numpy()
+                            pred_vis = _apply_palette(pred, palette) if palette else \
+                                cv2.cvtColor(cv2.applyColorMap(pred, cv2.COLORMAP_VIRIDIS),
+                                             cv2.COLOR_BGR2RGB)
+                            decoder_preds[6] = pred_vis
+                    if final_fused_key in feats:
+                        final_fused_feats = feats[final_fused_key]
+                        logits = model._decode_head_predict_logits(final_fused_feats)
+                        if isinstance(logits, torch.Tensor):
+                            pred = logits.argmax(dim=1).squeeze().cpu().numpy()
+                            pred_vis = _apply_palette(pred, palette) if palette else \
+                                cv2.cvtColor(cv2.applyColorMap(pred, cv2.COLORMAP_VIRIDIS),
+                                             cv2.COLOR_BGR2RGB)
+                            decoder_preds[7] = pred_vis
         except Exception as e:
             runner.logger.warning(f'Decoder prediction failed: {e}')
         return decoder_preds
@@ -1243,6 +1294,25 @@ class TrainVisHook(Hook):
             aspect_ratio = (img_w / max(img_h, 1)) if (img_h and img_w) else 1.0
             q_grid = self._compose_v9_quality_vis(
                 q_info, rgb_vis=rgb_vis, t_vis=t_vis, aspect_ratio=aspect_ratio)
+        elif model_type in ('mit_quality_mamba', 'swin_quality_mask2former'):
+            q_info = self._create_v9_quality_vis(feats, img_h=img_h, img_w=img_w)
+            deg_q_rgb_mask = self._get_v12d_quality_mask(feats['q_rgb_deg'])
+            deg_q_t_mask = self._get_v12d_quality_mask(feats['q_t_deg'])
+            feat_rows = _build_feat_rows(
+                [feats['zc_rgb'], feats['zc_t'], feats['zc_fused'],
+                 feats['zp_rgb'], feats['zp_t'],
+                 feats['rgb_pf'], feats['t_pf'], feats['final_fused']])
+            deg_feat_rows = _build_feat_rows(
+                [feats['zc_rgb_deg'], feats['zc_t_deg'], feats['zc_fused_deg'],
+                 feats['zp_rgb_deg'], feats['zp_t_deg'],
+                 feats['rgb_pf_deg'], feats['t_pf_deg'], feats['final_fused_deg']],
+                masks=[deg_q_rgb_mask, deg_q_t_mask, None,
+                       deg_q_rgb_mask, deg_q_t_mask,
+                       deg_q_rgb_mask, deg_q_t_mask, None])
+            aspect_ratio = (img_w / max(img_h, 1)) if (img_h and img_w) else 1.0
+            q_grid = self._compose_v9_quality_vis(
+                q_info, rgb_vis=rgb_vis, t_vis=t_vis, aspect_ratio=aspect_ratio)
+            return feat_rows, q_grid, deg_feat_rows
         elif model_type == 'v7_quality_adaptive':
             q_info = self._create_v9_quality_vis(feats, img_h=img_h, img_w=img_w)
             feat_rows = _build_feat_rows(
@@ -1914,6 +1984,20 @@ class TrainVisHook(Hook):
             row_labels = [f'Stage {s}' for s in range(num_stages)]
             aspect_ratio = proc_inputs.shape[-1] / max(proc_inputs.shape[-2], 1)
 
+        if model_type in ('mit_quality_mamba', 'swin_quality_mask2former'):
+            col_headers = ['zc_rgb', 'zc_t', 'zc_fused',
+                           'zp_rgb', 'zp_t',
+                           'rgb_pf', 't_pf', 'final']
+            num_stages = len(feats.get('zc_rgb', feats.get('final_fused', [])))
+            row_labels = [f'Stage {s} (clean)' for s in range(num_stages)]
+            row_labels += [f'Stage {s} (degraded)' for s in range(num_stages)]
+
+            decoder_preds = self._get_decoder_predictions(
+                model, feats, palette, runner)
+
+            img_h, img_w = proc_inputs.shape[-2], proc_inputs.shape[-1]
+            aspect_ratio = img_w / max(img_h, 1)
+
         if model_type == 'mask2former_rgbt_add':
             col_headers = ['rgb_feat', 't_feat', 'fused']
             num_stages = len(feats.get('zc_rgb', feats.get('fused', [])))
@@ -1952,7 +2036,8 @@ class TrainVisHook(Hook):
         deg_decoder_preds = None
         if model_type in ('v12d_quality_disentangle',
                           'v12_nodeg_quality_disentangle',
-                          'ab_v9') and 'deg_rgb_img' in feats:
+                          'ab_v9',
+                          'mit_quality_mamba', 'swin_quality_mask2former') and 'deg_rgb_img' in feats:
             deg_rgb_vis, deg_t_vis = self._render_degraded_images(
                 feats, model, raw_rgb=rgb_vis, raw_t=t_vis)
 
@@ -1990,6 +2075,16 @@ class TrainVisHook(Hook):
             if loss_str:
                 title += f' | {loss_str}'
             if model_type == 'ab_v9':
+                grid = _compose_v9_ablation_vis(
+                    rgb_vis, t_vis, feat_rows, label_vis, pred_vis,
+                    self.short_side, title=title,
+                    col_headers=col_headers, row_labels=row_labels,
+                    decoder_preds=decoder_preds, aspect_ratio=aspect_ratio,
+                    deg_rgb_vis=deg_rgb_vis, deg_t_vis=deg_t_vis,
+                    deg_feat_rows=deg_feat_rows,
+                    deg_decoder_preds=deg_decoder_preds,
+                    deg_pred_vis=deg_pred_vis)
+            elif model_type in ('mit_quality_mamba', 'swin_quality_mask2former'):
                 grid = _compose_v9_ablation_vis(
                     rgb_vis, t_vis, feat_rows, label_vis, pred_vis,
                     self.short_side, title=title,
@@ -2256,11 +2351,18 @@ class TrainVisHook(Hook):
             title = f'Epoch {epoch} | Sample {b_idx}'
             if loss_str:
                 title += f' | {loss_str}'
-            grid = _compose_vis(rgb_vis, t_vis, feat_rows, label_vis, pred_vis,
-                                self.short_side, title=title,
-                                col_headers=col_headers, row_labels=row_labels,
-                                decoder_preds=decoder_preds,
-                                aspect_ratio=aspect_ratio)
+            if model_type in ('mit_quality_mamba', 'swin_quality_mask2former'):
+                grid = _compose_v9_ablation_vis(rgb_vis, t_vis, feat_rows, label_vis, pred_vis,
+                                                self.short_side, title=title,
+                                                col_headers=col_headers, row_labels=row_labels,
+                                                decoder_preds=decoder_preds,
+                                                aspect_ratio=aspect_ratio)
+            else:
+                grid = _compose_vis(rgb_vis, t_vis, feat_rows, label_vis, pred_vis,
+                                    self.short_side, title=title,
+                                    col_headers=col_headers, row_labels=row_labels,
+                                    decoder_preds=decoder_preds,
+                                    aspect_ratio=aspect_ratio)
         return grid, q_grid
 
     def _save_results(self, runner, sample_grids, quality_grids, epoch,

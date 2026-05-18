@@ -495,7 +495,68 @@ class RGBXTransformer(BaseModule):
                     from mmengine.model.weight_init import normal_init
                     normal_init(m, mean=0, std=math.sqrt(2.0 / fan_out), bias=0)
         else:
-            super().init_weights()
+            from mmengine.runner.checkpoint import CheckpointLoader
+            checkpoint = CheckpointLoader.load_checkpoint(
+                self.init_cfg.checkpoint, map_location='cpu')
+            if 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            else:
+                state_dict = checkpoint
+
+            clean_sd = {}
+            for k, v in state_dict.items():
+                nk = k.replace('backbone.', '', 1) if k.startswith('backbone.') else k
+                clean_sd[nk] = v
+
+            model_sd = self.state_dict()
+
+            stage_map = {
+                '1': '0', '2': '1', '3': '2', '4': '3'
+            }
+
+            key_map = {}
+            for pretrained_key, pretrained_val in clean_sd.items():
+                if pretrained_key.startswith('layers.'):
+                    parts = pretrained_key.split('.')
+                    stage_idx = parts[1]
+                    sub_idx = parts[2]
+
+                    if stage_idx not in stage_map:
+                        continue
+                    new_stage = stage_map[stage_idx]
+
+                    if sub_idx == '0':
+                        new_key = f'patch_embed{new_stage}.{pretrained_key[len("layers." + stage_idx + ".0."):]}'
+                        new_key = new_key.replace('projection.', 'proj.')
+                        extra_key = f'extra_patch_embed{new_stage}.{pretrained_key[len("layers." + stage_idx + ".0."):]}'
+                        extra_key = extra_key.replace('projection.', 'proj.')
+                    elif sub_idx == '1':
+                        block_local_idx = parts[3]
+                        rest = '.'.join(parts[4:])
+                        new_key = f'block{new_stage}.{block_local_idx}.{rest}'
+                        extra_key = f'extra_block{new_stage}.{block_local_idx}.{rest}'
+                    elif sub_idx == '2':
+                        rest = '.'.join(parts[3:])
+                        new_key = f'norm{new_stage}.{rest}'
+                        extra_key = f'extra_norm{new_stage}.{rest}'
+                    else:
+                        continue
+
+                    if new_key in model_sd and model_sd[new_key].shape == pretrained_val.shape:
+                        key_map[new_key] = pretrained_val
+
+                    if extra_key in model_sd and model_sd[extra_key].shape == pretrained_val.shape:
+                        key_map[extra_key] = pretrained_val
+
+            model_sd.update(key_map)
+            self.load_state_dict(model_sd, strict=False)
+
+            import logging
+            logger = logging.getLogger(__name__)
+            loaded_rgb = sum(1 for k in key_map if not k.startswith('extra_'))
+            loaded_extra = sum(1 for k in key_map if k.startswith('extra_'))
+            logger.info(f'RGBXTransformer: loaded {loaded_rgb} keys to rgb branch, '
+                        f'{loaded_extra} keys to extra branch')
 
     def forward_features(self, x_rgb, x_e):
         B = x_rgb.shape[0]
@@ -582,6 +643,8 @@ class RGBXTransformer(BaseModule):
 
     def forward(self, x):
         x_rgb = x[:, :3, :, :]
-        x_e = x[:, 3:6, :, :]
+        x_e = x[:, 3:, :, :]
+        if x_e.shape[1] == 1:
+            x_e = x_e.repeat(1, 3, 1, 1)
         out_vision, out_semantic = self.forward_features(x_rgb, x_e)
         return out_vision, out_semantic

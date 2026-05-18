@@ -22,9 +22,9 @@ crop_size = (480, 640)
 
 data_preprocessor = dict(
     type='SegDataPreProcessor',
-    mean=[123.675, 116.28, 103.53, 123.675, 116.28, 103.53],
-    std=[58.395, 57.12, 57.375, 58.395, 57.12, 57.375],
-    bgr_to_rgb=False,
+    mean=[123.675, 116.28, 103.53, 127.0],
+    std=[58.395, 57.12, 57.375, 60.0],
+    bgr_to_rgb=True,
     pad_val=0,
     seg_pad_val=255,
     size=crop_size)

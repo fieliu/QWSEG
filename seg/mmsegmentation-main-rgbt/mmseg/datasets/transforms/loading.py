@@ -26,10 +26,7 @@ class LoadRGBTImageFromFile(BaseTransform):
     The RGB image is loaded from ``img_path`` and the thermal/IR image is
     loaded by replacing ``ir_replace_src`` with ``ir_replace_dst`` in the
     path. Both images are concatenated along the channel dimension to produce
-    a 6-channel output (3 RGB + 3 thermal).
-
-    If the thermal image is single-channel, it will be replicated to 3
-    channels automatically.
+    a 4-channel output (3 RGB + 1 thermal).
 
     Required Keys:
 
@@ -137,8 +134,6 @@ class LoadRGBTImageFromFile(BaseTransform):
         assert img is not None, f'failed to load image: {filename}'
         if img_ir.ndim == 2:
             img_ir = img_ir[:, :, np.newaxis]
-        if img_ir.shape[2] == 1:
-            img_ir = np.concatenate([img_ir, img_ir, img_ir], axis=2)
         if self.to_float32:
             img = img.astype(np.float32)
             img_ir = img_ir.astype(np.float32)
@@ -172,9 +167,8 @@ class LoadRGBTImageFrom4Channel(BaseTransform):
     """Load RGBT image from a 4-channel PNG file (RGB + Thermal).
 
     The image is expected to be a 4-channel PNG where channels 0-2 are RGB
-    and channel 3 is the thermal/IR channel. The transform splits the image
-    into RGB (3ch) and thermal (3ch, replicated from single channel) and
-    concatenates them into a 6-channel image.
+    and channel 3 is the thermal/IR channel. The output is a 4-channel
+    image (3 RGB + 1 thermal).
 
     Required Keys:
 
@@ -226,10 +220,9 @@ class LoadRGBTImageFrom4Channel(BaseTransform):
         if img.shape[2] == 4:
             img_rgb = img[:, :, :3]
             img_ir = img[:, :, 3:4]
-            img_ir = np.concatenate([img_ir, img_ir, img_ir], axis=2)
         elif img.shape[2] == 3:
             img_rgb = img
-            img_ir = img
+            img_ir = img[:, :, 0:1]
         else:
             raise ValueError(
                 f'Unexpected image shape {img.shape} for {filename}')

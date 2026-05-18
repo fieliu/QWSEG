@@ -21,9 +21,9 @@ crop_size = (480, 640)
 
 data_preprocessor = dict(
     type='SegDataPreProcessor',
-    mean=[123.675, 116.28, 103.53, 123.675, 116.28, 103.53],
-    std=[58.395, 57.12, 57.375, 58.395, 57.12, 57.375],
-    bgr_to_rgb=False,
+    mean=[123.675, 116.28, 103.53, 127.0],
+    std=[58.395, 57.12, 57.375, 60.0],
+    bgr_to_rgb=True,
     pad_val=0,
     seg_pad_val=255,
     size=crop_size)
@@ -47,8 +47,7 @@ model = dict(
         sr_ratios=[8, 4, 2, 1],
         init_cfg=dict(
             type='Pretrained',
-            checkpoint='./pretrain/segformer_mit-b4_512x512_160k_ade20k.pth',
-            prefix='backbone.')),
+            checkpoint='./pretrain/segformer_mit-b4_512x512_160k_ade20k.pth')),
 
     decode_head=dict(
         type='SegDecoderHead',
@@ -71,8 +70,10 @@ model = dict(
         norm_cfg=norm_cfg,
         align_corners=False,
         loss_fusion=dict(type='FusionLoss', loss_weight=1.0,
-                         mean=[123.675, 116.28, 103.53, 123.675, 116.28, 103.53],
-                         std=[58.395, 57.12, 57.375, 58.395, 57.12, 57.375])),
+                         mean=[123.675, 116.28, 103.53],
+                         std=[58.395, 57.12, 57.375],
+                         ir_mean=[127.0, 127.0, 127.0],
+                         ir_std=[60.0, 60.0, 60.0])),
     test_cfg=dict(mode='whole'))
 
 optim_wrapper = dict(

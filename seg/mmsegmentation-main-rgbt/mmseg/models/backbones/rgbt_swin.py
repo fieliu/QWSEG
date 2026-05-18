@@ -96,16 +96,22 @@ class RGBTSwinTransformer(BaseModule):
             rgb_loaded = {k: v for k, v in rgb_state.items() if k in model_dict and v.shape == model_dict[k].shape}
             thr_loaded = {k: v for k, v in thr_state.items() if k in model_dict and v.shape == model_dict[k].shape}
 
+            if self.thr_branch.patch_embed.projection.in_channels == 1:
+                pe_key = 'thr_branch.patch_embed.projection.weight'
+                if pe_key in model_dict:
+                    pretrained_pe_key = 'patch_embed.projection.weight'
+                    if pretrained_pe_key in state_dict:
+                        pretrained_pe = state_dict[pretrained_pe_key]
+                        thr_loaded[pe_key] = pretrained_pe.mean(dim=1, keepdim=True)
+
             model_dict.update(rgb_loaded)
             model_dict.update(thr_loaded)
             self.load_state_dict(model_dict, strict=False)
 
-            rgb_keys = set(rgb_state.keys()) - set(rgb_loaded.keys())
-            thr_keys = set(thr_state.keys()) - set(thr_loaded.keys())
-            if rgb_keys:
-                print(f'RGB branch skipped keys: {sorted(rgb_keys)}')
-            if thr_keys:
-                print(f'THR branch skipped keys: {sorted(thr_keys)}')
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f'RGBTSwinTransformer: loaded {len(rgb_loaded)} keys to rgb branch, '
+                        f'{len(thr_loaded)} keys to thr branch')
         else:
             self.rgb_branch.init_weights()
             self.thr_branch.init_weights()

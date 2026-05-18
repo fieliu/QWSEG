@@ -74,15 +74,14 @@ model = dict(
     common_decode_head=_segformer_head,
     rgb_private_decode_head=_segformer_head,
     t_private_decode_head=_segformer_head,
-    prune_mid_channels=32,  # kept for API compat, unused by QualityPredictor
     gumbel_tau_init=1.0,
     gumbel_tau_min=0.1,
     gumbel_tau_decay=0.995,
     retention_min=0.5,
     retention_max=0.95,
     retention_loss_weight=5.0,
-    phase1_epochs=10,
-    phase2_epochs=20,
+    phase1_epochs=20,
+    phase2_epochs=60,
     loss_align_weight=0.1,
     contrast_tau=0.07,
     contrast_num_samples=512,
@@ -96,6 +95,9 @@ model = dict(
     mamba_d_state=16,
     mamba_d_conv=4,
     mamba_expand=2,
+    missing_ratio=0.3,
+    global_deg_ratio=0.3,
+    local_deg_ratio=0.4,
     test_cfg=dict(mode='slide', crop_size=crop_size, stride=(320, 427)))
 
 custom_keys = {

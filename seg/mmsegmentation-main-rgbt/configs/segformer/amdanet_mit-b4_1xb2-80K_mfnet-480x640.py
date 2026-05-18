@@ -44,7 +44,11 @@ model = dict(
         attn_drop_rate=0.0,
         drop_path_rate=0.1,
         depths=[3, 8, 27, 3],
-        sr_ratios=[8, 4, 2, 1]),
+        sr_ratios=[8, 4, 2, 1],
+        init_cfg=dict(
+            type='Pretrained',
+            checkpoint='./pretrain/segformer_mit-b4_512x512_160k_ade20k.pth')),
+
     decode_head=dict(
         type='SegDecoderHead',
         in_channels=[64, 128, 320, 512],
@@ -81,13 +85,13 @@ optim_wrapper = dict(
         }))
 
 param_scheduler = [
-    dict(type='LinearLR', start_factor=1e-6, by_epoch=False, begin=0, end=3000),
+    dict(type='LinearLR', start_factor=1e-6, by_epoch=False, begin=0, end=1500),
     dict(
         type='PolyLR',
         eta_min=0.0,
         power=1.0,
-        begin=3000,
-        end=80000,
+        begin=1500,
+        end=117600,
         by_epoch=False),
 ]
 
@@ -97,13 +101,13 @@ test_cfg = dict(type='TestLoop')
 
 default_hooks = dict(
     timer=dict(type='IterTimerHook'),
-    logger=dict(type='LoggerHook', interval=50, log_metric_by_epoch=True),
+    logger=dict(type='LoggerHook', interval=20, log_metric_by_epoch=True),
     param_scheduler=dict(type='ParamSchedulerHook'),
     checkpoint=dict(
         type='CheckpointHook', by_epoch=True, interval=5,
         save_best='mIoU'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
-    visualization=dict(type='SegVisualizationHook', draw=True, interval=100))
+    visualization=dict(type='SegVisualizationHook', draw=True, interval=5))
 
 train_dataloader = dict(batch_size=2, num_workers=4, persistent_workers=True)
 val_dataloader = dict(batch_size=1)

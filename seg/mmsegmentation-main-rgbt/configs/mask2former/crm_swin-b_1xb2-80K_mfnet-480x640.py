@@ -222,20 +222,20 @@ param_scheduler = [
         eta_min=0.0,
         power=0.9,
         begin=1500,
-        end=80000,
+        end=117600,
         by_epoch=False),
 ]
 
-train_cfg = dict(type='IterBasedTrainLoop', max_iters=80000, val_interval=5000)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=200, val_interval=5)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
 default_hooks = dict(
     timer=dict(type='IterTimerHook'),
-    logger=dict(type='LoggerHook', interval=50, log_metric_by_epoch=False),
+    logger=dict(type='LoggerHook', interval=20, log_metric_by_epoch=True),
     param_scheduler=dict(type='ParamSchedulerHook'),
     checkpoint=dict(
-        type='CheckpointHook', by_epoch=False, interval=5000,
+        type='CheckpointHook', by_epoch=True, interval=5,
         save_best='mIoU'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
     visualization=dict(type='SegVisualizationHook'))

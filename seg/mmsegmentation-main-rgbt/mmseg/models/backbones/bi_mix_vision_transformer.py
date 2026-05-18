@@ -341,7 +341,60 @@ class BIMixVisionTransformer(BaseModule):
             cur += num_layer
 
     def init_weights(self):
-        if self.init_cfg is None:
+        from mmengine.runner.checkpoint import CheckpointLoader
+        if self.init_cfg is not None and hasattr(self.init_cfg, 'type') and \
+                self.init_cfg.type == 'Pretrained' and self.init_cfg.checkpoint:
+            ckpt = CheckpointLoader.load_checkpoint(
+                self.init_cfg.checkpoint, map_location='cpu')
+            if 'state_dict' in ckpt:
+                state_dict = ckpt['state_dict']
+            else:
+                state_dict = ckpt
+
+            # strip 'backbone.' prefix
+            clean_sd = {}
+            for k, v in state_dict.items():
+                nk = k.replace('backbone.', '', 1) if k.startswith('backbone.') else k
+                clean_sd[nk] = v
+
+            model_sd = self.state_dict()
+            # Map pretrained single-branch weights to both RGB and X branches
+            # by structural index: stage i + block j + param suffix
+            def _map_branch(branch_prefix):
+                loaded = {}
+                for model_key, model_val in model_sd.items():
+                    if not model_key.startswith(branch_prefix):
+                        continue
+                    # e.g. layers_rgb.0.1.0.norm1.weight
+                    # extract: 0 (stage), 1 (block idx within stage), 0 (sub-block), norm1.weight
+                    suffix = model_key[len(branch_prefix):]  # .0.1.0.norm1.weight
+                    parts = suffix.strip('.').split('.')
+                    if len(parts) < 4:
+                        continue
+                    try:
+                        stage = int(parts[0])
+                        block_idx = int(parts[1])
+                    except ValueError:
+                        continue
+                    # Build pretrained key suffix: block{stage+1}.{block_idx}.<rest>
+                    pretrained_suffix = '.'.join([f'block{stage+1}', str(block_idx)] + parts[2:])
+                    for pk, pv in clean_sd.items():
+                        if pk.endswith(pretrained_suffix) and pv.shape == model_val.shape:
+                            loaded[model_key] = pv
+                            break
+                return loaded
+
+            rgb_load = _map_branch('layers_rgb')
+            x_load = _map_branch('layers_x')
+            model_sd.update(rgb_load)
+            model_sd.update(x_load)
+            self.load_state_dict(model_sd, strict=False)
+
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f'BIMixVisionTransformer: loaded {len(rgb_load)} keys to rgb branch, '
+                        f'{len(x_load)} keys to x branch')
+        elif self.init_cfg is None:
             for m in self.modules():
                 if isinstance(m, nn.Linear):
                     from mmengine.model.weight_init import trunc_normal_init
@@ -350,12 +403,10 @@ class BIMixVisionTransformer(BaseModule):
                     from mmengine.model.weight_init import constant_init
                     constant_init(m, val=1.0, bias=0.)
                 elif isinstance(m, nn.Conv2d):
-                    fan_out = m.kernel_size[0] * m.kernel_size[
-                        1] * m.out_channels
+                    fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
                     fan_out //= m.groups
                     from mmengine.model.weight_init import normal_init
-                    normal_init(
-                        m, mean=0, std=math.sqrt(2.0 / fan_out), bias=0)
+                    normal_init(m, mean=0, std=math.sqrt(2.0 / fan_out), bias=0)
         else:
             super().init_weights()
 

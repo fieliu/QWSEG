@@ -50,7 +50,11 @@ model = dict(
         attn_drop_rate=0.0,
         drop_path_rate=0.1,
         act_cfg=dict(type='GELU'),
-        norm_cfg=dict(type='LN', eps=1e-6)),
+        norm_cfg=dict(type='LN', eps=1e-6),
+        init_cfg=dict(
+            type='Pretrained',
+            checkpoint='./pretrain/segformer_mit-b2_512x512_160k_ade20k.pth')),
+
     decode_head=dict(
         type='SegformerHeadMult',
         in_channels=[64, 128, 320, 512],

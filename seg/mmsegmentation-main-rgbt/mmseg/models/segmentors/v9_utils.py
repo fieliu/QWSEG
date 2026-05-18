@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mmseg.utils.quality_degradation import (
+from mmseg.datasets.transforms.quality_degradation import (
     apply_quality_degradation_rgb,
     apply_quality_degradation_t,
     _QUALITY_RGB_DEG_TYPES,

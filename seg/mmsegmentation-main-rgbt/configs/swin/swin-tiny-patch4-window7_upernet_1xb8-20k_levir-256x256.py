@@ -9,7 +9,7 @@ data_preprocessor = dict(
     type='SegDataPreProcessor',
     mean=[123.675, 116.28, 103.53, 123.675, 116.28, 103.53],
     std=[58.395, 57.12, 57.375, 58.395, 57.12, 57.375],
-    bgr_to_rgb=False)
+    bgr_to_rgb=True)
 
 model = dict(
     data_preprocessor=data_preprocessor,

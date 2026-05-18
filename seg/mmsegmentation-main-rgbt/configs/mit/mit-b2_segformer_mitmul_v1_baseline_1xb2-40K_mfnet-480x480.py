@@ -133,7 +133,7 @@ model = dict(
             dict(type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0),
         ]),
     fusion_embed_dims=[64, 128, 320, 512],
-    test_cfg=dict(mode='whole'))
+    test_cfg=dict(mode='slide', crop_size=crop_size, stride=(320, 320)))
 
 optim_wrapper = dict(
     type='OptimWrapper',

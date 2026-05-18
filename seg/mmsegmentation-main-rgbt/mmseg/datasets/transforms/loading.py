@@ -167,8 +167,9 @@ class LoadRGBTImageFrom4Channel(BaseTransform):
     """Load RGBT image from a 4-channel PNG file (RGB + Thermal).
 
     The image is expected to be a 4-channel PNG where channels 0-2 are RGB
-    and channel 3 is the thermal/IR channel. The output is a 4-channel
-    image (3 RGB + 1 thermal).
+    and channel 3 is the thermal/IR channel. The thermal channel is repeated
+    3 times to produce a 6-channel output (3 RGB + 3 thermal), consistent
+    with ``LoadRGBTImageFromFile`` with ``ir_color_type='color'``.
 
     Required Keys:
 
@@ -229,6 +230,7 @@ class LoadRGBTImageFrom4Channel(BaseTransform):
         if self.to_float32:
             img_rgb = img_rgb.astype(np.float32)
             img_ir = img_ir.astype(np.float32)
+        img_ir = np.repeat(img_ir, 3, axis=2)
         img = np.concatenate((img_rgb, img_ir), axis=2)
         results['img'] = img
         results['img_shape'] = img.shape[:2]

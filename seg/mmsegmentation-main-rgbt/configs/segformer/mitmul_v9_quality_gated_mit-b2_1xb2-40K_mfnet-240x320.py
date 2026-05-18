@@ -17,7 +17,7 @@ data_preprocessor = dict(
     type='SegDataPreProcessor',
     mean=[123.675, 116.28, 103.53, 123.675, 116.28, 103.53],
     std=[58.395, 57.12, 57.375, 58.395, 57.12, 57.375],
-    bgr_to_rgb=False,
+    bgr_to_rgb=True,
     pad_val=0,
     seg_pad_val=255,
     size=crop_size)
@@ -175,7 +175,7 @@ model = dict(
     init_threshold=0.1,
     loss_align_weight=0.5,
     quality_pretrained=None,
-    test_cfg=dict(mode='whole'))
+    test_cfg=dict(mode='slide', crop_size=crop_size, stride=(160, 214)))
 
 optim_wrapper = dict(
     type='OptimWrapper',

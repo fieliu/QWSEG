@@ -20,7 +20,7 @@ data_preprocessor = dict(
     type='SegDataPreProcessor',
     mean=[123.675, 116.28, 103.53, 127.0, 127.0, 127.0],
     std=[58.395, 57.12, 57.375, 60.0, 60.0, 60.0],
-    bgr_to_rgb=False,
+    bgr_to_rgb=True,
     pad_val=0,
     seg_pad_val=255,
     size=crop_size,
@@ -170,7 +170,7 @@ model = dict(
     mask_type='patch',
     mask_strategy='rand_comp',
     train_cfg=dict(),
-    test_cfg=dict(mode='whole'))
+    test_cfg=dict(mode='slide', crop_size=crop_size, stride=(320, 427)))
 
 backbone_norm_multi = dict(lr_mult=0.1, decay_mult=0.0)
 backbone_embed_multi = dict(lr_mult=0.1, decay_mult=0.0)

@@ -19,7 +19,7 @@ data_preprocessor = dict(
     type='SegDataPreProcessor',
     mean=[123.675, 116.28, 103.53, 123.675, 116.28, 103.53],
     std=[58.395, 57.12, 57.375, 58.395, 57.12, 57.375],
-    bgr_to_rgb=False,
+    bgr_to_rgb=True,
     pad_val=0,
     seg_pad_val=255,
     size=crop_size,
@@ -91,14 +91,13 @@ model = dict(
     distill_temperature=4.0,
     aux_loss_weight=0.3,
     total_epochs=50,
-    mamba_layers=2,
     mamba_d_state=16,
     mamba_d_conv=4,
     mamba_expand=2,
     missing_ratio=0.3,
     global_deg_ratio=0.3,
     local_deg_ratio=0.4,
-    test_cfg=dict(mode='whole'))
+    test_cfg=dict(mode='slide', crop_size=crop_size, stride=(160, 214)))
 
 custom_keys = {
     'backbone': dict(lr_mult=0.1, decay_mult=1.0),

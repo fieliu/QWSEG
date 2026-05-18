@@ -186,7 +186,7 @@ model = dict(
     loss_modal_weight=0.2,
     loss_disentangle_weights=(0.1, 0.2, 0.3, 0.4),
     loss_invariance_weight=0.01,
-    test_cfg=dict(mode='whole'))
+    test_cfg=dict(mode='slide', crop_size=crop_size, stride=(320, 320)))
 
 optim_wrapper = dict(
     type='OptimWrapper',

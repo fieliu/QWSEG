@@ -706,7 +706,12 @@ class QualityGatedMiTMamba(BaseSegmentor):
         return phase
 
     def _compute_retention_loss(self, all_D):
-        loss = torch.tensor(0.)
+        dev = None
+        for d in all_D:
+            if d is not None:
+                dev = d.device
+                break
+        loss = torch.tensor(0., device=dev or 'cpu')
         cnt = 0
         for D in all_D:
             if D is None: continue
@@ -925,9 +930,9 @@ class QualityGatedMiTMamba(BaseSegmentor):
                             qd = torch.max(
                                 dqr[i] if dqr[i] is not None else torch.ones_like(D_gate),
                                 dqt[i] if dqt[i] is not None else torch.ones_like(D_gate))
-                            for t in [D_gate, qc, qd]:
-                                if t.shape[2:] != zf[i].shape[2:]:
-                                    t = F.interpolate(t, size=zf[i].shape[2:], mode='nearest')
+                            D_gate = F.interpolate(D_gate, size=zf[i].shape[2:], mode='nearest') if D_gate.shape[2:] != zf[i].shape[2:] else D_gate
+                            qc = F.interpolate(qc, size=zf[i].shape[2:], mode='nearest') if qc.shape[2:] != zf[i].shape[2:] else qc
+                            qd = F.interpolate(qd, size=zf[i].shape[2:], mode='nearest') if qd.shape[2:] != zf[i].shape[2:] else qd
                             q_distill = qc * qd * D_gate
                             diff = F.smooth_l1_loss(zf[i], dzf[i], reduction='none')
                             denom = q_distill.sum() + 1e-6

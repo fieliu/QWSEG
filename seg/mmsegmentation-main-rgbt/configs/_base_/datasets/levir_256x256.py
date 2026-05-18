@@ -20,7 +20,7 @@ train_pipeline = [
         },
         transforms=albu_train_transforms,
         additional_targets={'image2': 'image'},
-        bgr_to_rgb=False),
+        bgr_to_rgb=True),
     dict(type='ConcatCDInput'),
     dict(type='PackSegInputs')
 ]

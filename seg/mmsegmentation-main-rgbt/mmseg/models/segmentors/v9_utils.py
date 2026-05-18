@@ -43,6 +43,8 @@ class QualityPredictor(nn.Module):
         local = F.gelu(self.local_conv2(local))
 
         mask_d = mask.detach()
+        if mask_d.shape[2:] != x.shape[2:]:
+            mask_d = F.adaptive_max_pool2d(mask_d.float(), x.shape[2:])
         mask_sum = mask_d.sum(dim=(2, 3), keepdim=True).clamp(min=1e-6)
         global_feat = (local * mask_d).sum(dim=(2, 3), keepdim=True) / mask_sum
         global_feat = global_feat.expand(-1, -1, x.shape[2], x.shape[3])
@@ -246,17 +248,23 @@ def compute_cross_modal_contrastive_loss(feat_rgb, feat_t, labels, D_rgb, D_t,
     def _align(t, size, mode='nearest', out_dtype=None):
         if t is None:
             return None
+        orig_dim = t.dim()
         if t.shape[-2:] != size:
-            t = F.interpolate(t.float().unsqueeze(0) if t.dim() == 2 else t.float(),
-                              size=size, mode=mode)
-            t = t.squeeze(0) if t.dim() == 3 and t.shape[0] == 1 else t
+            if t.dim() == 2:
+                t = t.unsqueeze(0).unsqueeze(0)
+            elif t.dim() == 3:
+                t = t.unsqueeze(1)
+            t = F.interpolate(t.float(), size=size, mode=mode)
+        if orig_dim == 2:
+            t = t.squeeze(0).squeeze(0)
+        elif orig_dim == 3:
+            t = t.squeeze(1)
         if out_dtype is not None:
             t = t.to(out_dtype)
         return t
 
     target = (H, W)
-    labels_rs = _align(labels, target, out_dtype=torch.long).squeeze(1) if labels.dim() == 3 else \
-        _align(labels.unsqueeze(1), target, out_dtype=torch.long).squeeze(1)
+    labels_rs = _align(labels, target, out_dtype=torch.long)
     D_rgb = _align(D_rgb, target)
     D_t = _align(D_t, target)
     if pad_mask is not None:

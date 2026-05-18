@@ -19,7 +19,7 @@ data_preprocessor = dict(
     type='SegDataPreProcessor',
     mean=[123.675, 116.28, 103.53, 123.675, 116.28, 103.53],
     std=[58.395, 57.12, 57.375, 58.395, 57.12, 57.375],
-    bgr_to_rgb=False,
+    bgr_to_rgb=True,
     pad_val=0,
     seg_pad_val=255,
     size=crop_size,
@@ -154,7 +154,7 @@ model = dict(
                         eps=1.0)
                 ]),
             sampler=dict(type='mmdet.MaskPseudoSampler'))),
-    test_cfg=dict(mode='whole'))
+    test_cfg=dict(mode='slide', crop_size=crop_size, stride=(320, 427)))
 
 backbone_norm_multi = dict(lr_mult=0.1, decay_mult=0.0)
 backbone_embed_multi = dict(lr_mult=0.1, decay_mult=0.0)

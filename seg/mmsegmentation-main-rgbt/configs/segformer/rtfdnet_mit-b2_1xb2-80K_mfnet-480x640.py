@@ -22,8 +22,8 @@ crop_size = (480, 640)
 
 data_preprocessor = dict(
     type='SegDataPreProcessor',
-    mean=[123.675, 116.28, 103.53, 127.0],
-    std=[58.395, 57.12, 57.375, 60.0],
+    mean=[123.675, 116.28, 103.53, 127.0, 127.0, 127.0],
+    std=[58.395, 57.12, 57.375, 60.0, 60.0, 60.0],
     bgr_to_rgb=True,
     pad_val=0,
     seg_pad_val=255,
@@ -76,7 +76,7 @@ model = dict(
         loss_decode_head=[
             dict(type='RegionL1', loss_weight=1.0, tau=1.0, N_cls=9),
         ]),
-    test_cfg=dict(mode='whole'))
+    test_cfg=dict(mode='slide', crop_size=crop_size, stride=(320, 427)))
 
 optim_wrapper = dict(
     type='AmpOptimWrapper',

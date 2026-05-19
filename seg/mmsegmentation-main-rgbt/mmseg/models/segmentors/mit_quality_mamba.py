@@ -968,7 +968,12 @@ class QualityGatedMiTMamba(BaseSegmentor):
         return self.neck(ff) if self.with_neck else ff
 
     def extract_feat_vis(self, inputs):
-        rgb, t = inputs[:,:3], inputs[:,3:]
+        # inputs may be (2B, 3, H, W) from vis hook (batch-concat) or (B, 6, H, W)
+        if inputs.shape[1] == 6:
+            rgb, t = inputs[:, :3], inputs[:, 3:]
+        else:
+            B = inputs.shape[0] // 2
+            rgb, t = inputs[:B], inputs[B:]
         with torch.no_grad():
             (zc_r,zc_t,zp_r,zp_t,zf,re,te,ff,q_r,q_t,ad,
              D_r,D_t,Dpr,Dpt,qpr,qpt,cDr,cDt,cDpr,cDpt) = self._extract_feat_single(rgb,t)

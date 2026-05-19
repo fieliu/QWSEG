@@ -17,9 +17,15 @@ class AMDANet(BaseSegmentor):
                  test_cfg=None,
                  data_preprocessor=None,
                  pretrained=None,
-                 init_cfg=None):
+                 init_cfg=None,
+                 fusion_loss_weight=0.5,
+                 decode_r_weight=0.25,
+                 fusion_r_weight=0.25):
         super().__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
+        self.fusion_loss_weight = fusion_loss_weight
+        self.decode_r_weight = decode_r_weight
+        self.fusion_r_weight = fusion_r_weight
         if pretrained is not None:
             assert backbone.get('pretrained') is None, \
                 'both backbone and segmentor set pretrained weight'
@@ -115,15 +121,16 @@ class AMDANet(BaseSegmentor):
             Fus_img_r = self.fuse_head.forward(x_vision_r, original_input)
 
             loss_fuse = self.fuse_head.loss(Fus_img, original_input)
-            losses.update(loss_fuse)
+            for k, v in loss_fuse.items():
+                losses[k] = v * self.fusion_loss_weight
 
             loss_fuse_r = self.fuse_head.loss(Fus_img_r, original_input)
             for k, v in loss_fuse_r.items():
-                losses[f'{k}_r'] = v
+                losses[f'{k}_r'] = v * self.fusion_r_weight
 
             loss_decode_r = self.decode_head.loss(semantic_r, data_samples, self.train_cfg)
             for k, v in loss_decode_r.items():
-                losses[f'{k}_r'] = v
+                losses[f'{k}_r'] = v * self.decode_r_weight
 
         return losses
 

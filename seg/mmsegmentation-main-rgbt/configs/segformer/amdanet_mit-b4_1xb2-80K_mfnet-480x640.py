@@ -61,7 +61,7 @@ model = dict(
         align_corners=False,
         loss_decode=[
             dict(type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0),
-            dict(type='DiceLoss', use_sigmoid=False, loss_weight=1.0),
+            dict(type='DiceLoss', use_sigmoid=False, loss_weight=2.0),
         ]),
     fuse_head=dict(
         type='FuseDecoderHead',
@@ -69,7 +69,11 @@ model = dict(
         embed_dim=16,
         norm_cfg=norm_cfg,
         align_corners=False,
-        loss_fusion=dict(type='FusionLoss', loss_weight=1.0,
+        rgb_mean=[123.675, 116.28, 103.53],
+        rgb_std=[58.395, 57.12, 57.375],
+        ir_mean=[127.0, 127.0, 127.0],
+        ir_std=[60.0, 60.0, 60.0],
+        loss_fusion=dict(type='FusionLoss', loss_weight=0.5,
                          mean=[123.675, 116.28, 103.53],
                          std=[58.395, 57.12, 57.375],
                          ir_mean=[127.0, 127.0, 127.0],

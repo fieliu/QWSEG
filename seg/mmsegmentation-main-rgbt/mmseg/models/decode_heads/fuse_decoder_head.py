@@ -32,12 +32,33 @@ class FuseDecoderHead(BaseModule):
                  norm_cfg=dict(type='BN'),
                  align_corners=False,
                  loss_fusion=dict(type='FusionLoss', loss_weight=1.0),
+                 rgb_mean=None,
+                 rgb_std=None,
+                 ir_mean=None,
+                 ir_std=None,
                  init_cfg=None):
         super().__init__(init_cfg=init_cfg)
         self.align_corners = align_corners
         self.in_channels = in_channels
         F1_in, F2_in, F3_in, F4_in = self.in_channels
         embedding_dim = embed_dim
+
+        if rgb_mean is not None:
+            self.register_buffer('rgb_mean', torch.tensor(rgb_mean).view(1, -1, 1, 1))
+        else:
+            self.rgb_mean = None
+        if rgb_std is not None:
+            self.register_buffer('rgb_std', torch.tensor(rgb_std).view(1, -1, 1, 1))
+        else:
+            self.rgb_std = None
+        if ir_mean is not None:
+            self.register_buffer('ir_mean', torch.tensor(ir_mean).view(1, -1, 1, 1))
+        else:
+            self.ir_mean = None
+        if ir_std is not None:
+            self.register_buffer('ir_std', torch.tensor(ir_std).view(1, -1, 1, 1))
+        else:
+            self.ir_std = None
 
         self.PointConv_1_rgb = PointConv(in_dim=F1_in, out_dim=embedding_dim, norm_cfg=norm_cfg)
         self.PointConv_1_ir = PointConv(in_dim=F1_in, out_dim=embedding_dim, norm_cfg=norm_cfg)
@@ -67,7 +88,21 @@ class FuseDecoderHead(BaseModule):
         F1_rgb, F1_ir, F2_rgb, F2_ir, F3_rgb, F3_ir, F4_rgb, F4_ir = inputs
         input_rgb, input_ir = original_input
 
-        ir_rgb_cat = torch.cat([input_rgb, input_ir], dim=1)
+        if self.rgb_mean is not None and self.rgb_std is not None:
+            m = self.rgb_mean[:, :input_rgb.shape[1], :, :]
+            s = self.rgb_std[:, :input_rgb.shape[1], :, :]
+            input_rgb_denorm = (input_rgb * s + m).clamp(0, 255) / 255.0
+        else:
+            input_rgb_denorm = input_rgb
+
+        if self.ir_mean is not None and self.ir_std is not None:
+            m = self.ir_mean[:, :input_ir.shape[1], :, :]
+            s = self.ir_std[:, :input_ir.shape[1], :, :]
+            input_ir_denorm = (input_ir * s + m).clamp(0, 255) / 255.0
+        else:
+            input_ir_denorm = input_ir
+
+        ir_rgb_cat = torch.cat([input_rgb_denorm, input_ir_denorm], dim=1)
 
         F1_rgb_c = self.PointConv_1_rgb(F1_rgb)
         F1_rgb_c = F.interpolate(F1_rgb_c, size=input_rgb.shape[2:], mode='bilinear', align_corners=self.align_corners)

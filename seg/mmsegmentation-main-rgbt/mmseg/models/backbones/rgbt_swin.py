@@ -122,11 +122,11 @@ class RGBTSwinTransformer(BaseModule):
             rgb_f = rgb_feats[idx]
             thr_f = thr_feats[idx]
             if self.fusion_type == 'ADD':
-                out = (rgb_f + thr_f) / 2.0
+                out = rgb_f + thr_f
             elif self.fusion_type == 'MAX':
                 out = torch.max(rgb_f, thr_f)
             else:
-                out = (rgb_f + thr_f) / 2.0
+                out = rgb_f + thr_f
             out = self.fusion_norms[i](out)
             fused.append(out)
         return fused

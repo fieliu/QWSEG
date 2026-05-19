@@ -32,7 +32,7 @@ _QUALITY_RGB_DEG_TYPES = [
     'lowlight',
     'stain',
     'bad_block',
-    'missing',
+    # 'missing' excluded — only triggered via explicit deg_type='missing'
 ]
 
 _QUALITY_T_DEG_TYPES = [
@@ -43,7 +43,7 @@ _QUALITY_T_DEG_TYPES = [
     'thermal_halo',
     'stain',
     'bad_block',
-    'missing',
+    # 'missing' excluded — only triggered via explicit deg_type='missing'
 ]
 
 _QUALITY_LEVEL_CONFIGS = {

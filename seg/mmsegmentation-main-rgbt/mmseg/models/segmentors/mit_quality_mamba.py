@@ -1036,37 +1036,8 @@ class QualityGatedMiTMamba(BaseSegmentor):
         return seg_logits
 
     def _generate_degraded_vis_inputs(self, rgb, ir):
-        B, C, H, W = rgb.shape
-        dev = rgb.device
-        rm = self.data_preprocessor.mean[:3].to(dev); rs = self.data_preprocessor.std[:3].to(dev)
-        im = self.data_preprocessor.mean[3:].to(dev); iss = self.data_preprocessor.std[3:].to(dev)
-        dr, di = rgb.clone(), ir.clone()
-        dtr, dtt = ['none']*B, ['none']*B
-        for b in range(B):
-            r = random.random()
-            if r < 0.3:
-                if random.random() < 0.5:
-                    dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,deg_type='missing',level=5)
-                    dtr[b]='missing'
-                else:
-                    di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,deg_type='missing',level=5)
-                    dtt[b]='missing'
-            elif r < 0.6:
-                lv = random.choice([1,2,3])
-                if random.random() < 0.5:
-                    dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,level=lv); dtr[b]='global'
-                else:
-                    di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,level=lv); dtt[b]='global'
-            else:
-                lv = random.choice([1,2,3])
-                lm = _generate_local_mask(1,H,W,num_regions=3,device=dev,level=lv)
-                if random.random() < 0.5:
-                    dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,level=lv,is_local=True,local_mask=lm)
-                    dtr[b]='local'
-                else:
-                    di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,level=lv,is_local=True,local_mask=lm)
-                    dtt[b]='local'
-        return dr, di, dtr, dtt
+        """Visualization degradation — follows the same schedule as training."""
+        return self._generate_degraded_inputs(rgb, ir)
 
     def _forward(self, inputs, data_samples=None):
         rgb, t = inputs[:,:3], inputs[:,3:]

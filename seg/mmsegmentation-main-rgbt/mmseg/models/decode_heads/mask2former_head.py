@@ -39,7 +39,7 @@ class Mask2FormerHead(MMDET_Mask2FormerHead):
     def _get_targets_single(self, cls_score, mask_pred, gt_instances, img_meta):
         # fp16 safety: clean per-image tensors before point_sample + assigner
         mask_pred = mask_pred.nan_to_num(0.0).clamp(-50, 50)
-        cls_score = cls_score.nan_to_num(0.0)
+        cls_score = cls_score.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
         return super()._get_targets_single(cls_score, mask_pred, gt_instances, img_meta)
 
     def _seg_data_to_instance_data(self, batch_data_samples: SampleList):

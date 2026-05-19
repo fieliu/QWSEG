@@ -785,14 +785,14 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                     dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,deg_type='missing',level=5)
                     dtr[b]='missing'
                 else:
-                    di[b:b+1] = _apply_degradation(ir32[b:b+1],'thermal',im,iss,deg_type='missing',level=5)
+                    di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,deg_type='missing',level=5)
                     dtt[b]='missing'
             elif r < sched['p_missing']+sched['p_global']:
                 lv = sample_level(sched['global_levels'])
                 if random.random() < 0.5:
                     dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,level=lv); dtr[b]='global'
                 else:
-                    di[b:b+1] = _apply_degradation(ir32[b:b+1],'thermal',im,iss,level=lv); dtt[b]='global'
+                    di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,level=lv); dtt[b]='global'
             else:
                 lv = sample_level(sched['local_levels'])
                 lm = _generate_local_mask(1,H,W,num_regions=3,device=dev,level=lv)
@@ -800,7 +800,7 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                     dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,level=lv,is_local=True,local_mask=lm)
                     dtr[b]='local'
                 else:
-                    di[b:b+1] = _apply_degradation(ir32[b:b+1],'thermal',im,iss,level=lv,is_local=True,local_mask=lm)
+                    di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,level=lv,is_local=True,local_mask=lm)
                     dtt[b]='local'
         return dr.to(rgb.dtype), di.to(ir.dtype), dtr, dtt
 

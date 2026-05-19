@@ -785,14 +785,14 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                     dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,deg_type='missing',level=5)
                     dtr[b]='missing'
                 else:
-                    di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,deg_type='missing',level=5)
+                    di[b:b+1] = _apply_degradation(ir32[b:b+1],'thermal',im,iss,deg_type='missing',level=5)
                     dtt[b]='missing'
             elif r < sched['p_missing']+sched['p_global']:
                 lv = sample_level(sched['global_levels'])
                 if random.random() < 0.5:
                     dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,level=lv); dtr[b]='global'
                 else:
-                    di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,level=lv); dtt[b]='global'
+                    di[b:b+1] = _apply_degradation(ir32[b:b+1],'thermal',im,iss,level=lv); dtt[b]='global'
             else:
                 lv = sample_level(sched['local_levels'])
                 lm = _generate_local_mask(1,H,W,num_regions=3,device=dev,level=lv)
@@ -800,9 +800,9 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                     dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,level=lv,is_local=True,local_mask=lm)
                     dtr[b]='local'
                 else:
-                    di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,level=lv,is_local=True,local_mask=lm)
+                    di[b:b+1] = _apply_degradation(ir32[b:b+1],'thermal',im,iss,level=lv,is_local=True,local_mask=lm)
                     dtt[b]='local'
-        return dr, di, dtr, dtt
+        return dr.to(rgb.dtype), di.to(ir.dtype), dtr, dtt
 
     # ---- loss / predict / inference ----
 
@@ -839,11 +839,15 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         if self.retention_loss_weight > 0: losses['loss_retention'] = self.retention_loss_weight*self._compute_retention_loss(ad)
         if self.training:
             df,drl,dtl,dzf,dqr,dqt,dzpr,dzpt,dzcr,dzct,dDr,dDt = self._train_with_degradation(rgb,ir)
-            losses['loss_deg_seg'] = sum(self.decode_head.loss(df,data_samples,self.train_cfg).values())
-            if ph >= 3:
-                if self.common_decode_head and dzf: losses['loss_deg_common_decode'] = self.aux_loss_weight*sum(self.common_decode_head.loss(dzf,data_samples,self.train_cfg).values())
-                if self.rgb_private_decode_head and drl: losses['loss_deg_rgb_private_decode'] = self.aux_loss_weight*sum(self.rgb_private_decode_head.loss(drl,data_samples,self.train_cfg).values())
-                if self.t_private_decode_head and dtl: losses['loss_deg_t_private_decode'] = self.aux_loss_weight*sum(self.t_private_decode_head.loss(dtl,data_samples,self.train_cfg).values())
+            losses.update(add_prefix(self.decode_head.loss(df,data_samples,self.train_cfg),'deg_decode'))
+            for head, feats, pfx in [
+                (self.common_decode_head, dzf, 'deg_common_decode'),
+                (self.rgb_private_decode_head, drl, 'deg_rgb_private_decode'),
+                (self.t_private_decode_head, dtl, 'deg_t_private_decode'),
+            ]:
+                if head and feats:
+                    ld = {k: v*self.aux_loss_weight for k,v in head.loss(feats,data_samples,self.train_cfg).items()}
+                    losses.update(add_prefix(ld, pfx))
             if self.loss_align_weight > 0 and dzcr is not None and dzct is not None:
                 dlc, dcnt = 0., 0
                 for i in range(len(dzcr)):

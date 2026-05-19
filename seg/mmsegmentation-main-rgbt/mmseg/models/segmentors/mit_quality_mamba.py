@@ -892,11 +892,15 @@ class QualityGatedMiTMamba(BaseSegmentor):
                     'NaN in degraded features — falling back to clean features for deg losses')
                 df,drl,dtl,dzf,dqr,dqt,dzpr,dzpt,dzcr,dzct,dDr,dDt = \
                     ff,re,te,zf,q_r,q_t,zp_r,zp_t,zc_r,zc_t,D_r,D_t
-            losses['loss_deg_seg'] = sum(self.decode_head.loss(df,data_samples,self.train_cfg).values())
-            if ph >= 3:
-                if self.common_decode_head and dzf: losses['loss_deg_common_decode'] = self.aux_loss_weight*sum(self.common_decode_head.loss(dzf,data_samples,self.train_cfg).values())
-                if self.rgb_private_decode_head and drl: losses['loss_deg_rgb_private_decode'] = self.aux_loss_weight*sum(self.rgb_private_decode_head.loss(drl,data_samples,self.train_cfg).values())
-                if self.t_private_decode_head and dtl: losses['loss_deg_t_private_decode'] = self.aux_loss_weight*sum(self.t_private_decode_head.loss(dtl,data_samples,self.train_cfg).values())
+            losses.update(add_prefix(self.decode_head.loss(df,data_samples,self.train_cfg),'deg_decode'))
+            for head, feats, pfx in [
+                (self.common_decode_head, dzf, 'deg_common_decode'),
+                (self.rgb_private_decode_head, drl, 'deg_rgb_private_decode'),
+                (self.t_private_decode_head, dtl, 'deg_t_private_decode'),
+            ]:
+                if head and feats:
+                    ld = {k: v*self.aux_loss_weight for k,v in head.loss(feats,data_samples,self.train_cfg).items()}
+                    losses.update(add_prefix(ld, pfx))
             if self.loss_align_weight > 0 and dzcr is not None and dzct is not None:
                 dlc, dcnt = 0., 0
                 for i in range(len(dzcr)):

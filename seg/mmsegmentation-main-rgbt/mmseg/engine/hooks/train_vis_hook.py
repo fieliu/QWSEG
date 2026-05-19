@@ -667,24 +667,37 @@ class TrainVisHook(Hook):
                 return dict(zc_rgb=zc_rgb, zc_t=zc_t,
                             zp_rgb=zp_rgb, zp_t=zp_t,
                             zc_enhanced=zc_enhanced, fused=fused)
-            elif model_type == 'v7_degradation':
+            elif model_type in ('v7_degradation', 'v7_degradation_full'):
                 input_rgb = proc_inputs[:, :3, :, :]
                 input_ir = proc_inputs[:, 3:, :, :]
                 input_rgbt = torch.cat([input_rgb, input_ir], dim=0)
                 zc_rgb, zc_t, zp_rgb, zp_t, zc_enhanced, fused = \
                     model.extract_feat(input_rgbt)
-                return dict(zc_rgb=zc_rgb, zc_t=zc_t,
-                            zp_rgb=zp_rgb, zp_t=zp_t,
-                            zc_enhanced=zc_enhanced, fused=fused)
-            elif model_type == 'v7_degradation_full':
-                input_rgb = proc_inputs[:, :3, :, :]
-                input_ir = proc_inputs[:, 3:, :, :]
-                input_rgbt = torch.cat([input_rgb, input_ir], dim=0)
-                zc_rgb, zc_t, zp_rgb, zp_t, zc_enhanced, fused = \
-                    model.extract_feat(input_rgbt)
-                return dict(zc_rgb=zc_rgb, zc_t=zc_t,
-                            zp_rgb=zp_rgb, zp_t=zp_t,
-                            zc_enhanced=zc_enhanced, fused=fused)
+                result = dict(zc_rgb=zc_rgb, zc_t=zc_t,
+                              zp_rgb=zp_rgb, zp_t=zp_t,
+                              zc_enhanced=zc_enhanced, fused=fused)
+                with torch.no_grad():
+                    rgb_mean = model.data_preprocessor.mean[:3].to(input_rgb.device)
+                    rgb_std = model.data_preprocessor.std[:3].to(input_rgb.device)
+                    t_mean = model.data_preprocessor.mean[3:].to(input_ir.device)
+                    t_std = model.data_preprocessor.std[3:].to(input_ir.device)
+                    rgb_01 = (input_rgb * rgb_std + rgb_mean) / 255.0
+                    rgb_01 = rgb_01.clamp(0, 1)
+                    t_01 = (input_ir * t_std + t_mean) / 255.0
+                    t_01 = t_01.clamp(0, 1)
+                    deg_rgb, deg_t = model.degradation(rgb_01, t_01)
+                    deg_rgb_norm = (deg_rgb * 255.0 - rgb_mean) / rgb_std
+                    deg_t_norm = (deg_t * 255.0 - t_mean) / t_std
+                    deg_rgbt = torch.cat([deg_rgb_norm, deg_t_norm], dim=0)
+                    (zc_rgb_deg, zc_t_deg, zp_rgb_deg, zp_t_deg,
+                     zc_enhanced_deg, fused_deg) = model.extract_feat(deg_rgbt)
+                    result.update(
+                        deg_rgb_img=deg_rgb_norm, deg_t_img=deg_t_norm,
+                        deg_type_rgb='degraded', deg_type_t='degraded',
+                        zc_rgb_deg=zc_rgb_deg, zc_t_deg=zc_t_deg,
+                        zp_rgb_deg=zp_rgb_deg, zp_t_deg=zp_t_deg,
+                        zc_enhanced_deg=zc_enhanced_deg, fused_deg=fused_deg)
+                return result
             elif model_type == 'v8_quality_pyramid':
                 input_rgb = proc_inputs[:, :3, :, :]
                 input_ir = proc_inputs[:, 3:, :, :]
@@ -1266,16 +1279,16 @@ class TrainVisHook(Hook):
                 [feats['zc_rgb'], feats['zc_t'],
                  feats['zp_rgb'], feats['zp_t'],
                  feats['zc_enhanced'], feats['fused']])
-        elif model_type == 'v7_degradation':
+        elif model_type in ('v7_degradation', 'v7_degradation_full'):
             feat_rows = _build_feat_rows(
                 [feats['zc_rgb'], feats['zc_t'],
                  feats['zp_rgb'], feats['zp_t'],
                  feats['zc_enhanced'], feats['fused']])
-        elif model_type == 'v7_degradation_full':
-            feat_rows = _build_feat_rows(
-                [feats['zc_rgb'], feats['zc_t'],
-                 feats['zp_rgb'], feats['zp_t'],
-                 feats['zc_enhanced'], feats['fused']])
+            deg_feat_rows = _build_feat_rows(
+                [feats['zc_rgb_deg'], feats['zc_t_deg'],
+                 feats['zp_rgb_deg'], feats['zp_t_deg'],
+                 feats['zc_enhanced_deg'], feats['fused_deg']])
+            return feat_rows, q_grid, deg_feat_rows
         elif model_type == 'v8_quality_pyramid':
             q_info = self._create_pyramid_quality_vis(feats, img_h=img_h, img_w=img_w)
             feat_rows = _build_feat_rows(
@@ -1978,6 +1991,15 @@ class TrainVisHook(Hook):
             img_h, img_w = proc_inputs.shape[-2], proc_inputs.shape[-1]
             aspect_ratio = img_w / max(img_h, 1)
 
+        if model_type in ('v7_degradation', 'v7_degradation_full'):
+            col_headers = ['zc_rgb', 'zc_t', 'zp_rgb', 'zp_t',
+                           'zc_enhanced', 'fused']
+            num_stages = len(feats.get('zc_rgb', []))
+            row_labels = [f'Stage {s} (clean)' for s in range(num_stages)]
+            row_labels += [f'Stage {s} (degraded)' for s in range(num_stages)]
+            img_h, img_w = proc_inputs.shape[-2], proc_inputs.shape[-1]
+            aspect_ratio = img_w / max(img_h, 1)
+
         if model_type == 'ab_baseline':
             col_headers = ['rgb_feat', 't_feat', 'fused']
             num_stages = len(feats.get('x_rgb', feats.get('fused', [])))
@@ -2346,6 +2368,39 @@ class TrainVisHook(Hook):
                 deg_rgb_vis=deg_rgb_vis, deg_t_vis=deg_t_vis,
                 deg_feat_rows=deg_feat_rows,
                 deg_decoder_preds=ab_deg_decoder_preds,
+                deg_pred_vis=deg_pred_vis)
+        elif model_type in ('v7_degradation', 'v7_degradation_full'):
+            deg_rgb_vis, deg_t_vis = self._render_degraded_images(
+                feats, model, raw_rgb=rgb_vis, raw_t=t_vis)
+
+            deg_rgb_t = feats['deg_rgb_img']
+            deg_t_t = feats['deg_t_img']
+            deg_input = torch.cat([deg_rgb_t, deg_t_t], dim=1)
+            deg_pred_seg = self._get_prediction(
+                model, deg_input, single_sample, runner)
+            if pad_bottom > 0 or pad_right > 0:
+                dH, dW = deg_rgb_vis.shape[:2]
+                if dH == H and dW == W:
+                    deg_rgb_vis = deg_rgb_vis[pad_top:dH - pad_bottom,
+                                              pad_left:dW - pad_right]
+                    deg_t_vis = deg_t_vis[pad_top:dH - pad_bottom,
+                                          pad_left:dW - pad_right]
+                dpH, dpW = deg_pred_seg.shape[:2]
+                if dpH == H and dpW == W:
+                    deg_pred_seg = deg_pred_seg[pad_top:dpH - pad_bottom,
+                                                pad_left:dpW - pad_right]
+            _, deg_pred_vis = self._render_seg(label_seg, deg_pred_seg, palette)
+
+            title = f'Epoch {epoch} | Sample {b_idx} | Deg: degraded'
+            if loss_str:
+                title += f' | {loss_str}'
+            grid = _compose_ablation_vis(
+                rgb_vis, t_vis, feat_rows, label_vis, pred_vis,
+                self.short_side, title=title,
+                col_headers=col_headers, row_labels=row_labels,
+                decoder_preds=decoder_preds, aspect_ratio=aspect_ratio,
+                deg_rgb_vis=deg_rgb_vis, deg_t_vis=deg_t_vis,
+                deg_feat_rows=deg_feat_rows,
                 deg_pred_vis=deg_pred_vis)
         else:
             title = f'Epoch {epoch} | Sample {b_idx}'

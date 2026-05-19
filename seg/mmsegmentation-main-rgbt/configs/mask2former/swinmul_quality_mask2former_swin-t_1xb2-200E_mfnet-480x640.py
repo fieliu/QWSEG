@@ -222,8 +222,10 @@ model = dict(
     retention_min=0.5,
     retention_max=0.95,
     retention_loss_weight=5.0,
-    phase1_epochs=20,
-    phase2_epochs=60,
+    phase_mode='absolute',
+    phase1_epochs=10,
+    phase2_epochs=20,
+    total_epochs=200,
     loss_align_weight=0.1,
     contrast_tau=0.07,
     contrast_num_samples=512,
@@ -231,10 +233,6 @@ model = dict(
     loss_distill_weight=0.3,
     distill_temperature=4.0,
     aux_loss_weight=0.3,
-    total_epochs=200,
-    mamba_d_state=16,
-    mamba_d_conv=4,
-    mamba_expand=2,
     missing_ratio=0.3,
     global_deg_ratio=0.3,
     local_deg_ratio=0.4,
@@ -280,8 +278,7 @@ custom_keys.update({
 })
 
 predictor_keys = {}
-for pred_name in ['predictors_common_rgb', 'predictors_common_t',
-                  'predictors_priv_rgb', 'predictors_priv_t']:
+for pred_name in ['predictors_common']:
     predictor_keys[f'{pred_name}'] = dict(lr_mult=5.0, decay_mult=1.0)
     for stage_id in range(4):
         for sub in ['local_conv1', 'local_conv2', 'fuse_conv1', 'fuse_conv2',

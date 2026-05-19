@@ -180,35 +180,40 @@ def _lerp(a, b, t):
 
 
 def get_degradation_schedule(r):
-    """Return probability dict for each degradation type at training progress r."""
-    if r < 0.1:
-        t = r / 0.1
-        p_local, p_global, p_missing = 1.0, 0.0, 0.0
-        local_levels = {2: _lerp(0.7, 0.7, t), 3: _lerp(0.3, 0.3, t), 4: 0.0, 5: 0.0}
+    """Return probability dict for each degradation type at training progress r.
+
+    Aggressive curriculum: missing modality from epoch 0, local drops early,
+    final distribution favours hard degradation (0.4 missing / 0.3 global / 0.3 local).
+    """
+    if r < 0.05:          # epoch  0- 9  (200 total)
+        t = r / 0.05
+        p_local, p_global, p_missing = _lerp(0.8, 0.6, t), _lerp(0.1, 0.2, t), _lerp(0.1, 0.2, t)
+        local_levels  = {2: _lerp(0.6, 0.3, t), 3: _lerp(0.3, 0.5, t), 4: _lerp(0.1, 0.2, t), 5: 0.0}
         global_levels = {2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
-    elif r < 0.3:
-        t = (r - 0.1) / 0.2
-        p_local, p_global, p_missing = _lerp(1.0, 0.8, t), _lerp(0.0, 0.2, t), 0.0
-        local_levels = {2: _lerp(0.7, 0.1, t), 3: _lerp(0.3, 0.5, t), 4: _lerp(0.0, 0.4, t), 5: 0.0}
-        global_levels = {2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
-    elif r < 0.5:
-        t = (r - 0.3) / 0.2
-        p_local, p_global, p_missing = _lerp(0.8, 0.6, t), 0.2, _lerp(0.0, 0.2, t)
-        local_levels = {2: 0.0, 3: _lerp(0.5, 0.3, t), 4: 0.4, 5: _lerp(0.0, 0.3, t)}
-        global_levels = {2: _lerp(1.0, 0.5, t), 3: _lerp(0.0, 0.5, t), 4: 0.0, 5: 0.0}
-    elif r < 0.7:
-        t = (r - 0.5) / 0.2
-        p_local, p_global, p_missing = _lerp(0.6, 0.3, t), _lerp(0.2, 0.25, t), _lerp(0.2, 0.45, t)
-        local_levels = {2: 0.0, 3: 0.2, 4: 0.4, 5: 0.4}
-        global_levels = {2: 0.3, 3: 0.4, 4: 0.3, 5: 0.0}
-    elif r < 0.9:
-        p_local, p_global, p_missing = 0.25, 0.25, 0.5
-        local_levels = {2: 0.0, 3: 0.1, 4: 0.4, 5: 0.5}
-        global_levels = {2: 0.2, 3: 0.4, 4: 0.3, 5: 0.1}
-    else:
-        p_local, p_global, p_missing = 0.25, 0.25, 0.5
-        local_levels = {2: 0.0, 3: 0.1, 4: 0.4, 5: 0.5}
-        global_levels = {2: 0.2, 3: 0.4, 4: 0.3, 5: 0.1}
+    elif r < 0.10:         # epoch 10-19
+        t = (r - 0.05) / 0.05
+        p_local, p_global, p_missing = _lerp(0.6, 0.4, t), _lerp(0.2, 0.3, t), _lerp(0.2, 0.3, t)
+        local_levels  = {2: 0.2, 3: _lerp(0.5, 0.4, t), 4: _lerp(0.3, 0.4, t), 5: 0.0}
+        global_levels = {2: _lerp(1.0, 0.6, t), 3: _lerp(0.0, 0.4, t), 4: 0.0, 5: 0.0}
+    elif r < 0.15:         # epoch 20-29
+        t = (r - 0.10) / 0.05
+        p_local, p_global, p_missing = _lerp(0.4, 0.3, t), _lerp(0.3, 0.3, t), _lerp(0.3, 0.4, t)
+        local_levels  = {2: 0.1, 3: _lerp(0.4, 0.3, t), 4: _lerp(0.4, 0.4, t), 5: _lerp(0.1, 0.3, t)}
+        global_levels = {2: _lerp(0.5, 0.3, t), 3: _lerp(0.4, 0.4, t), 4: _lerp(0.1, 0.3, t), 5: 0.0}
+    elif r < 0.25:         # epoch 30-49
+        t = (r - 0.15) / 0.10
+        p_local, p_global, p_missing = _lerp(0.3, 0.3, t), _lerp(0.3, 0.3, t), _lerp(0.4, 0.4, t)
+        local_levels  = {2: 0.0, 3: 0.2, 4: _lerp(0.4, 0.4, t), 5: _lerp(0.4, 0.4, t)}
+        global_levels = {2: 0.2, 3: _lerp(0.4, 0.3, t), 4: _lerp(0.3, 0.4, t), 5: _lerp(0.1, 0.3, t)}
+    elif r < 0.40:         # epoch 50-79
+        t = (r - 0.25) / 0.15
+        p_local, p_global, p_missing = 0.3, _lerp(0.3, 0.3, t), _lerp(0.4, 0.4, t)
+        local_levels  = {2: 0.0, 3: 0.1, 4: _lerp(0.4, 0.3, t), 5: _lerp(0.5, 0.6, t)}
+        global_levels = {2: 0.1, 3: _lerp(0.3, 0.3, t), 4: _lerp(0.4, 0.3, t), 5: _lerp(0.2, 0.4, t)}
+    else:                   # epoch 80+
+        p_local, p_global, p_missing = 0.3, 0.3, 0.4
+        local_levels  = {2: 0.0, 3: 0.1, 4: 0.3, 5: 0.6}
+        global_levels = {2: 0.1, 3: 0.3, 4: 0.3, 5: 0.3}
     return dict(p_local=p_local, p_global=p_global, p_missing=p_missing,
                 local_levels=local_levels, global_levels=global_levels)
 
@@ -310,9 +315,10 @@ def compute_cross_modal_contrastive_loss(feat_rgb, feat_t, labels, D_rgb, D_t,
     neg_mask = (~is_self) & (~same_class)                     # diff class, not self
 
     # ---- InfoNCE with logsumexp (masked) ----
+    # Clamp similarity to avoid overflow in logsumexp (fp16 safety)
+    sim = sim.clamp(-50, 50)
     pos_scores = sim.diag()  # (N,)
     sim_masked = sim.masked_fill(~neg_mask, float('-inf'))
-    # prepend positive score column
     sim_ext = torch.cat([pos_scores.unsqueeze(1), sim_masked], dim=1)  # (N, N+1)
     log_denom = torch.logsumexp(sim_ext, dim=1)                       # (N,)
     loss_per_sample = -pos_scores + log_denom                         # (N,)

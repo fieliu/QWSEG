@@ -312,10 +312,12 @@ def _build_quality_attn_mask(q_2d, threshold, H, W, B,
     combined = torch.clamp(row_mask + col_mask, max=1.0)
 
     attn_bias = torch.where(combined.bool(),
-                            torch.tensor(-50.0,
-                                         device=q_2d.device),
+                            torch.tensor(-100.0,
+                                         device=q_2d.device,
+                                         dtype=torch.float32),
                             torch.tensor(0.0,
-                                         device=q_2d.device))
+                                         device=q_2d.device,
+                                         dtype=torch.float32))
 
     attn_bias = attn_bias.reshape(B * nW, 1, N, N).expand(
         B * nW, num_heads, N, N).contiguous()

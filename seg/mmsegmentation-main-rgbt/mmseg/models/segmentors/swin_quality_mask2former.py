@@ -504,6 +504,7 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                  phase1_epochs: int = 10,
                  phase2_epochs: int = 20,
                  total_epochs: int = 200,
+                 phase_mode: str = 'absolute',  # 'absolute' or 'ratio'
                  loss_align_weight: float = 0.1,
                  contrast_tau: float = 0.07,
                  contrast_num_samples: int = 512,
@@ -548,6 +549,7 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         self.retention_loss_weight = retention_loss_weight
         self.phase1_epochs, self.phase2_epochs = phase1_epochs, phase2_epochs
         self.total_epochs = total_epochs
+        self.phase_mode = phase_mode
         self.loss_align_weight = loss_align_weight
         self.contrast_tau, self.contrast_num_samples = contrast_tau, contrast_num_samples
         self.loss_distill_weight = loss_distill_weight
@@ -616,11 +618,13 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         return valid
 
     def _get_training_phase(self, epoch):
-        if self.skip_phases:
+        if self.phase_mode == 'ratio':
+            r = min(epoch / max(self.total_epochs, 1), 1.0)
+            if r < 0.1: return 1
+            elif r < 0.3: return 2
             return 3
-        r = min(epoch / max(self.total_epochs, 1), 1.0)
-        if r < 0.1: return 1
-        elif r < 0.3: return 2
+        if epoch < self.phase1_epochs: return 1
+        elif epoch < self.phase1_epochs + self.phase2_epochs: return 2
         return 3
 
     def _update_training_phase(self, epoch):
@@ -919,6 +923,18 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
              q_r_d,q_t_d,ad_d,D_r_d,D_t_d,Dpr_d,Dpt_d,
              qpr_d,qpt_d,cDr_d,cDt_d,cDpr_d,cDpt_d) = self._extract_feat_single(deg_rgb, deg_t)
             fused_d = self.neck(ff_d) if self.with_neck else ff_d
+
+        # align degraded feat spatial sizes to clean counterparts
+        for i in range(len(zf)):
+            if zc_r_d[i].shape[-2:] != zc_r[i].shape[-2:]:
+                zc_r_d[i] = F.interpolate(zc_r_d[i], size=zc_r[i].shape[-2:], mode='bilinear')
+                zc_t_d[i] = F.interpolate(zc_t_d[i], size=zc_t[i].shape[-2:], mode='bilinear')
+                zf_d[i] = F.interpolate(zf_d[i], size=zf[i].shape[-2:], mode='bilinear')
+                zp_r_d[i] = F.interpolate(zp_r_d[i], size=zp_r[i].shape[-2:], mode='bilinear')
+                zp_t_d[i] = F.interpolate(zp_t_d[i], size=zp_t[i].shape[-2:], mode='bilinear')
+                re_d[i] = F.interpolate(re_d[i], size=re[i].shape[-2:], mode='bilinear')
+                te_d[i] = F.interpolate(te_d[i], size=te[i].shape[-2:], mode='bilinear')
+                ff_d[i] = F.interpolate(ff_d[i], size=ff[i].shape[-2:], mode='bilinear')
 
         return dict(
             zc_rgb=zc_r, zc_t=zc_t,

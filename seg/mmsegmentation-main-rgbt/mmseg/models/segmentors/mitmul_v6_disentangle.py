@@ -1265,11 +1265,17 @@ class MiTMulV7Degradation(MiTMulV6Disentangle):
             self.loss_variance_weight
 
         with torch.no_grad():
-            rgb_norm = input_rgb * 0.5 + 0.5
-            t_norm = input_ir * 0.5 + 0.5
-            deg_rgb, deg_t = self.degradation(rgb_norm, t_norm)
-            deg_rgb = (deg_rgb - 0.5) / 0.5
-            deg_t = (deg_t - 0.5) / 0.5
+            rgb_mean = self.data_preprocessor.mean[:3].to(input_rgb.device)
+            rgb_std = self.data_preprocessor.std[:3].to(input_rgb.device)
+            t_mean = self.data_preprocessor.mean[3:].to(input_ir.device)
+            t_std = self.data_preprocessor.std[3:].to(input_ir.device)
+            rgb_01 = (input_rgb * rgb_std + rgb_mean) / 255.0
+            rgb_01 = rgb_01.clamp(0, 1)
+            t_01 = (input_ir * t_std + t_mean) / 255.0
+            t_01 = t_01.clamp(0, 1)
+            deg_rgb, deg_t = self.degradation(rgb_01, t_01)
+            deg_rgb = (deg_rgb * 255.0 - rgb_mean) / rgb_std
+            deg_t = (deg_t * 255.0 - t_mean) / t_std
 
         deg_rgbt = torch.cat([deg_rgb, deg_t], dim=0)
         (_, _, _, _, deg_zc_enhanced,
@@ -1449,11 +1455,17 @@ class MiTMulV7DegradationFull(MiTMulV7Degradation):
                            max(self.deg_loss_warmup_iters, 1))
 
         with torch.no_grad():
-            rgb_norm = input_rgb * 0.5 + 0.5
-            t_norm = input_ir * 0.5 + 0.5
-            deg_rgb, deg_t = self.degradation(rgb_norm, t_norm)
-            deg_rgb = (deg_rgb - 0.5) / 0.5
-            deg_t = (deg_t - 0.5) / 0.5
+            rgb_mean = self.data_preprocessor.mean[:3].to(input_rgb.device)
+            rgb_std = self.data_preprocessor.std[:3].to(input_rgb.device)
+            t_mean = self.data_preprocessor.mean[3:].to(input_ir.device)
+            t_std = self.data_preprocessor.std[3:].to(input_ir.device)
+            rgb_01 = (input_rgb * rgb_std + rgb_mean) / 255.0
+            rgb_01 = rgb_01.clamp(0, 1)
+            t_01 = (input_ir * t_std + t_mean) / 255.0
+            t_01 = t_01.clamp(0, 1)
+            deg_rgb, deg_t = self.degradation(rgb_01, t_01)
+            deg_rgb = (deg_rgb * 255.0 - rgb_mean) / rgb_std
+            deg_t = (deg_t * 255.0 - t_mean) / t_std
 
         deg_rgbt = torch.cat([deg_rgb, deg_t], dim=0)
         (deg_zc_rgb_list, deg_zc_t_list, deg_zp_rgb_list, deg_zp_t_list,

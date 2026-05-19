@@ -50,18 +50,18 @@ def nchw_to_nlc(x):
 # ---------------------------------------------------------------------------
 
 class SimpleConcatFusion(nn.Module):
-    """Shallow-stage fusion: concat gen+priv, 1x1 conv, LN, GELU, residual."""
+    """Shallow-stage fusion: concat, 1x1 conv, LN, GELU, residual."""
 
     def __init__(self, d_model):
         super().__init__()
         self.fuse_conv = nn.Conv2d(d_model * 2, d_model, 1, bias=False)
-        self.norm = nn.LayerNorm(d_model)
+        self.out_norm = nn.LayerNorm(d_model)
         self.act = nn.GELU()
 
     def forward(self, common_feat, priv_feat):
         x = torch.cat([common_feat, priv_feat], dim=1)
         x = self.fuse_conv(x)
-        x = self.act(self.norm(x.permute(0, 2, 3, 1))).permute(0, 3, 1, 2)
+        x = self.act(self.out_norm(x.permute(0, 2, 3, 1))).permute(0, 3, 1, 2)
         return common_feat + x
 
 
@@ -84,7 +84,7 @@ class BiMambaFusion(nn.Module):
         self._init_mamba_params('fwd')
         self._init_mamba_params('bwd')
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
-        self.norm = nn.LayerNorm(d_model)
+        self.out_norm = nn.LayerNorm(d_model)
 
     def _init_mamba_params(self, suffix):
         d, s, r = self.d_inner, self.d_state, self.dt_rank
@@ -177,7 +177,7 @@ class BiMambaFusion(nn.Module):
         out_rev = self._reverse_sequences(out_rev, cu_seqlens)
         out_seq = (out_fwd + out_rev).squeeze(0)
         G_enhanced = self._extract_generic(out_seq, cu_seqlens, N_g)
-        return generic_tokens + self.out_proj(self.norm(G_enhanced))
+        return generic_tokens + self.out_proj(self.out_norm(G_enhanced))
 
 
 def _selective_scan_pytorch(x, dt, A, B_ssm, C_ssm, D, cu_seqlens=None):
@@ -200,12 +200,12 @@ def _selective_scan_pytorch(x, dt, A, B_ssm, C_ssm, D, cu_seqlens=None):
 
 
 class MultiScaleRefine(nn.Module):
-    """Multi-scale refinement with dilated depthwise convs + channel attention."""
+    """Multi-scale refinement with dilated depthwise convs + channel attention.
+    All normalisation uses LayerNorm (channel-last)."""
 
     def __init__(self, channels, dilations=(1, 2, 3)):
         super().__init__()
-        num_groups = min(32, channels)
-        self.norm = nn.GroupNorm(num_groups, channels)
+        self.in_norm = nn.LayerNorm(channels)
         self.dw_convs = nn.ModuleList([
             nn.Conv2d(channels, channels, 3, padding=d, dilation=d, groups=channels, bias=False)
             for d in dilations])
@@ -215,14 +215,16 @@ class MultiScaleRefine(nn.Module):
         self.channel_attn = nn.Sequential(
             nn.AdaptiveAvgPool2d(1), nn.Conv2d(channels, mid_ca, 1, bias=False),
             nn.ReLU(inplace=True), nn.Conv2d(mid_ca, channels, 1, bias=False), nn.Sigmoid())
+        self.out_norm = nn.LayerNorm(channels)
         self.out_conv = nn.Conv2d(channels, channels, 1, bias=False)
 
     def forward(self, x):
         residual = x
-        x = self.norm(x)
+        x = self.in_norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         multi = [dw(x) for dw in self.dw_convs]
         x = self.fuse_conv(torch.cat(multi, dim=1))
         x = self.act(x) * self.channel_attn(x)
+        x = self.out_norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         return residual + self.out_conv(x)
 
 
@@ -389,9 +391,9 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
             if cum_D is not None:
                 H_k, W_k = hw_shape_k
                 D_k = downsample_mask(cum_D, H_k, W_k).reshape(Bb, 1, 1, -1)
-                attn = attn + torch.log(D_k + 1e-9)
+                attn = attn + torch.log(D_k.float() + 1e-6).to(attn.dtype)
 
-            attn = attn.softmax(dim=-1)
+            attn = attn.float().softmax(dim=-1).to(V.dtype)
             if hasattr(attn_module, 'dropout_layer') and attn_module.dropout_layer is not None:
                 attn = attn_module.dropout_layer(attn)
             attn_out = (attn @ V).transpose(1, 2).reshape(Bb, N_tok, C_tok)
@@ -509,9 +511,9 @@ def _forward_branch_pruned(backbone, img, predictor_list, cum_D_prev_list,
             if cum_D is not None:
                 H_k, W_k = hw_shape_k
                 D_k = downsample_mask(cum_D, H_k, W_k).reshape(Bb, 1, 1, -1)
-                attn = attn + torch.log(D_k + 1e-9)
+                attn = attn + torch.log(D_k.float() + 1e-6).to(attn.dtype)
 
-            attn = attn.softmax(dim=-1)
+            attn = attn.float().softmax(dim=-1).to(V.dtype)
             if hasattr(attn_module, 'dropout_layer') and attn_module.dropout_layer is not None:
                 attn = attn_module.dropout_layer(attn)
             attn_out = (attn @ V).transpose(1, 2).reshape(Bb, N_tok, C_tok)
@@ -567,6 +569,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
                  phase1_epochs: int = 10,
                  phase2_epochs: int = 20,
                  total_epochs: int = 200,
+                 phase_mode: str = 'absolute',  # 'absolute' or 'ratio'
                  loss_align_weight: float = 0.1,
                  contrast_tau: float = 0.07,
                  contrast_num_samples: int = 512,
@@ -608,6 +611,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
         self.retention_loss_weight = retention_loss_weight
         self.phase1_epochs, self.phase2_epochs = phase1_epochs, phase2_epochs
         self.total_epochs = total_epochs
+        self.phase_mode = phase_mode
         self.loss_align_weight = loss_align_weight
         self.contrast_tau, self.contrast_num_samples = contrast_tau, contrast_num_samples
         self.loss_distill_weight = loss_distill_weight
@@ -676,11 +680,14 @@ class QualityGatedMiTMamba(BaseSegmentor):
         return valid
 
     def _get_training_phase(self, epoch):
-        if self.skip_phases:
+        if self.phase_mode == 'ratio':
+            r = min(epoch / max(self.total_epochs, 1), 1.0)
+            if r < 0.1: return 1
+            elif r < 0.3: return 2
             return 3
-        r = min(epoch / max(self.total_epochs, 1), 1.0)
-        if r < 0.1: return 1
-        elif r < 0.3: return 2
+        # absolute (default)
+        if epoch < self.phase1_epochs: return 1
+        elif epoch < self.phase1_epochs + self.phase2_epochs: return 2
         return 3
 
     def _update_training_phase(self, epoch):
@@ -878,6 +885,13 @@ class QualityGatedMiTMamba(BaseSegmentor):
         if self.retention_loss_weight > 0: losses['loss_retention'] = self.retention_loss_weight*self._compute_retention_loss(ad)
         if self.training:
             df,drl,dtl,dzf,dqr,dqt,dzpr,dzpt,dzcr,dzct,dDr,dDt = self._train_with_degradation(rgb,ir)
+            # NaN guard: if degraded features are NaN, fall back to clean
+            if torch.isnan(df[0]).any():
+                import logging
+                logging.getLogger(__name__).warning(
+                    'NaN in degraded features — falling back to clean features for deg losses')
+                df,drl,dtl,dzf,dqr,dqt,dzpr,dzpt,dzcr,dzct,dDr,dDt = \
+                    ff,re,te,zf,q_r,q_t,zp_r,zp_t,zc_r,zc_t,D_r,D_t
             losses['loss_deg_seg'] = sum(self.decode_head.loss(df,data_samples,self.train_cfg).values())
             if self.common_decode_head and dzf: losses['loss_deg_common_decode'] = self.aux_loss_weight*sum(self.common_decode_head.loss(dzf,data_samples,self.train_cfg).values())
             if self.rgb_private_decode_head and drl: losses['loss_deg_rgb_private_decode'] = self.aux_loss_weight*sum(self.rgb_private_decode_head.loss(drl,data_samples,self.train_cfg).values())
@@ -965,6 +979,18 @@ class QualityGatedMiTMamba(BaseSegmentor):
              q_r_d,q_t_d,ad_d,D_r_d,D_t_d,Dpr_d,Dpt_d,
              qpr_d,qpt_d,cDr_d,cDt_d,cDpr_d,cDpt_d) = self._extract_feat_single(deg_rgb, deg_t)
             fused_d = self.neck(ff_d) if self.with_neck else ff_d
+
+        # align degraded feat spatial sizes to clean counterparts (padding may differ)
+        for i in range(len(zf)):
+            if zc_r_d[i].shape[-2:] != zc_r[i].shape[-2:]:
+                zc_r_d[i] = F.interpolate(zc_r_d[i], size=zc_r[i].shape[-2:], mode='bilinear')
+                zc_t_d[i] = F.interpolate(zc_t_d[i], size=zc_t[i].shape[-2:], mode='bilinear')
+                zf_d[i] = F.interpolate(zf_d[i], size=zf[i].shape[-2:], mode='bilinear')
+                zp_r_d[i] = F.interpolate(zp_r_d[i], size=zp_r[i].shape[-2:], mode='bilinear')
+                zp_t_d[i] = F.interpolate(zp_t_d[i], size=zp_t[i].shape[-2:], mode='bilinear')
+                re_d[i] = F.interpolate(re_d[i], size=re[i].shape[-2:], mode='bilinear')
+                te_d[i] = F.interpolate(te_d[i], size=te[i].shape[-2:], mode='bilinear')
+                ff_d[i] = F.interpolate(ff_d[i], size=ff[i].shape[-2:], mode='bilinear')
 
         return dict(
             zc_rgb=zc_r, zc_t=zc_t,

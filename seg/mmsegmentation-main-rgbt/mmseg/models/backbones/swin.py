@@ -112,7 +112,7 @@ class WindowMSA(BaseModule):
                 attn = attn.view(B // nW, nW, self.num_heads, N,
                                  N) + mask.unsqueeze(1).unsqueeze(0)
                 attn = attn.view(-1, self.num_heads, N, N)
-        attn = self.softmax(attn)
+        attn = self.softmax(attn.float()).to(v.dtype)
 
         attn = self.attn_drop(attn)
 

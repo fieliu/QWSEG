@@ -281,7 +281,8 @@ custom_keys.update({
 })
 
 predictor_keys = {}
-for pred_name in ['predictors_common']:
+for pred_name in ['predictors_common_rgb', 'predictors_common_t',
+                  'predictors_priv_rgb', 'predictors_priv_t']:
     predictor_keys[f'{pred_name}'] = dict(lr_mult=5.0, decay_mult=1.0)
     for stage_id in range(4):
         for sub in ['local_conv1', 'local_conv2', 'fuse_conv1', 'fuse_conv2',

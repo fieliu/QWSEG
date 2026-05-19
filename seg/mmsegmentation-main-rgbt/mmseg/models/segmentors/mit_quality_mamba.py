@@ -893,9 +893,10 @@ class QualityGatedMiTMamba(BaseSegmentor):
                 df,drl,dtl,dzf,dqr,dqt,dzpr,dzpt,dzcr,dzct,dDr,dDt = \
                     ff,re,te,zf,q_r,q_t,zp_r,zp_t,zc_r,zc_t,D_r,D_t
             losses['loss_deg_seg'] = sum(self.decode_head.loss(df,data_samples,self.train_cfg).values())
-            if self.common_decode_head and dzf: losses['loss_deg_common_decode'] = self.aux_loss_weight*sum(self.common_decode_head.loss(dzf,data_samples,self.train_cfg).values())
-            if self.rgb_private_decode_head and drl: losses['loss_deg_rgb_private_decode'] = self.aux_loss_weight*sum(self.rgb_private_decode_head.loss(drl,data_samples,self.train_cfg).values())
-            if self.t_private_decode_head and dtl: losses['loss_deg_t_private_decode'] = self.aux_loss_weight*sum(self.t_private_decode_head.loss(dtl,data_samples,self.train_cfg).values())
+            if ph >= 3:
+                if self.common_decode_head and dzf: losses['loss_deg_common_decode'] = self.aux_loss_weight*sum(self.common_decode_head.loss(dzf,data_samples,self.train_cfg).values())
+                if self.rgb_private_decode_head and drl: losses['loss_deg_rgb_private_decode'] = self.aux_loss_weight*sum(self.rgb_private_decode_head.loss(drl,data_samples,self.train_cfg).values())
+                if self.t_private_decode_head and dtl: losses['loss_deg_t_private_decode'] = self.aux_loss_weight*sum(self.t_private_decode_head.loss(dtl,data_samples,self.train_cfg).values())
             if self.loss_align_weight > 0 and dzcr is not None and dzct is not None:
                 dlc, dcnt = 0., 0
                 for i in range(len(dzcr)):
@@ -915,10 +916,9 @@ class QualityGatedMiTMamba(BaseSegmentor):
                 cl = self.decode_head.forward(ff); dl_ = self.decode_head.forward(df)
                 tp = F.softmax(cl.detach()/T,dim=1); sp = F.log_softmax(dl_/T,dim=1)
                 kl = F.kl_div(sp,tp,reduction='none').sum(dim=1)
-                # Equal-weight over all pixels: the distillation objective is to
-                # make the degraded segmentation match the clean one everywhere,
-                # regardless of per-pixel quality.
-                losses['loss_distill'] = self.loss_distill_weight*(T*T)*kl.mean()
+                dm = self._build_pad_mask(data_samples, kl.shape[-2], kl.shape[-1], kl.device)
+                dm_f = dm.float()
+                losses['loss_distill'] = self.loss_distill_weight*(T*T)*(kl*dm_f).sum()/dm_f.sum().clamp(min=1)
 
             if self.loss_invariant_weight > 0 and ph >= 3:
                 inv_loss = torch.tensor(0.0, device=ff[0].device)
@@ -947,7 +947,8 @@ class QualityGatedMiTMamba(BaseSegmentor):
                             D_gate = F.interpolate(D_gate, size=zf[i].shape[2:], mode='nearest') if D_gate.shape[2:] != zf[i].shape[2:] else D_gate
                             qc = F.interpolate(qc, size=zf[i].shape[2:], mode='nearest') if qc.shape[2:] != zf[i].shape[2:] else qc
                             qd = F.interpolate(qd, size=zf[i].shape[2:], mode='nearest') if qd.shape[2:] != zf[i].shape[2:] else qd
-                            q_distill = qc * qd * D_gate
+                            pm_i = self._build_pad_mask(data_samples, zf[i].shape[2], zf[i].shape[3], zf[i].device).float().unsqueeze(1)
+                            q_distill = qc * qd * D_gate * pm_i
                             diff = F.smooth_l1_loss(zf[i], dzf[i], reduction='none')
                             denom = q_distill.sum() + 1e-6
                             inv_loss += (q_distill * diff).sum() / denom

@@ -840,9 +840,10 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         if self.training:
             df,drl,dtl,dzf,dqr,dqt,dzpr,dzpt,dzcr,dzct,dDr,dDt = self._train_with_degradation(rgb,ir)
             losses['loss_deg_seg'] = sum(self.decode_head.loss(df,data_samples,self.train_cfg).values())
-            if self.common_decode_head and dzf: losses['loss_deg_common_decode'] = self.aux_loss_weight*sum(self.common_decode_head.loss(dzf,data_samples,self.train_cfg).values())
-            if self.rgb_private_decode_head and drl: losses['loss_deg_rgb_private_decode'] = self.aux_loss_weight*sum(self.rgb_private_decode_head.loss(drl,data_samples,self.train_cfg).values())
-            if self.t_private_decode_head and dtl: losses['loss_deg_t_private_decode'] = self.aux_loss_weight*sum(self.t_private_decode_head.loss(dtl,data_samples,self.train_cfg).values())
+            if ph >= 3:
+                if self.common_decode_head and dzf: losses['loss_deg_common_decode'] = self.aux_loss_weight*sum(self.common_decode_head.loss(dzf,data_samples,self.train_cfg).values())
+                if self.rgb_private_decode_head and drl: losses['loss_deg_rgb_private_decode'] = self.aux_loss_weight*sum(self.rgb_private_decode_head.loss(drl,data_samples,self.train_cfg).values())
+                if self.t_private_decode_head and dtl: losses['loss_deg_t_private_decode'] = self.aux_loss_weight*sum(self.t_private_decode_head.loss(dtl,data_samples,self.train_cfg).values())
             if self.loss_align_weight > 0 and dzcr is not None and dzct is not None:
                 dlc, dcnt = 0., 0
                 for i in range(len(dzcr)):

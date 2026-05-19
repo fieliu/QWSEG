@@ -338,57 +338,63 @@ def _compose_v9_ablation_vis(rgb_vis, t_vis, feat_rows, label_vis, pred_vis,
                               deg_feat_rows=None,
                               deg_decoder_preds=None,
                               deg_pred_vis=None):
+    """Compose V9 feature+prediction grid.
+
+    Columns (8):  zc_rgb | zc_t | zc_fused | zp_rgb | zp_t | rgb_pf | t_pf | final
+    Predictions:  ──────|──────| common   | ──────|──────| rgb_p  | t_p  | final/GT
+    """
     num_cols = 8
     cell_h, cell_w = _compute_cell_size(short_side, aspect_ratio)
     empty = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
-    inner_gap = 5
+    gap = 5
     block_gap = 10
-    h_gap_strip = np.zeros((cell_h, inner_gap, 3), dtype=np.uint8)
-    total_w = num_cols * cell_w + (num_cols - 1) * inner_gap
+    h_gap = np.zeros((cell_h, gap, 3), dtype=np.uint8)
+    total_w = num_cols * cell_w + (num_cols - 1) * gap
+    v_gap = np.zeros((gap, total_w, 3), dtype=np.uint8)
 
-    def _gapped_row(cells):
-        processed = []
-        for c in cells:
-            if c is None:
-                processed.append(empty.copy())
-            else:
-                processed.append(_make_cell(c, cell_h, cell_w, short_side))
-        while len(processed) < num_cols:
-            processed.append(empty.copy())
-        result = processed[0]
-        for cell in processed[1:]:
-            result = np.concatenate([result, h_gap_strip, cell], axis=1)
-        return result
+    def _cell(img):
+        return _make_cell(img, cell_h, cell_w, short_side) if img is not None else empty.copy()
 
-    def _feat_block(rgb, t, gt, f_rows, d_preds):
+    def _row(*cells):
+        items = list(cells)
+        while len(items) < num_cols:
+            items.append(None)
+        r = _cell(items[0])
+        for c in items[1:]:
+            r = np.concatenate([r, h_gap, _cell(c)], axis=1)
+        return r
+
+    def _block(rgb, t, gt_label, f_rows, d_preds, is_degraded):
         rows = []
-        rows.append(_gapped_row([rgb, t, gt] + [None] * 5))
+        # Input row: RGB | T | GT@col7 (under final)
+        rows.append(_row(rgb, t, None, None, None, None, None, gt_label))
+        rows.append(v_gap.copy())
+        # Feature rows (4 stages)
         for stage_cells in f_rows:
-            rows.append(_gapped_row(stage_cells))
-        pred_cells = [None] * num_cols
+            rows.append(_row(*stage_cells))
+            rows.append(v_gap.copy())
+        # Prediction row: preds under matching columns
+        p = [None] * num_cols
         if d_preds is not None:
-            for col_idx, pred_img in d_preds.items():
-                if col_idx < num_cols:
-                    pred_cells[col_idx] = pred_img
-        rows.append(_gapped_row(pred_cells))
+            for idx, img in d_preds.items():
+                if idx < num_cols:
+                    p[idx] = img
+        if pred_vis is not None:
+            p[7] = p[7] if p[7] is not None else pred_vis  # main pred under final
+        rows.append(_row(*p))
         return rows
 
     all_rows = []
-    clean_rows = _feat_block(rgb_vis, t_vis, label_vis, feat_rows, decoder_preds)
-    v_gap = np.zeros((inner_gap, total_w, 3), dtype=np.uint8)
-    for i, row in enumerate(clean_rows):
-        if i > 0:
-            all_rows.append(v_gap)
+    clean_rows = _block(rgb_vis, t_vis, label_vis,
+                         feat_rows, decoder_preds, is_degraded=False)
+    for row in clean_rows:
         all_rows.append(row)
 
     if deg_rgb_vis is not None and deg_t_vis is not None and deg_feat_rows is not None:
-        b_gap = np.zeros((block_gap, total_w, 3), dtype=np.uint8)
-        all_rows.append(b_gap)
-        deg_rows = _feat_block(deg_rgb_vis, deg_t_vis, empty.copy(),
-                               deg_feat_rows, deg_decoder_preds)
-        for i, row in enumerate(deg_rows):
-            if i > 0:
-                all_rows.append(v_gap)
+        all_rows.append(np.zeros((block_gap, total_w, 3), dtype=np.uint8))
+        deg_rows = _block(deg_rgb_vis, deg_t_vis, None,
+                          deg_feat_rows, deg_decoder_preds, is_degraded=True)
+        for row in deg_rows:
             all_rows.append(row)
 
     return np.concatenate(all_rows, axis=0)
@@ -1153,7 +1159,7 @@ class TrainVisHook(Hook):
                         pred_vis = _apply_palette(pred, palette) if palette else \
                             cv2.cvtColor(cv2.applyColorMap(pred, cv2.COLORMAP_VIRIDIS),
                                          cv2.COLOR_BGR2RGB)
-                        decoder_preds[4] = pred_vis
+                        decoder_preds[2] = pred_vis   # under zc_fused
 
                 if hasattr(model, 'rgb_private_decode_head') and \
                         model.rgb_private_decode_head is not None and \
@@ -1168,7 +1174,7 @@ class TrainVisHook(Hook):
                         pred_vis = _apply_palette(pred, palette) if palette else \
                             cv2.cvtColor(cv2.applyColorMap(pred, cv2.COLORMAP_VIRIDIS),
                                          cv2.COLOR_BGR2RGB)
-                        decoder_preds[5] = pred_vis
+                        decoder_preds[5] = pred_vis   # under rgb_pf
 
                 if hasattr(model, 't_private_decode_head') and \
                         model.t_private_decode_head is not None and \
@@ -1183,7 +1189,7 @@ class TrainVisHook(Hook):
                         pred_vis = _apply_palette(pred, palette) if palette else \
                             cv2.cvtColor(cv2.applyColorMap(pred, cv2.COLORMAP_VIRIDIS),
                                          cv2.COLOR_BGR2RGB)
-                        decoder_preds[6] = pred_vis
+                        decoder_preds[6] = pred_vis   # under t_pf
 
                 if hasattr(model, 'decode_head') and final_fused_key in feats:
                     final_feats = feats[final_fused_key]
@@ -1646,68 +1652,79 @@ class TrainVisHook(Hook):
         return np.concatenate(rows, axis=0)
 
     def _create_v9_quality_vis(self, feats, img_h=None, img_w=None):
-        q_rgb_maps = feats['q_rgb_maps']
-        q_t_maps = feats['q_t_maps']
+        q_rgb = feats['q_rgb_maps']
+        q_t = feats['q_t_maps']
+        q_rgb_priv = feats.get('q_rgb_priv', q_rgb)
+        q_t_priv = feats.get('q_t_priv', q_t)
+        D_rgb = feats.get('D_rgb', q_rgb)
+        D_t = feats.get('D_t', q_t)
+        D_rgb_priv = feats.get('D_rgb_priv', D_rgb)
+        D_t_priv = feats.get('D_t_priv', D_t)
         if img_h is not None and img_w is not None:
             h, w = img_h, img_w
         else:
             h, w = feats['zc_rgb'][0].shape[-2:]
 
-        rgb_heatmaps = []
-        t_heatmaps = []
-        rgb_mean_scores = []
-        t_mean_scores = []
+        def _to_np(t, i):
+            return t[i][0, 0].detach().cpu().numpy() if t[i] is not None else np.ones((h, w), dtype=np.float32)
 
-        for i in range(len(q_rgb_maps)):
-            q_rgb_i = q_rgb_maps[i]
-            q_t_i = q_t_maps[i]
-
-            q_rgb_np = q_rgb_i[0, 0].detach().cpu().numpy()
-            q_t_np = q_t_i[0, 0].detach().cpu().numpy()
-
-            rgb_mean_scores.append(float(q_rgb_np.mean()))
-            t_mean_scores.append(float(q_t_np.mean()))
-
-            rgb_heatmaps.append(
-                _quality_to_rgb_heatmap(q_rgb_np, h, w, vmin=0.0, vmax=1.0,
-                                        cmap='rdBu_r'))
-            t_heatmaps.append(
-                _quality_to_rgb_heatmap(q_t_np, h, w, vmin=0.0, vmax=1.0,
-                                        cmap='rdBu_r'))
-
-        return dict(rgb_heatmaps=rgb_heatmaps, t_heatmaps=t_heatmaps,
-                    rgb_mean_scores=rgb_mean_scores, t_mean_scores=t_mean_scores)
+        stages = []
+        for i in range(len(q_rgb)):
+            stages.append(dict(
+                rgb_hm=_quality_to_rgb_heatmap(_to_np(q_rgb, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                t_hm=_quality_to_rgb_heatmap(_to_np(q_t, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                rgb_priv_hm=_quality_to_rgb_heatmap(_to_np(q_rgb_priv, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                t_priv_hm=_quality_to_rgb_heatmap(_to_np(q_t_priv, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                rgb_mask=(_to_np(D_rgb, i) >= self.mask_threshold).astype(np.float32),
+                t_mask=(_to_np(D_t, i) >= self.mask_threshold).astype(np.float32),
+                rgb_priv_mask=(_to_np(D_rgb_priv, i) >= self.mask_threshold).astype(np.float32),
+                t_priv_mask=(_to_np(D_t_priv, i) >= self.mask_threshold).astype(np.float32),
+            ))
+        return dict(stages=stages)
 
     def _compose_v9_quality_vis(self, q_info, rgb_vis=None, t_vis=None,
                                 aspect_ratio=1.0):
         cell_h, cell_w = _compute_cell_size(self.short_side, aspect_ratio)
-        num_cols = 2
+        num_cols = 4
+        gap_s = 5
+        empty = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
+
+        def _mask_vis(m, tw, th):
+            m_r = cv2.resize(m, (tw, th), interpolation=cv2.INTER_NEAREST)
+            v = np.zeros((th, tw, 3), dtype=np.uint8)
+            v[:, :, 1] = (m_r * 255).astype(np.uint8)  # green = keep
+            return v
+
+        def _row(*cells):
+            while len(cells) < num_cols:
+                cells = cells + (None,)
+            r = _make_cell(cells[0] if cells[0] is not None else empty, cell_h, cell_w, self.short_side)
+            for c in cells[1:]:
+                r = np.concatenate([r, np.zeros((cell_h, gap_s, 3), dtype=np.uint8),
+                                    _make_cell(c if c is not None else empty, cell_h, cell_w, self.short_side)], axis=1)
+            return r
+
+        rgb_cell = cv2.resize(rgb_vis, (cell_w, cell_h)) if rgb_vis is not None else empty.copy()
+        t_cell = cv2.resize(t_vis, (cell_w, cell_h)) if t_vis is not None else empty.copy()
         rows = []
-        if rgb_vis is not None and t_vis is not None:
-            header = _build_row(
-                [rgb_vis, t_vis],
-                cell_h, cell_w, self.short_side, num_cols)
-        else:
-            header = _build_row(
-                [np.zeros((cell_h, cell_w, 3), dtype=np.uint8)] * 2,
-                cell_h, cell_w, self.short_side, num_cols)
-        rows.append(header)
-        for i in range(len(q_info['rgb_heatmaps'])):
-            rgb_hm = q_info['rgb_heatmaps'][i]
-            t_hm = q_info['t_heatmaps'][i]
-            rgb_score = q_info.get('rgb_mean_scores', [None])[i]
-            t_score = q_info.get('t_mean_scores', [None])[i]
-            if rgb_score is not None:
-                rgb_hm = _add_text_overlay(rgb_hm, f'S{i} q={rgb_score:.2f}',
-                                           font_scale=0.4, thickness=1)
-            if t_score is not None:
-                t_hm = _add_text_overlay(t_hm, f'S{i} q={t_score:.2f}',
-                                         font_scale=0.4, thickness=1)
-            row = _build_row(
-                [rgb_hm, t_hm],
-                cell_h, cell_w, self.short_side, num_cols)
-            rows.append(row)
-        return np.concatenate(rows, axis=0)
+
+        # Row 1: original images
+        rows.append(_row(rgb_cell, t_cell, rgb_cell, t_cell))
+        rows.append(np.zeros((gap_s, cell_w * num_cols + (num_cols - 1) * gap_s, 3), dtype=np.uint8))
+
+        for si, s in enumerate(q_info['stages']):
+            # Heatmap row: standalone heatmaps (no overlay)
+            rows.append(_row(s['rgb_hm'], s['t_hm'], s['rgb_priv_hm'], s['t_priv_hm']))
+            rows.append(np.zeros((gap_s, cell_w * num_cols + (num_cols - 1) * gap_s, 3), dtype=np.uint8))
+            # Mask row
+            rows.append(_row(
+                _mask_vis(s['rgb_mask'], cell_w, cell_h),
+                _mask_vis(s['t_mask'], cell_w, cell_h),
+                _mask_vis(s['rgb_priv_mask'], cell_w, cell_h),
+                _mask_vis(s['t_priv_mask'], cell_w, cell_h)))
+            rows.append(np.zeros((gap_s, cell_w * num_cols + (num_cols - 1) * gap_s, 3), dtype=np.uint8))
+
+        return np.concatenate(rows, axis=0) if rows else empty
 
     def _create_v12d_quality_vis(self, feats, img_h=None, img_w=None):
         q_rgb_maps = feats['q_rgb_maps']

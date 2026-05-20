@@ -299,7 +299,7 @@ optimizer = dict(
 optim_wrapper = dict(
     type='OptimWrapper',
     optimizer=optimizer,
-    clip_grad=dict(max_norm=0.01, norm_type=2),
+    clip_grad=dict(max_norm=10.0, norm_type=2),
     paramwise_cfg=dict(
         custom_keys=custom_keys,
         norm_decay_mult=0.0))

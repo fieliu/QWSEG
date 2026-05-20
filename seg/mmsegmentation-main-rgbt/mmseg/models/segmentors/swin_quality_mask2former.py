@@ -32,6 +32,228 @@ from mmseg.registry import MODELS
 from mmseg.structures import SegDataSample
 from mmseg.utils import (ConfigType, OptConfigType, OptMultiConfig,
                          SampleList, add_prefix)
+from mmseg.models.backbones.swin import (
+    ShiftWindowMSA, SwinBlock, SwinBlockSequence, WindowMSA,
+)
+from mmengine.utils import to_2tuple
+
+
+# ---------------------------------------------------------------------------
+# Quality-aware Swin components: inject quality_bias into attention
+# ---------------------------------------------------------------------------
+
+class _QualityWindowMSA(WindowMSA):
+    """WindowMSA with an extra quality_bias injection point.
+
+    After relative_position_bias is added to attention scores, quality_bias
+    is added before the optional mask.  This allows quality information to
+    influence attention without replacing the SW-MSA window mask.
+    """
+
+    def forward(self, x, mask=None, quality_bias=None):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads,
+                                  C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))
+
+        relative_position_bias = self.relative_position_bias_table[
+            self.relative_position_index.view(-1)].view(
+                self.window_size[0] * self.window_size[1],
+                self.window_size[0] * self.window_size[1],
+                -1)
+        relative_position_bias = relative_position_bias.permute(
+            2, 0, 1).contiguous()
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        if quality_bias is not None:
+            attn = attn + quality_bias
+
+        if mask is not None:
+            if mask.ndim == 4:
+                attn = attn + mask
+            else:
+                nW = mask.shape[0]
+                attn = attn.view(B // nW, nW, self.num_heads, N,
+                                 N) + mask.unsqueeze(1).unsqueeze(0)
+                attn = attn.view(-1, self.num_heads, N, N)
+        attn = self.softmax(attn.float()).to(v.dtype)
+
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class _QualityShiftWindowMSA(ShiftWindowMSA):
+    """ShiftWindowMSA that forwards quality_bias to the inner WindowMSA."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        qkv_bias = kwargs.get('qkv_bias', True)
+        qk_scale = kwargs.get('qk_scale', None)
+        attn_drop_rate = kwargs.get('attn_drop_rate', 0)
+        proj_drop_rate = kwargs.get('proj_drop_rate', 0)
+        self.w_msa = _QualityWindowMSA(
+            embed_dims=kwargs['embed_dims'],
+            num_heads=kwargs['num_heads'],
+            window_size=to_2tuple(kwargs['window_size']),
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            attn_drop_rate=attn_drop_rate,
+            proj_drop_rate=proj_drop_rate,
+            init_cfg=None)
+
+    def forward(self, query, hw_shape, extra_attn_mask=None,
+                quality_bias=None):
+        B, L, C = query.shape
+        H, W = hw_shape
+        assert L == H * W, 'input feature has wrong size'
+        query = query.view(B, H, W, C)
+
+        pad_r = (self.window_size - W % self.window_size) % self.window_size
+        pad_b = (self.window_size - H % self.window_size) % self.window_size
+        query = F.pad(query, (0, 0, 0, pad_r, 0, pad_b))
+        H_pad, W_pad = query.shape[1], query.shape[2]
+
+        if self.shift_size > 0:
+            shifted_query = torch.roll(
+                query,
+                shifts=(-self.shift_size, -self.shift_size),
+                dims=(1, 2))
+            img_mask = torch.zeros((1, H_pad, W_pad, 1), device=query.device)
+            h_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size,
+                              -self.shift_size), slice(-self.shift_size, None))
+            w_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size,
+                              -self.shift_size), slice(-self.shift_size, None))
+            cnt = 0
+            for h in h_slices:
+                for w in w_slices:
+                    img_mask[:, h, w, :] = cnt
+                    cnt += 1
+            mask_windows = self.window_partition(img_mask)
+            mask_windows = mask_windows.view(
+                -1, self.window_size * self.window_size)
+            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+            attn_mask = attn_mask.masked_fill(attn_mask != 0,
+                                              float(-100.0)).masked_fill(
+                                                  attn_mask == 0, float(0.0))
+        else:
+            shifted_query = query
+            attn_mask = None
+
+        query_windows = self.window_partition(shifted_query)
+        query_windows = query_windows.view(-1, self.window_size**2, C)
+
+        attn_windows = self.w_msa(query_windows, mask=attn_mask,
+                                  quality_bias=quality_bias)
+
+        attn_windows = attn_windows.view(-1, self.window_size,
+                                         self.window_size, C)
+        shifted_x = self.window_reverse(attn_windows, H_pad, W_pad)
+        if self.shift_size > 0:
+            x = torch.roll(
+                shifted_x,
+                shifts=(self.shift_size, self.shift_size),
+                dims=(1, 2))
+        else:
+            x = shifted_x
+
+        if pad_r > 0 or pad_b:
+            x = x[:, :H, :W, :].contiguous()
+
+        x = x.view(B, H * W, C)
+        x = self.drop(x)
+        return x
+
+
+class QualitySwinBlock(SwinBlock):
+    """SwinBlock that accepts quality_bias and passes it to the MSA module.
+
+    quality_bias is added to attention scores *after* relative position bias
+    and *before* the SW-MSA window mask, so both can coexist.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        attn_kwargs = dict(
+            embed_dims=kwargs['embed_dims'],
+            num_heads=kwargs['num_heads'],
+            window_size=kwargs['window_size'],
+            shift_size=kwargs['window_size'] // 2 if kwargs.get('shift', False) else 0,
+            qkv_bias=kwargs.get('qkv_bias', True),
+            qk_scale=kwargs.get('qk_scale', None),
+            attn_drop_rate=kwargs.get('attn_drop_rate', 0.),
+            proj_drop_rate=kwargs.get('drop_rate', 0.),
+            dropout_layer=dict(type='DropPath', drop_prob=kwargs.get('drop_path_rate', 0.)),
+            init_cfg=None)
+        self.attn = _QualityShiftWindowMSA(**attn_kwargs)
+
+    def forward(self, x, hw_shape, quality_bias=None):
+        def _inner_forward(x):
+            identity = x
+            x = self.norm1(x)
+            x = self.attn(x, hw_shape, quality_bias=quality_bias)
+            x = x + identity
+
+            identity = x
+            x = self.norm2(x)
+            x = self.ffn(x, identity=identity)
+            return x
+
+        if self.with_cp and x.requires_grad:
+            from torch.utils.checkpoint import checkpoint as cp
+            x = cp(_inner_forward, x)
+        else:
+            x = _inner_forward(x)
+        return x
+
+
+def _replace_swin_blocks_with_quality(swin_model):
+    """Replace SwinBlocks with QualitySwinBlocks that support quality_bias.
+
+    All pretrained weights (norm, ffn, attn qkv/proj/rpb, drop) are preserved
+    by direct attribute assignment or data copy.
+    """
+    for stage in swin_model.stages:
+        new_blocks = nn.ModuleList()
+        for block in stage.blocks:
+            old_attn = block.attn
+            new_block = QualitySwinBlock(
+                embed_dims=old_attn.w_msa.embed_dims,
+                num_heads=old_attn.w_msa.num_heads,
+                feedforward_channels=block.ffn.feedforward_channels,
+                window_size=old_attn.window_size,
+                shift=old_attn.shift_size > 0,
+                qkv_bias=old_attn.w_msa.qkv.bias is not None,
+                with_cp=block.with_cp,
+            )
+            new_block.norm1 = block.norm1
+            new_block.norm2 = block.norm2
+            new_block.ffn = block.ffn
+            new_block.attn.w_msa.qkv.weight.data.copy_(
+                old_attn.w_msa.qkv.weight.data)
+            if old_attn.w_msa.qkv.bias is not None:
+                new_block.attn.w_msa.qkv.bias.data.copy_(
+                    old_attn.w_msa.qkv.bias.data)
+            new_block.attn.w_msa.relative_position_bias_table.data.copy_(
+                old_attn.w_msa.relative_position_bias_table.data)
+            new_block.attn.w_msa.relative_position_index.copy_(
+                old_attn.w_msa.relative_position_index)
+            new_block.attn.w_msa.proj.weight.data.copy_(
+                old_attn.w_msa.proj.weight.data)
+            if old_attn.w_msa.proj.bias is not None:
+                new_block.attn.w_msa.proj.bias.data.copy_(
+                    old_attn.w_msa.proj.bias.data)
+            new_block.attn.drop = old_attn.drop
+            new_blocks.append(new_block)
+        stage.blocks = new_blocks
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +266,7 @@ def _quality_mask_to_swin_bias(D_2d, window_size, shift_size, eps=1e-9):
     pad_r = (window_size - W % window_size) % window_size
     pad_b = (window_size - H % window_size) % window_size
     if pad_r > 0 or pad_b > 0:
-        D = F.pad(D, (0, pad_r, 0, pad_b), value=0.0)
+        D = F.pad(D, (0, pad_r, 0, pad_b), value=1.0)
     H_pad, W_pad = D.shape[1], D.shape[2]
     if shift_size > 0:
         D = torch.roll(D, shifts=(-shift_size, -shift_size), dims=(1, 2))
@@ -111,7 +333,6 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
             gate_t, q_t = predictors_t[i](x_2d[orig_B:].detach(), prev_mask_t)
             D_rgb_raw, _ = gumbel_softmax_hard(gate_rgb, tau=gumbel_tau, training=training)
             D_t_raw, _ = gumbel_softmax_hard(gate_t, tau=gumbel_tau, training=training)
-            D_rgb_raw, D_t_raw = complementary_fix(D_rgb_raw, D_t_raw, q_rgb, q_t)
         if D_rgb_raw is None:
             D_rgb_raw = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
             D_t_raw = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
@@ -120,6 +341,7 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
         if q_t is None:
             q_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
 
+        # cross-stage: D_raw × max_pool(prev_cum_D)
         if cum_D_rgb is not None:
             if cum_D_rgb.shape[2:] != (H, W):
                 cum_D_rgb = F.adaptive_max_pool2d(cum_D_rgb.float(), (H, W))
@@ -133,6 +355,9 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
         else:
             cum_D_t = D_t_raw
 
+        # complementary correction AFTER cross-stage
+        cum_D_rgb, cum_D_t = complementary_fix(cum_D_rgb, cum_D_t, q_rgb, q_t)
+
         all_D_rgb.append(D_rgb_raw); all_D_t.append(D_t_raw)
         all_q_rgb.append(q_rgb); all_q_t.append(q_t)
         cum_D_rgb_list.append(cum_D_rgb); cum_D_t_list.append(cum_D_t)
@@ -142,18 +367,22 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
             torch.cat([torch.ones_like(cum_D_rgb), cum_D_t], dim=0))
 
         for j, block in enumerate(blocks):
+            if cum_D is not None:
+                x = x * cum_D.detach().view(B_tok, H * W, 1)  # hard zero before attention (detached)
             shift_size = block.attn.shift_size
             quality_bias = None
             if cum_D is not None:
                 quality_bias = _quality_mask_to_swin_bias(
                     cum_D, window_size, shift_size)
-            x = block(x, (H, W), attn_mask=quality_bias)
+            x = block(x, (H, W), quality_bias=quality_bias)
             if cum_D is not None:
-                x = x * cum_D.view(B_tok, H * W, 1)
+                x = x * cum_D.detach().view(B_tok, H * W, 1)
 
         if i in swin_branch.out_indices:
             norm_layer = getattr(swin_branch, f'norm{i}', None)
             out = norm_layer(x) if norm_layer is not None else x
+            if cum_D is not None:
+                out = out * cum_D.detach().view(B_tok, H * W, 1)
             stage_out = out.view(B_tok, H, W, -1).permute(0, 3, 1, 2).contiguous()
             outs.append(stage_out)
 
@@ -226,18 +455,22 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
         cum_D_list.append(cum_D)
 
         for j, block in enumerate(blocks):
+            if cum_D is not None:
+                x = x * cum_D.detach().view(B_tok, H * W, 1)  # hard zero before attention (detached)
             shift_size = block.attn.shift_size
             quality_bias = None
             if cum_D is not None:
                 quality_bias = _quality_mask_to_swin_bias(
                     cum_D, window_size, shift_size)
-            x = block(x, (H, W), attn_mask=quality_bias)
+            x = block(x, (H, W), quality_bias=quality_bias)
             if cum_D is not None:
-                x = x * cum_D.view(B_tok, H * W, 1)
+                x = x * cum_D.detach().view(B_tok, H * W, 1)
 
         if i in swin_branch.out_indices:
             norm_layer = getattr(swin_branch, f'norm{i}', None)
             out = norm_layer(x) if norm_layer is not None else x
+            if cum_D is not None:
+                out = out * cum_D.detach().view(B_tok, H * W, 1)
             stage_out = out.view(B_tok, H, W, -1).permute(0, 3, 1, 2).contiguous()
             outs.append(stage_out)
 
@@ -262,8 +495,9 @@ class SimpleConcatFusion(nn.Module):
     def forward(self, common_feat, priv_feat):
         x = torch.cat([common_feat, priv_feat], dim=1)
         x = self.fuse_conv(x)
-        x = self.act(self.norm(x.permute(0, 2, 3, 1))).permute(0, 3, 1, 2)
-        return common_feat + x
+        x = common_feat + self.act(x)
+        x = self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        return x
 
 
 class BiMambaFusion(nn.Module):
@@ -277,7 +511,8 @@ class BiMambaFusion(nn.Module):
         self.d_inner = int(expand * d_model)
         self.dt_rank = math.ceil(d_model / 16)
 
-        self.pos_table = nn.Parameter(torch.randn(1, d_model, base_pos_size, base_pos_size) * 0.02)
+        self.pos_table = nn.Parameter(torch.empty(1, d_model, base_pos_size, base_pos_size))
+        nn.init.trunc_normal_(self.pos_table, std=0.02)
         self.type_gen = nn.Parameter(torch.zeros(d_model))
         self.type_priv = nn.Parameter(torch.zeros(d_model))
 
@@ -285,12 +520,13 @@ class BiMambaFusion(nn.Module):
         self._init_mamba_params('bwd')
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.norm = nn.LayerNorm(d_model)
+        self.norm_final = nn.LayerNorm(d_model)
 
     def _init_mamba_params(self, suffix):
         d, s, r = self.d_inner, self.d_state, self.dt_rank
         self.add_module(f'in_proj_{suffix}', nn.Linear(self.d_model, d * 2, bias=False))
         self.add_module(f'conv1d_{suffix}', nn.Conv1d(d, d, kernel_size=self.d_conv,
-                         groups=d, padding=self.d_conv - 1, bias=True))
+                         groups=d, padding=self.d_conv - 1, bias=False))
         self.add_module(f'x_proj_{suffix}', nn.Linear(d, r + s * 2, bias=False))
         self.add_module(f'dt_proj_{suffix}', nn.Linear(r, d, bias=True))
         A = torch.arange(1, s + 1, dtype=torch.float32).repeat(d, 1)
@@ -320,13 +556,10 @@ class BiMambaFusion(nn.Module):
         x_scan = x_conv.transpose(1, 2)
         dt_scan, B_scan, C_scan = dt.transpose(1, 2), B_ssm.transpose(1, 2), C_ssm.transpose(1, 2)
 
-        try:
-            from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
-            y = selective_scan_fn(x_scan, dt_scan, A, B_scan, C_scan, D_param.float(),
-                                  delta_bias=dt_proj.bias.float() if dt_proj.bias is not None else None,
-                                  delta_softplus=True)
-        except ImportError:
-            y = _selective_scan_pytorch(x_scan, dt_scan, A, B_scan, C_scan, D_param, cu_seqlens)
+        from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+        y = selective_scan_fn(x_scan, dt_scan, A, B_scan, C_scan, D_param.float(),
+                              delta_bias=dt_proj.bias.float() if dt_proj.bias is not None else None,
+                              delta_softplus=True)
 
         y = y.transpose(1, 2) * F.silu(z)
         return getattr(self, f'out_proj_{suffix}')(y)
@@ -362,13 +595,15 @@ class BiMambaFusion(nn.Module):
         G_list = [out_seq[cu[b]:cu[b] + N_g] for b in range(B)]
         return torch.stack(G_list, dim=0)
 
-    def forward(self, generic_tokens, priv_valid_tokens, stage_H, stage_W, cu_seqlens):
+    def forward(self, generic_tokens, priv_valid_tokens, stage_H, stage_W, cu_seqlens, priv_indices=None):
         N_g = stage_H * stage_W
         pos_embed = self._get_pos_embed(stage_H, stage_W, generic_tokens.device, generic_tokens.dtype)
         gen = generic_tokens + pos_embed.unsqueeze(0) + self.type_gen.unsqueeze(0).unsqueeze(0)
         priv = priv_valid_tokens
         if priv.shape[0] > 0:
             priv = priv + self.type_priv.unsqueeze(0)
+            if priv_indices is not None and priv_indices.shape[0] == priv.shape[0]:
+                priv = priv + pos_embed[priv_indices]
         x_seq = self._build_sequences(gen, priv, cu_seqlens, N_g)
         x_bld = x_seq.unsqueeze(0)
         out_fwd = self._mamba_scan(x_bld, 'fwd', cu_seqlens=cu_seqlens)
@@ -377,34 +612,20 @@ class BiMambaFusion(nn.Module):
         out_rev = self._reverse_sequences(out_rev, cu_seqlens)
         out_seq = (out_fwd + out_rev).squeeze(0)
         G_enhanced = self._extract_generic(out_seq, cu_seqlens, N_g)
-        return generic_tokens + self.out_proj(self.norm(G_enhanced))
-
-
-def _selective_scan_pytorch(x, dt, A, B_ssm, C_ssm, D, cu_seqlens=None):
-    batch, d_inner, L = x.shape
-    d_state = A.shape[1]
-    dt = F.softplus(dt)
-    h = torch.zeros(batch, d_inner, d_state, device=x.device, dtype=x.dtype)
-    ys = []
-    cu = cu_seqlens.cpu().numpy() if cu_seqlens is not None else None
-    seq_starts = set(cu.tolist()) if cu is not None else set()
-    for i in range(L):
-        if cu is not None and i in seq_starts and i > 0:
-            h = torch.zeros_like(h)
-        dA = torch.exp(dt[:, :, i].unsqueeze(-1) * A.unsqueeze(0))
-        dB = dt[:, :, i].unsqueeze(-1) * B_ssm[:, :, i].unsqueeze(-2)
-        h = dA * h + dB * x[:, :, i].unsqueeze(-1)
-        ys.append(torch.sum(h * C_ssm[:, :, i].unsqueeze(1), dim=-1))
-    y = torch.stack(ys, dim=2)
-    return y + D.unsqueeze(0).unsqueeze(-1) * x
+        enhanced = self.out_proj(self.norm(G_enhanced))
+        return self.norm_final(generic_tokens + enhanced)
 
 
 class MultiScaleRefine(nn.Module):
+    """Multi-scale refinement with dilated depthwise convs + channel attention.
+
+    Uses Pre-Norm: input is normalised first, residual is also normalised input.
+    """
 
     def __init__(self, channels, dilations=(1, 2, 3)):
         super().__init__()
-        num_groups = min(32, channels)
-        self.norm = nn.GroupNorm(num_groups, channels)
+        # 使用 LayerNorm，与 MiT/Swin 骨干保持一致，无需指定 num_groups
+        self.norm = nn.LayerNorm(channels)
         self.dw_convs = nn.ModuleList([
             nn.Conv2d(channels, channels, 3, padding=d, dilation=d, groups=channels, bias=False)
             for d in dilations])
@@ -417,16 +638,23 @@ class MultiScaleRefine(nn.Module):
         self.out_conv = nn.Conv2d(channels, channels, 1, bias=False)
 
     def forward(self, x):
-        residual = x
-        x = self.norm(x)
-        multi = [dw(x) for dw in self.dw_convs]
-        x = self.fuse_conv(torch.cat(multi, dim=1))
-        x = self.act(x) * self.channel_attn(x)
-        return residual + self.out_conv(x)
+        # x: [B, C, H, W]
+        # 1. 将特征转为 [B, H, W, C] 进行 LayerNorm，然后转回
+        x_norm = x.permute(0, 2, 3, 1).contiguous()
+        x_norm = self.norm(x_norm)
+        x_norm = x_norm.permute(0, 3, 1, 2).contiguous()   # [B, C, H, W]
 
+        # 2. 多尺度深度空洞卷积 + 融合
+        multi = [dw(x_norm) for dw in self.dw_convs]
+        x_fused = self.fuse_conv(torch.cat(multi, dim=1))
+
+        # 3. 通道注意力 + 激活
+        x_fused = self.act(x_fused) * self.channel_attn(x_fused)
+
+        # 4. 残差连接（使用归一化后的 x_norm），保持 Pre-Norm 范式
+        return x_norm + self.out_conv(x_fused)
 
 class DualGateEnhancedFusion(nn.Module):
-
     def __init__(self, in_channels_list):
         super().__init__()
         self.num_stages = len(in_channels_list)
@@ -441,29 +669,39 @@ class DualGateEnhancedFusion(nn.Module):
             self.sp_gates.append(nn.Sequential(
                 nn.Conv2d(ch * 2, 2, 3, padding=1, bias=False), nn.Sigmoid()))
             self.post_norms.append(nn.LayerNorm(ch))
-            self.post_convs.append(nn.Sequential(nn.Conv2d(ch, ch, 1, bias=False), nn.GELU()))
+            self.post_convs.append(nn.Sequential(
+                nn.Conv2d(ch, ch, 1, bias=False), nn.GELU()))
 
     def forward(self, rgb_enhanced_list, t_enhanced_list, common_fused_list):
         fused_list = []
         for i in range(self.num_stages):
             Fr, Ft, Fg = rgb_enhanced_list[i], t_enhanced_list[i], common_fused_list[i]
+            # 空间对齐
             ref_h, ref_w = Fg.shape[2], Fg.shape[3]
             if Fr.shape[2:] != (ref_h, ref_w):
                 Fr = F.interpolate(Fr, size=(ref_h, ref_w), mode='bilinear', align_corners=False)
             if Ft.shape[2:] != (ref_h, ref_w):
                 Ft = F.interpolate(Ft, size=(ref_h, ref_w), mode='bilinear', align_corners=False)
+
+            # 双门控融合
             B, C, H, W = Fr.shape
             concat = torch.cat([Fr, Ft], dim=1)
             ch_gate = self.ch_gates[i](concat)
             ch_r, ch_t = ch_gate.split(C, dim=1)
             sp_gate = self.sp_gates[i](concat)
             sp_r, sp_t = sp_gate[:, 0:1], sp_gate[:, 1:2]
-            fused = ch_r * sp_r * Fr + ch_t * sp_t * Ft + Fg
-            x = fused.permute(0, 2, 3, 1)
-            x = self.post_norms[i](x).permute(0, 3, 1, 2)
-            fused_list.append(fused + self.post_convs[i](x))
-        return fused_list
+            fused = ch_r * sp_r * Fr + ch_t * sp_t * Ft
 
+            # --- 修正点：Pre-Norm 残差连接 ---
+            # 对 fused 做 LayerNorm
+            fused_norm = fused.permute(0, 2, 3, 1).contiguous()
+            fused_norm = self.post_norms[i](fused_norm).permute(0, 3, 1, 2).contiguous()
+            # 主分支变换
+            out = self.post_convs[i](fused_norm.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+            # 残差 = 归一化后的 fused
+            fused_list.append(Fg + out)
+
+        return fused_list
 
 # ===================================================================
 # Swin V9 Model  (3-branch, same structure as MiT V9)
@@ -524,8 +762,11 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         if pretrained is not None:
             backbone['pretrained'] = pretrained
         self.backbone = MODELS.build(backbone)
+        _replace_swin_blocks_with_quality(self.backbone)
         self.private_branch_rgb = MODELS.build(private_branch_rgb)
+        _replace_swin_blocks_with_quality(self.private_branch_rgb)
         self.private_branch_t = MODELS.build(private_branch_t)
+        _replace_swin_blocks_with_quality(self.private_branch_t)
         if neck is not None:
             self.neck = MODELS.build(neck)
         self._init_decode_head(decode_head)
@@ -605,16 +846,11 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
 
     @staticmethod
     def _build_pad_mask(data_samples, h, w, device):
-        valid = torch.ones(len(data_samples), h, w, dtype=torch.bool, device=device)
+        valid = torch.zeros(len(data_samples), h, w, dtype=torch.bool, device=device)
         for i, ds in enumerate(data_samples):
             ps = ds.metainfo.get('padding_size', [0, 0, 0, 0])
             pl, pr, pt, pb = ps
-            if pb > 0 or pr > 0:
-                valid[i, pt:h - pb, pl:w - pr] = True
-                if pt > 0: valid[i, :pt, :] = False
-                if pb > 0: valid[i, h - pb:, :] = False
-                if pl > 0: valid[i, :, :pl] = False
-                if pr > 0: valid[i, :, w - pr:] = False
+            valid[i, pt:h - pb, pl:w - pr] = True
         return valid
 
     def _get_training_phase(self, epoch):
@@ -699,18 +935,20 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         Ds = (Dp.squeeze(1) > 0.5).float()
         G = zc.permute(0,2,3,1).reshape(B, N_g, C)
         P = priv.permute(0,2,3,1).reshape(B, N_g, C)
-        pl, cs = [], [0]
+        pl, idx_l, cs = [], [], [0]
         for b in range(B):
             vi = Ds[b].reshape(-1).nonzero(as_tuple=True)[0]
             Mb = vi.shape[0]
             if Mb == 0:
                 pl.append(torch.zeros(0, C, device=P.device, dtype=P.dtype))
+                idx_l.append(torch.zeros(0, dtype=torch.long, device=P.device))
                 cs.append(cs[-1] + N_g)
             else:
-                pl.append(P[b, vi]); cs.append(cs[-1]+N_g+Mb)
+                pl.append(P[b, vi]); idx_l.append(vi); cs.append(cs[-1]+N_g+Mb)
         pv = torch.cat(pl, dim=0) if pl[0].shape[0] > 0 else torch.zeros(0, C, device=zc.device, dtype=zc.dtype)
+        priv_indices = torch.cat(idx_l, dim=0) if idx_l[0].shape[0] > 0 else torch.zeros(0, dtype=torch.long, device=zc.device)
         ct = torch.tensor(cs, dtype=torch.int32, device=zc.device)
-        return fuse_mod(G, pv, H, W, ct).reshape(B, H, W, C).permute(0,3,1,2)
+        return fuse_mod(G, pv, H, W, ct, priv_indices).reshape(B, H, W, C).permute(0,3,1,2)
 
     def init_weights(self):
         self.backbone.init_weights()
@@ -766,8 +1004,7 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
 
     def _train_with_degradation(self, rgb, ir):
         dr, di, _, _ = self._generate_degraded_inputs(rgb, ir)
-        drr = self._extract_feat_single(dr, di)
-        return drr[7], drr[5], drr[6], drr[4], drr[8], drr[9], drr[2], drr[3], drr[0], drr[1], drr[11], drr[12]
+        return self._extract_feat_single(dr, di)
 
     def _generate_degraded_inputs(self, rgb, ir):
         B, C, H, W = rgb.shape
@@ -826,10 +1063,10 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             pm = self._build_pad_mask(data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
             for i in range(len(zc_r)):
                 if zc_r[i] is not None and zc_t[i] is not None:
-                    Dr = D_r[i] if D_r[i] is not None else torch.ones(B,1,zc_r[i].shape[2],zc_r[i].shape[3],device=zc_r[i].device)
-                    Dt = D_t[i] if D_t[i] is not None else torch.ones(B,1,zc_t[i].shape[2],zc_t[i].shape[3],device=zc_t[i].device)
-                    qr = q_r[i]
-                    qt = q_t[i]
+                    Dr = D_r[i].detach() if D_r[i] is not None else torch.ones(B,1,zc_r[i].shape[2],zc_r[i].shape[3],device=zc_r[i].device)
+                    Dt = D_t[i].detach() if D_t[i] is not None else torch.ones(B,1,zc_t[i].shape[2],zc_t[i].shape[3],device=zc_t[i].device)
+                    qr = q_r[i].detach() if q_r[i] is not None else None
+                    qt = q_t[i].detach() if q_t[i] is not None else None
                     lc += compute_cross_modal_contrastive_loss(
                         zc_r[i],zc_t[i],gt,Dr,Dt,qr,qt,
                         tau_c=self.contrast_tau,num_samples=self.contrast_num_samples,
@@ -838,7 +1075,14 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             if cnt: losses['loss_align'] = (lc/cnt)*self.loss_align_weight
         if self.retention_loss_weight > 0: losses['loss_retention'] = self.retention_loss_weight*self._compute_retention_loss(ad)
         if self.training:
-            df,drl,dtl,dzf,dqr,dqt,dzpr,dzpt,dzcr,dzct,dDr,dDt = self._train_with_degradation(rgb,ir)
+            dzcr,dzct,dzpr,dzpt,dzf,drl,dtl,df,dqr,dqt,dad,dDr,dDt,dDpr,dDpt,dqpr,dqpt,dcDr,dcDt,dcDpr,dcDpt = self._train_with_degradation(rgb,ir)
+            # NaN guard: if degraded features are NaN, fall back to clean
+            if torch.isnan(df[0]).any():
+                import logging
+                logging.getLogger(__name__).warning(
+                    'NaN in degraded features — falling back to clean features for deg losses')
+                dzcr,dzct,dzpr,dzpt,dzf,drl,dtl,df,dqr,dqt,dad,dDr,dDt,dDpr,dDpt,dqpr,dqpt,dcDr,dcDt,dcDpr,dcDpt = \
+                    zc_r,zc_t,zp_r,zp_t,zf,re,te,ff,q_r,q_t,ad,D_r,D_t,Dpr,Dpt,qpr,qpt,cDr,cDt,cDpr,cDpt
             losses.update(add_prefix(self.decode_head.loss(df,data_samples,self.train_cfg),'deg_decode'))
             for head, feats, pfx in [
                 (self.common_decode_head, dzf, 'deg_common_decode'),
@@ -852,10 +1096,10 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                 dlc, dcnt = 0., 0
                 for i in range(len(dzcr)):
                     if dzcr[i] is not None and dzct[i] is not None:
-                        dDr_i = dDr[i] if dDr is not None and i < len(dDr) and dDr[i] is not None else torch.ones(B,1,dzcr[i].shape[2],dzcr[i].shape[3],device=dzcr[i].device)
-                        dDt_i = dDt[i] if dDt is not None and i < len(dDt) and dDt[i] is not None else torch.ones(B,1,dzct[i].shape[2],dzct[i].shape[3],device=dzct[i].device)
-                        dqr_i = dqr[i] if dqr is not None and i < len(dqr) and dqr[i] is not None else None
-                        dqt_i = dqt[i] if dqt is not None and i < len(dqt) and dqt[i] is not None else None
+                        dDr_i = dDr[i].detach() if dDr is not None and i < len(dDr) and dDr[i] is not None else torch.ones(B,1,dzcr[i].shape[2],dzcr[i].shape[3],device=dzcr[i].device)
+                        dDt_i = dDt[i].detach() if dDt is not None and i < len(dDt) and dDt[i] is not None else torch.ones(B,1,dzct[i].shape[2],dzct[i].shape[3],device=dzct[i].device)
+                        dqr_i = dqr[i].detach() if dqr is not None and i < len(dqr) and dqr[i] is not None else None
+                        dqt_i = dqt[i].detach() if dqt is not None and i < len(dqt) and dqt[i] is not None else None
                         dlc += compute_cross_modal_contrastive_loss(
                             dzcr[i],dzct[i],gt,dDr_i,dDt_i,dqr_i,dqt_i,
                             tau_c=self.contrast_tau,num_samples=self.contrast_num_samples,
@@ -878,21 +1122,21 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                     if zf[i] is not None and dzf is not None and i < len(dzf) and dzf[i] is not None:
                         if zf[i].shape == dzf[i].shape:
                             Dc = torch.max(
-                                D_r[i] if D_r[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device),
-                                D_t[i] if D_t[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device))
+                                D_r[i].detach() if D_r[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device),
+                                D_t[i].detach() if D_t[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device))
                             if all_D:
                                 Dd = torch.max(
-                                    dDr[i] if dDr[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device),
-                                    dDt[i] if dDt[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device))
+                                    dDr[i].detach() if dDr[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device),
+                                    dDt[i].detach() if dDt[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device))
                             else:
                                 Dd = torch.ones_like(Dc)
                             D_gate = ((Dc > 0.5) & (Dd > 0.5)).float()
                             qc = torch.max(
-                                q_r[i] if q_r[i] is not None else torch.ones_like(D_gate),
-                                q_t[i] if q_t[i] is not None else torch.ones_like(D_gate))
+                                q_r[i].detach() if q_r[i] is not None else torch.ones_like(D_gate),
+                                q_t[i].detach() if q_t[i] is not None else torch.ones_like(D_gate))
                             qd = torch.max(
-                                dqr[i] if dqr is not None and i < len(dqr) and dqr[i] is not None else torch.ones_like(D_gate),
-                                dqt[i] if dqt is not None and i < len(dqt) and dqt[i] is not None else torch.ones_like(D_gate))
+                                dqr[i].detach() if dqr is not None and i < len(dqr) and dqr[i] is not None else torch.ones_like(D_gate),
+                                dqt[i].detach() if dqt is not None and i < len(dqt) and dqt[i] is not None else torch.ones_like(D_gate))
                             D_gate = F.interpolate(D_gate, size=zf[i].shape[2:], mode='nearest') if D_gate.shape[2:] != zf[i].shape[2:] else D_gate
                             qc = F.interpolate(qc, size=zf[i].shape[2:], mode='nearest') if qc.shape[2:] != zf[i].shape[2:] else qc
                             qd = F.interpolate(qd, size=zf[i].shape[2:], mode='nearest') if qd.shape[2:] != zf[i].shape[2:] else qd
@@ -903,6 +1147,11 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                             cnt += 1
                 if cnt:
                     losses['loss_inv'] = self.loss_invariant_weight * inv_loss / cnt
+        for key in list(losses.keys()):
+            if not torch.isfinite(losses[key]):
+                losses[key] = torch.tensor(0.0, device=losses[key].device)
+            else:
+                losses[key] = torch.clamp(losses[key], max=100.0)
         return losses
 
     def encode_decode(self, inputs, bm):
@@ -963,6 +1212,9 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             rgb_pf_deg=re_d, t_pf_deg=te_d,
             final_fused_deg=fused_d,
             q_rgb_deg=q_r_d, q_t_deg=q_t_d,
+            q_rgb_priv_deg=qpr_d, q_t_priv_deg=qpt_d,
+            D_rgb_deg=D_r_d, D_t_deg=D_t_d,
+            D_rgb_priv_deg=Dpr_d, D_t_priv_deg=Dpt_d,
         )
 
     def _decode_head_predict_logits(self, feats, head=None):

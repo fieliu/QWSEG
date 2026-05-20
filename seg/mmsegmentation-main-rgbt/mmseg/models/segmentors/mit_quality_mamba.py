@@ -61,8 +61,9 @@ class SimpleConcatFusion(nn.Module):
     def forward(self, common_feat, priv_feat):
         x = torch.cat([common_feat, priv_feat], dim=1)
         x = self.fuse_conv(x)
-        x = self.act(self.out_norm(x.permute(0, 2, 3, 1))).permute(0, 3, 1, 2)
-        return common_feat + x
+        x = common_feat + self.act(x)
+        x = self.out_norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        return x
 
 
 class BiMambaFusion(nn.Module):
@@ -314,7 +315,6 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
             gate_t, q_t = predictors_t[i](x_2d[orig_B:].detach(), prev_mask_t)
             D_rgb_raw, _ = gumbel_softmax_hard(gate_rgb, tau=gumbel_tau, training=training)
             D_t_raw, _ = gumbel_softmax_hard(gate_t, tau=gumbel_tau, training=training)
-            D_rgb_raw, D_t_raw = complementary_fix(D_rgb_raw, D_t_raw, q_rgb, q_t)
         if D_rgb_raw is None:
             D_rgb_raw = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
             D_t_raw = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
@@ -323,7 +323,7 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
         if q_t is None:
             q_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
 
-        # cross-stage mask propagation (max-pool: pruned stays pruned)
+        # cross-stage: D_raw × max_pool(prev_cum_D) — pruned stays pruned
         if cum_D_rgb is not None:
             if cum_D_rgb.shape[2:] != (H, W):
                 cum_D_rgb = F.adaptive_max_pool2d(cum_D_rgb.float(), (H, W))
@@ -337,6 +337,9 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
         else:
             cum_D_t = D_t_raw
 
+        # complementary correction AFTER cross-stage: at least one modality kept
+        cum_D_rgb, cum_D_t = complementary_fix(cum_D_rgb, cum_D_t, q_rgb, q_t)
+
         all_D_rgb.append(D_rgb_raw); all_D_t.append(D_t_raw)
         all_q_rgb.append(q_rgb); all_q_t.append(q_t)
         cum_D_rgb_list.append(cum_D_rgb); cum_D_t_list.append(cum_D_t)
@@ -347,6 +350,9 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
 
         # --- transformer blocks ---
         for j, block in enumerate(blocks):
+            if cum_D is not None:
+                D_q = cum_D.detach().reshape(B_tok, H * W, 1)
+                x = x * D_q  # hard zero before attention input before attention input
             residual = x
             x_norm1 = block.norm1(x)
             attn_module = block.attn
@@ -400,7 +406,7 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
             attn_out = attn_module.proj_drop(attn_module.attn.out_proj(attn_out))
             x = residual + attn_out
             if cum_D is not None:
-                D_q = cum_D.reshape(Bb, H * W, 1)
+                D_q = cum_D.detach().reshape(Bb, H * W, 1)
                 x = x * D_q
 
             residual = x
@@ -467,6 +473,9 @@ def _forward_branch_pruned(backbone, img, predictor_list, cum_D_prev_list,
         all_D_raw.append(D_raw); all_q_weight.append(q_weight); cum_D_list.append(cum_D)
 
         for j, block in enumerate(blocks):
+            if cum_D is not None:
+                D_q = cum_D.detach().reshape(B_tok, H * W, 1)
+                x = x * D_q  # hard zero before attention input before attention input
             residual = x
             x_norm1 = block.norm1(x)
             attn_module = block.attn
@@ -520,7 +529,7 @@ def _forward_branch_pruned(backbone, img, predictor_list, cum_D_prev_list,
             attn_out = attn_module.proj_drop(attn_module.attn.out_proj(attn_out))
             x = residual + attn_out
             if cum_D is not None:
-                D_q = cum_D.reshape(Bb, H * W, 1)
+                D_q = cum_D.detach().reshape(Bb, H * W, 1)
                 x = x * D_q
 
             residual = x
@@ -874,8 +883,8 @@ class QualityGatedMiTMamba(BaseSegmentor):
                 if zc_r[i] is not None and zc_t[i] is not None:
                     Dr = D_r[i] if D_r[i] is not None else torch.ones(B,1,zc_r[i].shape[2],zc_r[i].shape[3],device=zc_r[i].device)
                     Dt = D_t[i] if D_t[i] is not None else torch.ones(B,1,zc_t[i].shape[2],zc_t[i].shape[3],device=zc_t[i].device)
-                    qr = q_r[i]
-                    qt = q_t[i]
+                    qr = q_r[i].detach() if q_r[i] is not None else None
+                    qt = q_t[i].detach() if q_t[i] is not None else None
                     lc += compute_cross_modal_contrastive_loss(
                         zc_r[i],zc_t[i],gt,Dr,Dt,qr,qt,
                         tau_c=self.contrast_tau,num_samples=self.contrast_num_samples,
@@ -907,8 +916,8 @@ class QualityGatedMiTMamba(BaseSegmentor):
                     if dzcr[i] is not None and dzct[i] is not None:
                         dDr_i = dDr[i] if dDr is not None and i < len(dDr) and dDr[i] is not None else torch.ones(B,1,dzcr[i].shape[2],dzcr[i].shape[3],device=dzcr[i].device)
                         dDt_i = dDt[i] if dDt is not None and i < len(dDt) and dDt[i] is not None else torch.ones(B,1,dzct[i].shape[2],dzct[i].shape[3],device=dzct[i].device)
-                        dqr_i = dqr[i] if dqr is not None and i < len(dqr) and dqr[i] is not None else None
-                        dqt_i = dqt[i] if dqt is not None and i < len(dqt) and dqt[i] is not None else None
+                        dqr_i = dqr[i].detach() if dqr is not None and i < len(dqr) and dqr[i] is not None else None
+                        dqt_i = dqt[i].detach() if dqt is not None and i < len(dqt) and dqt[i] is not None else None
                         dlc += compute_cross_modal_contrastive_loss(
                             dzcr[i],dzct[i],gt,dDr_i,dDt_i,dqr_i,dqt_i,
                             tau_c=self.contrast_tau,num_samples=self.contrast_num_samples,
@@ -931,23 +940,23 @@ class QualityGatedMiTMamba(BaseSegmentor):
                 for i in range(len(zf)):
                     if zf[i] is not None and dzf is not None and i < len(dzf) and dzf[i] is not None:
                         if zf[i].shape == dzf[i].shape:
-                            # D-based region gate: union of RGB+T masks, both sides
+                            # D-based region gate (detached: invariant loss must not train quality)
                             Dc = torch.max(
-                                D_r[i] if D_r[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device),
-                                D_t[i] if D_t[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device))
+                                D_r[i].detach() if D_r[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device),
+                                D_t[i].detach() if D_t[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device))
                             if all_D:
                                 Dd = torch.max(
-                                    dDr[i] if dDr[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device),
-                                    dDt[i] if dDt[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device))
+                                    dDr[i].detach() if dDr[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device),
+                                    dDt[i].detach() if dDt[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device))
                             else:
                                 Dd = torch.ones_like(Dc)
                             D_gate = ((Dc > 0.5) & (Dd > 0.5)).float()
                             qc = torch.max(
-                                q_r[i] if q_r[i] is not None else torch.ones_like(D_gate),
-                                q_t[i] if q_t[i] is not None else torch.ones_like(D_gate))
+                                q_r[i].detach() if q_r[i] is not None else torch.ones_like(D_gate),
+                                q_t[i].detach() if q_t[i] is not None else torch.ones_like(D_gate))
                             qd = torch.max(
-                                dqr[i] if dqr[i] is not None else torch.ones_like(D_gate),
-                                dqt[i] if dqt[i] is not None else torch.ones_like(D_gate))
+                                dqr[i].detach() if dqr[i] is not None else torch.ones_like(D_gate),
+                                dqt[i].detach() if dqt[i] is not None else torch.ones_like(D_gate))
                             D_gate = F.interpolate(D_gate, size=zf[i].shape[2:], mode='nearest') if D_gate.shape[2:] != zf[i].shape[2:] else D_gate
                             qc = F.interpolate(qc, size=zf[i].shape[2:], mode='nearest') if qc.shape[2:] != zf[i].shape[2:] else qc
                             qd = F.interpolate(qd, size=zf[i].shape[2:], mode='nearest') if qd.shape[2:] != zf[i].shape[2:] else qd

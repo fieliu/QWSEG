@@ -19,49 +19,48 @@ from mmseg.datasets.transforms.quality_degradation import (
 # ---------------------------------------------------------------------------
 # QualityPredictor
 # ---------------------------------------------------------------------------
-
 class QualityPredictor(nn.Module):
     """Per-stage quality predictor with masked global context.
 
     Input:  x [B, C, H, W] feature map, mask [B, 1, H, W] hard mask (detached).
     Output: gate_logits [B, 2, H, W], q_weight [B, 1, H, W] in [1e-7, 1-1e-7].
     """
-
     def __init__(self, in_channels):
         super().__init__()
         hidden = min(128, max(64, in_channels // 2))
         self.hidden = hidden
-        self.local_conv1 = nn.Conv2d(in_channels, hidden, 1, bias=False)
-        self.local_conv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
-        self.fuse_conv1 = nn.Conv2d(hidden * 2, hidden, 1, bias=False)
-        self.fuse_conv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
+        # 入口归一化（可选但推荐，与 Pre-Norm 范式对齐）
+        self.norm_in = nn.LayerNorm(in_channels)
+        self.norm1 = nn.LayerNorm(hidden)
+        self.conv1 = nn.Conv2d(in_channels, hidden, 1, bias=False)
+        self.norm2 = nn.LayerNorm(hidden)
+        self.conv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
         self.gate_head = nn.Conv2d(hidden, 2, 1, bias=True)
         self.weight_head = nn.Conv2d(hidden, 1, 1, bias=True)
-        # Bias gate_head toward "keep" (channel 0) to prevent collapse at Phase 3 start
         nn.init.constant_(self.gate_head.bias, 0.0)
-        self.gate_head.bias.data[0] = 2.0   # keep bias (sigmoid-ish offset)
-        # Bias weight_head toward "all high quality" initially
-        nn.init.constant_(self.weight_head.bias, 4.0)   # sigmoid(4) ≈ 0.98
+        self.gate_head.bias.data[0] = 2.0
+        nn.init.constant_(self.weight_head.bias, 4.0)
 
     def forward(self, x, mask):
-        local = F.gelu(self.local_conv1(x))
-        local = F.gelu(self.local_conv2(local))
-
-        mask_d = mask.detach()
-        if mask_d.shape[2:] != x.shape[2:]:
-            mask_d = F.adaptive_max_pool2d(mask_d.float(), x.shape[2:])
-        mask_sum = mask_d.sum(dim=(2, 3), keepdim=True).clamp(min=1e-6)
-        global_feat = (local * mask_d).sum(dim=(2, 3), keepdim=True) / mask_sum
-        global_feat = global_feat.expand(-1, -1, x.shape[2], x.shape[3])
-
-        fused = torch.cat([local, global_feat], dim=1)
-        fused = F.gelu(self.fuse_conv1(fused))
-        fused = F.gelu(self.fuse_conv2(fused))
-
-        gate_logits = self.gate_head(fused)
-        q_weight = torch.sigmoid(self.weight_head(fused)).clamp(1e-7, 1 - 1e-7)
+        # Pre-Norm 入口
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm_in(x).permute(0, 3, 1, 2)
+        
+        # 第一组：Norm → Conv → GELU
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm1(x).permute(0, 3, 1, 2)
+        x = self.conv1(x)
+        x = F.gelu(x)
+        
+        # 第二组：Norm → Conv → GELU
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm2(x).permute(0, 3, 1, 2)
+        x = self.conv2(x)
+        x = F.gelu(x)
+        
+        gate_logits = self.gate_head(x)
+        q_weight = torch.sigmoid(self.weight_head(x)).clamp(1e-7, 1 - 1e-7)
         return gate_logits, q_weight
-
 
 # backward-compat alias
 TokenPrunePredictor = QualityPredictor

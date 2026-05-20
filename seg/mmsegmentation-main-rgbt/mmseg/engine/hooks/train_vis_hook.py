@@ -469,6 +469,8 @@ class TrainVisHook(Hook):
                 runner.epoch, runner.max_epochs)
         if hasattr(model, 'epoch'):
             model.epoch = runner.epoch
+        if hasattr(model, 'current_epoch'):
+            model.current_epoch = runner.epoch
         if hasattr(model, '_update_quality_freeze_status'):
             model._update_quality_freeze_status(runner.epoch)
 
@@ -1315,6 +1317,7 @@ class TrainVisHook(Hook):
                 q_info, rgb_vis=rgb_vis, t_vis=t_vis, aspect_ratio=aspect_ratio)
         elif model_type in ('mit_quality_mamba', 'swin_quality_mask2former'):
             q_info = self._create_v9_quality_vis(feats, img_h=img_h, img_w=img_w)
+            deg_q_info = self._create_v9_deg_quality_vis(feats, img_h=img_h, img_w=img_w)
             deg_q_rgb_mask = self._get_v12d_quality_mask(feats['q_rgb_deg'])
             deg_q_t_mask = self._get_v12d_quality_mask(feats['q_t_deg'])
             feat_rows = _build_feat_rows(
@@ -1329,8 +1332,31 @@ class TrainVisHook(Hook):
                        deg_q_rgb_mask, deg_q_t_mask,
                        deg_q_rgb_mask, deg_q_t_mask, None])
             aspect_ratio = (img_w / max(img_h, 1)) if (img_h and img_w) else 1.0
+            deg_rgb_vis = deg_t_vis = None
+            if 'deg_rgb_img' in feats:
+                try:
+                    deg_rgb_t = feats['deg_rgb_img']
+                    deg_t_t = feats['deg_t_img']
+                    rgb_np = deg_rgb_t[0].cpu().permute(1, 2, 0).numpy()
+                    t_np = deg_t_t[0].cpu().permute(1, 2, 0).numpy()
+                    deg_rgb_vis = _to_uint8(rgb_np)
+                    t_gray = cv2.cvtColor(_to_uint8(t_np), cv2.COLOR_RGB2GRAY)
+                    deg_t_vis = np.stack([t_gray, t_gray, t_gray], axis=-1)
+                    deg_type_rgb = feats.get('deg_type_rgb', 'none')
+                    deg_type_t = feats.get('deg_type_t', 'none')
+                    if deg_type_rgb == 'missing':
+                        deg_rgb_vis = _add_missing_overlay(rgb_vis) if rgb_vis is not None else _add_text_overlay(deg_rgb_vis, 'MISSING')
+                    elif deg_type_rgb != 'none':
+                        deg_rgb_vis = _add_text_overlay(deg_rgb_vis, str(deg_type_rgb))
+                    if deg_type_t == 'missing':
+                        deg_t_vis = _add_missing_overlay(t_vis) if t_vis is not None else _add_text_overlay(deg_t_vis, 'MISSING')
+                    elif deg_type_t != 'none':
+                        deg_t_vis = _add_text_overlay(deg_t_vis, str(deg_type_t))
+                except Exception:
+                    pass
             q_grid = self._compose_v9_quality_vis(
-                q_info, rgb_vis=rgb_vis, t_vis=t_vis, aspect_ratio=aspect_ratio)
+                q_info, rgb_vis=rgb_vis, t_vis=t_vis, aspect_ratio=aspect_ratio,
+                deg_q_info=deg_q_info, deg_rgb_vis=deg_rgb_vis, deg_t_vis=deg_t_vis)
             return feat_rows, q_grid, deg_feat_rows
         elif model_type == 'v7_quality_adaptive':
             q_info = self._create_v9_quality_vis(feats, img_h=img_h, img_w=img_w)
@@ -1682,17 +1708,55 @@ class TrainVisHook(Hook):
             ))
         return dict(stages=stages)
 
+    def _create_v9_deg_quality_vis(self, feats, img_h=None, img_w=None):
+        q_rgb_deg = feats.get('q_rgb_deg')
+        q_t_deg = feats.get('q_t_deg')
+        if q_rgb_deg is None or q_t_deg is None:
+            return None
+        q_rgb_priv_deg = feats.get('q_rgb_priv_deg', q_rgb_deg)
+        q_t_priv_deg = feats.get('q_t_priv_deg', q_t_deg)
+        D_rgb_deg = feats.get('D_rgb_deg', feats.get('D_rgb', q_rgb_deg))
+        D_t_deg = feats.get('D_t_deg', feats.get('D_t', q_t_deg))
+        D_rgb_priv_deg = feats.get('D_rgb_priv_deg', D_rgb_deg)
+        D_t_priv_deg = feats.get('D_t_priv_deg', D_t_deg)
+        if img_h is not None and img_w is not None:
+            h, w = img_h, img_w
+        else:
+            h, w = feats['zc_rgb'][0].shape[-2:]
+
+        def _to_np(t, i):
+            if t is None or i >= len(t) or t[i] is None:
+                return np.ones((h, w), dtype=np.float32)
+            return t[i][0, 0].detach().cpu().numpy()
+
+        stages = []
+        for i in range(len(q_rgb_deg)):
+            stages.append(dict(
+                rgb_hm=_quality_to_rgb_heatmap(_to_np(q_rgb_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                t_hm=_quality_to_rgb_heatmap(_to_np(q_t_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                rgb_priv_hm=_quality_to_rgb_heatmap(_to_np(q_rgb_priv_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                t_priv_hm=_quality_to_rgb_heatmap(_to_np(q_t_priv_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                rgb_mask=(_to_np(D_rgb_deg, i) >= self.mask_threshold).astype(np.float32),
+                t_mask=(_to_np(D_t_deg, i) >= self.mask_threshold).astype(np.float32),
+                rgb_priv_mask=(_to_np(D_rgb_priv_deg, i) >= self.mask_threshold).astype(np.float32),
+                t_priv_mask=(_to_np(D_t_priv_deg, i) >= self.mask_threshold).astype(np.float32),
+            ))
+        return dict(stages=stages)
+
     def _compose_v9_quality_vis(self, q_info, rgb_vis=None, t_vis=None,
-                                aspect_ratio=1.0):
+                                aspect_ratio=1.0, deg_q_info=None,
+                                deg_rgb_vis=None, deg_t_vis=None):
         cell_h, cell_w = _compute_cell_size(self.short_side, aspect_ratio)
         num_cols = 4
         gap_s = 5
+        block_gap = 10
         empty = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
+        total_w = cell_w * num_cols + (num_cols - 1) * gap_s
 
         def _mask_vis(m, tw, th):
             m_r = cv2.resize(m, (tw, th), interpolation=cv2.INTER_NEAREST)
             v = np.zeros((th, tw, 3), dtype=np.uint8)
-            v[:, :, 1] = (m_r * 255).astype(np.uint8)  # green = keep
+            v[:, :, 1] = (m_r * 255).astype(np.uint8)
             return v
 
         def _row(*cells):
@@ -1708,21 +1772,34 @@ class TrainVisHook(Hook):
         t_cell = cv2.resize(t_vis, (cell_w, cell_h)) if t_vis is not None else empty.copy()
         rows = []
 
-        # Row 1: original images
         rows.append(_row(rgb_cell, t_cell, rgb_cell, t_cell))
-        rows.append(np.zeros((gap_s, cell_w * num_cols + (num_cols - 1) * gap_s, 3), dtype=np.uint8))
+        rows.append(np.zeros((gap_s, total_w, 3), dtype=np.uint8))
 
         for si, s in enumerate(q_info['stages']):
-            # Heatmap row: standalone heatmaps (no overlay)
             rows.append(_row(s['rgb_hm'], s['t_hm'], s['rgb_priv_hm'], s['t_priv_hm']))
-            rows.append(np.zeros((gap_s, cell_w * num_cols + (num_cols - 1) * gap_s, 3), dtype=np.uint8))
-            # Mask row
+            rows.append(np.zeros((gap_s, total_w, 3), dtype=np.uint8))
             rows.append(_row(
                 _mask_vis(s['rgb_mask'], cell_w, cell_h),
                 _mask_vis(s['t_mask'], cell_w, cell_h),
                 _mask_vis(s['rgb_priv_mask'], cell_w, cell_h),
                 _mask_vis(s['t_priv_mask'], cell_w, cell_h)))
-            rows.append(np.zeros((gap_s, cell_w * num_cols + (num_cols - 1) * gap_s, 3), dtype=np.uint8))
+            rows.append(np.zeros((gap_s, total_w, 3), dtype=np.uint8))
+
+        if deg_q_info is not None:
+            rows.append(np.zeros((block_gap, total_w, 3), dtype=np.uint8))
+            deg_rgb_cell = cv2.resize(deg_rgb_vis, (cell_w, cell_h)) if deg_rgb_vis is not None else empty.copy()
+            deg_t_cell = cv2.resize(deg_t_vis, (cell_w, cell_h)) if deg_t_vis is not None else empty.copy()
+            rows.append(_row(deg_rgb_cell, deg_t_cell, deg_rgb_cell, deg_t_cell))
+            rows.append(np.zeros((gap_s, total_w, 3), dtype=np.uint8))
+            for si, s in enumerate(deg_q_info['stages']):
+                rows.append(_row(s['rgb_hm'], s['t_hm'], s['rgb_priv_hm'], s['t_priv_hm']))
+                rows.append(np.zeros((gap_s, total_w, 3), dtype=np.uint8))
+                rows.append(_row(
+                    _mask_vis(s['rgb_mask'], cell_w, cell_h),
+                    _mask_vis(s['t_mask'], cell_w, cell_h),
+                    _mask_vis(s['rgb_priv_mask'], cell_w, cell_h),
+                    _mask_vis(s['t_priv_mask'], cell_w, cell_h)))
+                rows.append(np.zeros((gap_s, total_w, 3), dtype=np.uint8))
 
         return np.concatenate(rows, axis=0) if rows else empty
 

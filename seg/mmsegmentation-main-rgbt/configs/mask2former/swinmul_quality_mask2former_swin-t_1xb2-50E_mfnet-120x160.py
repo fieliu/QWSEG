@@ -1,5 +1,5 @@
 _base_ = [
-    '../_base_/datasets/mfnet_ab_480x640.py',
+    '../_base_/datasets/mfnet_ab_120x160.py',
     '../_base_/default_runtime.py',
 ]
 
@@ -11,7 +11,7 @@ custom_imports = dict(
              'mmdet.models'],
     allow_failed_imports=False)
 
-crop_size = (480, 640)
+crop_size = (120, 160)
 num_classes = 9
 depths = [2, 2, 6, 2]
 
@@ -226,9 +226,9 @@ model = dict(
     retention_max=0.95,
     retention_loss_weight=5.0,
     phase_mode='absolute',
-    phase1_epochs=10,
-    phase2_epochs=20,
-    total_epochs=200,
+    phase1_epochs=5,
+    phase2_epochs=15,
+    total_epochs=50,
     loss_align_weight=0.1,
     contrast_tau=0.07,
     contrast_num_samples=512,
@@ -239,7 +239,7 @@ model = dict(
     missing_ratio=0.3,
     global_deg_ratio=0.3,
     local_deg_ratio=0.4,
-    test_cfg=dict(mode='slide', crop_size=crop_size, stride=(320, 427)))
+    test_cfg=dict(mode='slide', crop_size=crop_size, stride=(80, 107)))
 
 backbone_norm_multi = dict(lr_mult=0.1, decay_mult=0.0)
 backbone_embed_multi = dict(lr_mult=0.1, decay_mult=0.0)
@@ -302,17 +302,17 @@ optim_wrapper = dict(
         norm_decay_mult=0.0))
 
 param_scheduler = [
-    dict(type='LinearLR', start_factor=1e-6, by_epoch=False, begin=0, end=1500),
+    dict(type='LinearLR', start_factor=1e-6, by_epoch=False, begin=0, end=500),
     dict(
         type='PolyLR',
         eta_min=0.0,
         power=0.9,
-        begin=1500,
-        end=117600,
+        begin=500,
+        end=25000,
         by_epoch=False),
 ]
 
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=200, val_interval=5)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=50, val_interval=5)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 

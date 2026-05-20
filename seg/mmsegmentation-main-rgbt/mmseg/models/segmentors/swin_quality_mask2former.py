@@ -275,7 +275,7 @@ def _quality_mask_to_swin_bias(D_2d, window_size, shift_size, eps=1e-9):
     D_windows = D.reshape(B, nW_h, wh, nW_w, wh)
     D_windows = D_windows.permute(0, 1, 3, 2, 4).contiguous()
     D_windows = D_windows.view(-1, wh * wh)
-    bias = torch.log(D_windows + eps)
+    bias = torch.log(D_windows.clamp(min=eps) + eps).clamp(min=-10.0)
     return bias.view(-1, 1, 1, wh * wh).expand(-1, 1, wh * wh, wh * wh).contiguous()
 
 
@@ -1108,8 +1108,8 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                 if dcnt: losses['loss_align_deg'] = (dlc/dcnt)*self.loss_align_weight
             if self.loss_distill_weight > 0 and ph >= 3:
                 T = self.distill_temperature
-                cl = self._get_seg_logits(ff, data_samples)
-                dl_ = self._get_seg_logits(df, data_samples)
+                cl = self._get_seg_logits(ff, data_samples).float()
+                dl_ = self._get_seg_logits(df, data_samples).float()
                 tp = F.softmax(cl.detach()/T,dim=1); sp = F.log_softmax(dl_/T,dim=1)
                 kl = F.kl_div(sp,tp,reduction='none').sum(dim=1)
                 losses['loss_distill'] = self.loss_distill_weight*(T*T)*kl.mean()

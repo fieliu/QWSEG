@@ -381,7 +381,7 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
             if cum_D is not None:
                 H_k, W_k = hw_shape_k
                 D_k = downsample_mask(cum_D, H_k, W_k).reshape(Bb, 1, 1, -1)
-                attn = attn + torch.log(D_k.float() + 1e-6).to(attn.dtype)
+                attn = attn + torch.log(D_k.float().clamp(min=1e-6) + 1e-6).clamp(min=-10.0).to(attn.dtype)
 
             attn = attn.float().softmax(dim=-1).to(V.dtype)
             if hasattr(attn_module, 'dropout_layer') and attn_module.dropout_layer is not None:
@@ -504,7 +504,7 @@ def _forward_branch_pruned(backbone, img, predictor_list, cum_D_prev_list,
             if cum_D is not None:
                 H_k, W_k = hw_shape_k
                 D_k = downsample_mask(cum_D, H_k, W_k).reshape(Bb, 1, 1, -1)
-                attn = attn + torch.log(D_k.float() + 1e-6).to(attn.dtype)
+                attn = attn + torch.log(D_k.float().clamp(min=1e-6) + 1e-6).clamp(min=-10.0).to(attn.dtype)
 
             attn = attn.float().softmax(dim=-1).to(V.dtype)
             if hasattr(attn_module, 'dropout_layer') and attn_module.dropout_layer is not None:
@@ -910,7 +910,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
                 if dcnt: losses['loss_align_deg'] = (dlc/dcnt)*self.loss_align_weight
             if self.loss_distill_weight > 0 and ph >= 3:
                 T = self.distill_temperature
-                cl = self.decode_head.forward(ff); dl_ = self.decode_head.forward(df)
+                cl = self.decode_head.forward(ff).float(); dl_ = self.decode_head.forward(df).float()
                 tp = F.softmax(cl.detach()/T,dim=1); sp = F.log_softmax(dl_/T,dim=1)
                 kl = F.kl_div(sp,tp,reduction='none').sum(dim=1)
                 dm = self._build_pad_mask(data_samples, kl.shape[-2], kl.shape[-1], kl.device)

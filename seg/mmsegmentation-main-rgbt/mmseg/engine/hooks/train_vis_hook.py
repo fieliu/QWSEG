@@ -1682,10 +1682,10 @@ class TrainVisHook(Hook):
         q_t = feats['q_t_maps']
         q_rgb_priv = feats.get('q_rgb_priv', q_rgb)
         q_t_priv = feats.get('q_t_priv', q_t)
-        D_rgb = feats.get('D_rgb', q_rgb)
-        D_t = feats.get('D_t', q_t)
-        D_rgb_priv = feats.get('D_rgb_priv', D_rgb)
-        D_t_priv = feats.get('D_t_priv', D_t)
+        D_rgb = feats.get('cum_D_rgb', feats.get('D_rgb', q_rgb))
+        D_t = feats.get('cum_D_t', feats.get('D_t', q_t))
+        D_rgb_priv = feats.get('cum_D_rgb_priv', feats.get('D_rgb_priv', D_rgb))
+        D_t_priv = feats.get('cum_D_t_priv', feats.get('D_t_priv', D_t))
         if img_h is not None and img_w is not None:
             h, w = img_h, img_w
         else:
@@ -1715,10 +1715,10 @@ class TrainVisHook(Hook):
             return None
         q_rgb_priv_deg = feats.get('q_rgb_priv_deg', q_rgb_deg)
         q_t_priv_deg = feats.get('q_t_priv_deg', q_t_deg)
-        D_rgb_deg = feats.get('D_rgb_deg', feats.get('D_rgb', q_rgb_deg))
-        D_t_deg = feats.get('D_t_deg', feats.get('D_t', q_t_deg))
-        D_rgb_priv_deg = feats.get('D_rgb_priv_deg', D_rgb_deg)
-        D_t_priv_deg = feats.get('D_t_priv_deg', D_t_deg)
+        D_rgb_deg = feats.get('cum_D_rgb_deg', feats.get('D_rgb_deg', feats.get('D_rgb', q_rgb_deg)))
+        D_t_deg = feats.get('cum_D_t_deg', feats.get('D_t_deg', feats.get('D_t', q_t_deg)))
+        D_rgb_priv_deg = feats.get('cum_D_rgb_priv_deg', feats.get('D_rgb_priv_deg', D_rgb_deg))
+        D_t_priv_deg = feats.get('cum_D_t_priv_deg', feats.get('D_t_priv_deg', D_t_deg))
         if img_h is not None and img_w is not None:
             h, w = img_h, img_w
         else:

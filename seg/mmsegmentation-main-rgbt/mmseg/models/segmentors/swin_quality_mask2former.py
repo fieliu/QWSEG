@@ -1203,6 +1203,7 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             q_rgb_maps=q_r, q_t_maps=q_t,
             q_rgb_priv=qpr, q_t_priv=qpt,
             D_rgb=D_r, D_t=D_t, D_rgb_priv=Dpr, D_t_priv=Dpt,
+            cum_D_rgb=cDr, cum_D_t=cDt, cum_D_rgb_priv=cDpr, cum_D_t_priv=cDpt,
             deg_rgb_img=deg_rgb, deg_t_img=deg_t,
             deg_type_rgb=deg_type_rgb[0] if isinstance(deg_type_rgb, list) else deg_type_rgb,
             deg_type_t=deg_type_t[0] if isinstance(deg_type_t, list) else deg_type_t,
@@ -1215,6 +1216,8 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             q_rgb_priv_deg=qpr_d, q_t_priv_deg=qpt_d,
             D_rgb_deg=D_r_d, D_t_deg=D_t_d,
             D_rgb_priv_deg=Dpr_d, D_t_priv_deg=Dpt_d,
+            cum_D_rgb_deg=cDr_d, cum_D_t_deg=cDt_d,
+            cum_D_rgb_priv_deg=cDpr_d, cum_D_t_priv_deg=cDpt_d,
         )
 
     def _decode_head_predict_logits(self, feats, head=None):

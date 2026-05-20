@@ -122,13 +122,13 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
 
         if cum_D_rgb is not None:
             if cum_D_rgb.shape[2:] != (H, W):
-                cum_D_rgb = F.interpolate(cum_D_rgb.float(), size=(H, W), mode='nearest')
+                cum_D_rgb = F.adaptive_max_pool2d(cum_D_rgb.float(), (H, W))
             cum_D_rgb = D_rgb_raw * cum_D_rgb
         else:
             cum_D_rgb = D_rgb_raw
         if cum_D_t is not None:
             if cum_D_t.shape[2:] != (H, W):
-                cum_D_t = F.interpolate(cum_D_t.float(), size=(H, W), mode='nearest')
+                cum_D_t = F.adaptive_max_pool2d(cum_D_t.float(), (H, W))
             cum_D_t = D_t_raw * cum_D_t
         else:
             cum_D_t = D_t_raw
@@ -216,7 +216,7 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
 
         if cum_D is not None:
             if cum_D.shape[2:] != (H, W):
-                cum_D = F.interpolate(cum_D.float(), size=(H, W), mode='nearest')
+                cum_D = F.adaptive_max_pool2d(cum_D.float(), (H, W))
             cum_D = D_raw * cum_D
         else:
             cum_D = D_raw

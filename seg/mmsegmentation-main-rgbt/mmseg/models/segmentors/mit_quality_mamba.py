@@ -323,16 +323,16 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
         if q_t is None:
             q_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
 
-        # cross-stage mask propagation
+        # cross-stage mask propagation (max-pool: pruned stays pruned)
         if cum_D_rgb is not None:
             if cum_D_rgb.shape[2:] != (H, W):
-                cum_D_rgb = F.interpolate(cum_D_rgb.float(), size=(H, W), mode='nearest')
+                cum_D_rgb = F.adaptive_max_pool2d(cum_D_rgb.float(), (H, W))
             cum_D_rgb = D_rgb_raw * cum_D_rgb
         else:
             cum_D_rgb = D_rgb_raw
         if cum_D_t is not None:
             if cum_D_t.shape[2:] != (H, W):
-                cum_D_t = F.interpolate(cum_D_t.float(), size=(H, W), mode='nearest')
+                cum_D_t = F.adaptive_max_pool2d(cum_D_t.float(), (H, W))
             cum_D_t = D_t_raw * cum_D_t
         else:
             cum_D_t = D_t_raw
@@ -460,7 +460,7 @@ def _forward_branch_pruned(backbone, img, predictor_list, cum_D_prev_list,
 
         if cum_D is not None:
             if cum_D.shape[2:] != (H, W):
-                cum_D = F.interpolate(cum_D.float(), size=(H, W), mode='nearest')
+                cum_D = F.adaptive_max_pool2d(cum_D.float(), (H, W))
             cum_D = D_raw * cum_D
         else:
             cum_D = D_raw

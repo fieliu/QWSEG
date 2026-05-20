@@ -30,8 +30,8 @@ class QualityPredictor(nn.Module):
         hidden = min(128, max(64, in_channels // 2))
         self.hidden = hidden
         # 入口归一化（可选但推荐，与 Pre-Norm 范式对齐）
-        self.norm_in = nn.LayerNorm(in_channels)
-        self.norm1 = nn.LayerNorm(hidden)
+        # self.norm_in = nn.LayerNorm(in_channels)
+        self.norm1 = nn.LayerNorm(in_channels)
         self.conv1 = nn.Conv2d(in_channels, hidden, 1, bias=False)
         self.norm2 = nn.LayerNorm(hidden)
         self.conv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
@@ -44,14 +44,13 @@ class QualityPredictor(nn.Module):
     def forward(self, x, mask):
         # Pre-Norm 入口
         x = x.permute(0, 2, 3, 1)
-        x = self.norm_in(x).permute(0, 3, 1, 2)
+        # x = self.norm_in(x).permute(0, 3, 1, 2)
         
         # 第一组：Norm → Conv → GELU
         x = x.permute(0, 2, 3, 1)
         x = self.norm1(x).permute(0, 3, 1, 2)
         x = self.conv1(x)
         x = F.gelu(x)
-        
         # 第二组：Norm → Conv → GELU
         x = x.permute(0, 2, 3, 1)
         x = self.norm2(x).permute(0, 3, 1, 2)

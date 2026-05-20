@@ -78,20 +78,22 @@ class BiMambaFusion(nn.Module):
         self.d_inner = int(expand * d_model)
         self.dt_rank = math.ceil(d_model / 16)
 
-        self.pos_table = nn.Parameter(torch.randn(1, d_model, base_pos_size, base_pos_size) * 0.02)
+        self.pos_table = nn.Parameter(torch.empty(1, d_model, base_pos_size, base_pos_size))
+        nn.init.trunc_normal_(self.pos_table, std=0.02)
         self.type_gen = nn.Parameter(torch.zeros(d_model))
         self.type_priv = nn.Parameter(torch.zeros(d_model))
 
         self._init_mamba_params('fwd')
         self._init_mamba_params('bwd')
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
-        self.out_norm = nn.LayerNorm(d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.norm_final = nn.LayerNorm(d_model)
 
     def _init_mamba_params(self, suffix):
         d, s, r = self.d_inner, self.d_state, self.dt_rank
         self.add_module(f'in_proj_{suffix}', nn.Linear(self.d_model, d * 2, bias=False))
         self.add_module(f'conv1d_{suffix}', nn.Conv1d(d, d, kernel_size=self.d_conv,
-                         groups=d, padding=self.d_conv - 1, bias=True))
+                         groups=d, padding=self.d_conv - 1, bias=False))
         self.add_module(f'x_proj_{suffix}', nn.Linear(d, r + s * 2, bias=False))
         self.add_module(f'dt_proj_{suffix}', nn.Linear(r, d, bias=True))
         A = torch.arange(1, s + 1, dtype=torch.float32).repeat(d, 1)
@@ -121,13 +123,10 @@ class BiMambaFusion(nn.Module):
         x_scan = x_conv.transpose(1, 2)
         dt_scan, B_scan, C_scan = dt.transpose(1, 2), B_ssm.transpose(1, 2), C_ssm.transpose(1, 2)
 
-        try:
-            from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
-            y = selective_scan_fn(x_scan, dt_scan, A, B_scan, C_scan, D_param.float(),
-                                  delta_bias=dt_proj.bias.float() if dt_proj.bias is not None else None,
-                                  delta_softplus=True)
-        except ImportError:
-            y = _selective_scan_pytorch(x_scan, dt_scan, A, B_scan, C_scan, D_param, cu_seqlens)
+        from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+        y = selective_scan_fn(x_scan, dt_scan, A, B_scan, C_scan, D_param.float(),
+                              delta_bias=dt_proj.bias.float() if dt_proj.bias is not None else None,
+                              delta_softplus=True)
 
         y = y.transpose(1, 2) * F.silu(z)
         return getattr(self, f'out_proj_{suffix}')(y)
@@ -163,13 +162,15 @@ class BiMambaFusion(nn.Module):
         G_list = [out_seq[cu[b]:cu[b] + N_g] for b in range(B)]
         return torch.stack(G_list, dim=0)
 
-    def forward(self, generic_tokens, priv_valid_tokens, stage_H, stage_W, cu_seqlens):
+    def forward(self, generic_tokens, priv_valid_tokens, stage_H, stage_W, cu_seqlens, priv_indices=None):
         N_g = stage_H * stage_W
         pos_embed = self._get_pos_embed(stage_H, stage_W, generic_tokens.device, generic_tokens.dtype)
         gen = generic_tokens + pos_embed.unsqueeze(0) + self.type_gen.unsqueeze(0).unsqueeze(0)
         priv = priv_valid_tokens
         if priv.shape[0] > 0:
             priv = priv + self.type_priv.unsqueeze(0)
+            if priv_indices is not None and priv_indices.shape[0] == priv.shape[0]:
+                priv = priv + pos_embed[priv_indices]
         x_seq = self._build_sequences(gen, priv, cu_seqlens, N_g)
         x_bld = x_seq.unsqueeze(0)
         out_fwd = self._mamba_scan(x_bld, 'fwd', cu_seqlens=cu_seqlens)
@@ -178,26 +179,8 @@ class BiMambaFusion(nn.Module):
         out_rev = self._reverse_sequences(out_rev, cu_seqlens)
         out_seq = (out_fwd + out_rev).squeeze(0)
         G_enhanced = self._extract_generic(out_seq, cu_seqlens, N_g)
-        return generic_tokens + self.out_proj(self.out_norm(G_enhanced))
-
-
-def _selective_scan_pytorch(x, dt, A, B_ssm, C_ssm, D, cu_seqlens=None):
-    batch, d_inner, L = x.shape
-    d_state = A.shape[1]
-    dt = F.softplus(dt)
-    h = torch.zeros(batch, d_inner, d_state, device=x.device, dtype=x.dtype)
-    ys = []
-    cu = cu_seqlens.cpu().numpy() if cu_seqlens is not None else None
-    seq_starts = set(cu.tolist()) if cu is not None else set()
-    for i in range(L):
-        if cu is not None and i in seq_starts and i > 0:
-            h = torch.zeros_like(h)
-        dA = torch.exp(dt[:, :, i].unsqueeze(-1) * A.unsqueeze(0))
-        dB = dt[:, :, i].unsqueeze(-1) * B_ssm[:, :, i].unsqueeze(-2)
-        h = dA * h + dB * x[:, :, i].unsqueeze(-1)
-        ys.append(torch.sum(h * C_ssm[:, :, i].unsqueeze(1), dim=-1))
-    y = torch.stack(ys, dim=2)
-    return y + D.unsqueeze(0).unsqueeze(-1) * x
+        enhanced = self.out_proj(self.norm(G_enhanced))
+        return self.norm_final(generic_tokens + enhanced)
 
 
 class MultiScaleRefine(nn.Module):
@@ -263,10 +246,11 @@ class DualGateEnhancedFusion(nn.Module):
             ch_r, ch_t = ch_gate.split(C, dim=1)
             sp_gate = self.sp_gates[i](concat)
             sp_r, sp_t = sp_gate[:, 0:1], sp_gate[:, 1:2]
-            fused = ch_r * sp_r * Fr + ch_t * sp_t * Ft + Fg
-            x = fused.permute(0, 2, 3, 1)
-            x = self.post_norms[i](x).permute(0, 3, 1, 2)
-            fused_list.append(fused + self.post_convs[i](x))
+            fused = ch_r * sp_r * Fr + ch_t * sp_t * Ft
+            fused_norm = fused.permute(0, 2, 3, 1).contiguous()
+            fused_norm = self.post_norms[i](fused_norm).permute(0, 3, 1, 2).contiguous()
+            out = self.post_convs[i](fused_norm)
+            fused_list.append(Fg + out)
         return fused_list
 
 
@@ -753,19 +737,20 @@ class QualityGatedMiTMamba(BaseSegmentor):
         Ds = (Dp.squeeze(1) > 0.5).float()
         G = zc.permute(0,2,3,1).reshape(B, N_g, C)
         P = priv.permute(0,2,3,1).reshape(B, N_g, C)
-        pl, cs = [], [0]
+        pl, idx_l, cs = [], [], [0]
         for b in range(B):
             vi = Ds[b].reshape(-1).nonzero(as_tuple=True)[0]
             Mb = vi.shape[0]
             if Mb == 0:
-                # No valid private tokens: add zero placeholder, skip priv in sequence
                 pl.append(torch.zeros(0, C, device=P.device, dtype=P.dtype))
+                idx_l.append(torch.zeros(0, dtype=torch.long, device=P.device))
                 cs.append(cs[-1] + N_g)
             else:
-                pl.append(P[b, vi]); cs.append(cs[-1]+N_g+Mb)
+                pl.append(P[b, vi]); idx_l.append(vi); cs.append(cs[-1]+N_g+Mb)
         pv = torch.cat(pl, dim=0) if pl[0].shape[0] > 0 else torch.zeros(0, C, device=zc.device, dtype=zc.dtype)
+        priv_indices = torch.cat(idx_l, dim=0) if idx_l[0].shape[0] > 0 else torch.zeros(0, dtype=torch.long, device=zc.device)
         ct = torch.tensor(cs, dtype=torch.int32, device=zc.device)
-        return fuse_mod(G, pv, H, W, ct).reshape(B, H, W, C).permute(0,3,1,2)
+        return fuse_mod(G, pv, H, W, ct, priv_indices).reshape(B, H, W, C).permute(0,3,1,2)
 
     def init_weights(self):
         self.backbone.init_weights()
@@ -821,8 +806,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
 
     def _train_with_degradation(self, rgb, ir):
         dr, di, _, _ = self._generate_degraded_inputs(rgb, ir)
-        drr = self._extract_feat_single(dr, di)
-        return drr[7], drr[5], drr[6], drr[4], drr[8], drr[9], drr[2], drr[3], drr[0], drr[1], drr[11], drr[12]
+        return self._extract_feat_single(dr, di)
 
     def _generate_degraded_inputs(self, rgb, ir):
         B, C, H, W = rgb.shape
@@ -893,14 +877,14 @@ class QualityGatedMiTMamba(BaseSegmentor):
             if cnt: losses['loss_align'] = (lc/cnt)*self.loss_align_weight
         if self.retention_loss_weight > 0: losses['loss_retention'] = self.retention_loss_weight*self._compute_retention_loss(ad)
         if self.training:
-            df,drl,dtl,dzf,dqr,dqt,dzpr,dzpt,dzcr,dzct,dDr,dDt = self._train_with_degradation(rgb,ir)
+            dzcr,dzct,dzpr,dzpt,dzf,drl,dtl,df,dqr,dqt,dad,dDr,dDt,dDpr,dDpt,dqpr,dqpt,dcDr,dcDt,dcDpr,dcDpt = self._train_with_degradation(rgb,ir)
             # NaN guard: if degraded features are NaN, fall back to clean
             if torch.isnan(df[0]).any():
                 import logging
                 logging.getLogger(__name__).warning(
                     'NaN in degraded features — falling back to clean features for deg losses')
-                df,drl,dtl,dzf,dqr,dqt,dzpr,dzpt,dzcr,dzct,dDr,dDt = \
-                    ff,re,te,zf,q_r,q_t,zp_r,zp_t,zc_r,zc_t,D_r,D_t
+                dzcr,dzct,dzpr,dzpt,dzf,drl,dtl,df,dqr,dqt,dad,dDr,dDt,dDpr,dDpt,dqpr,dqpt,dcDr,dcDt,dcDpr,dcDpt = \
+                    zc_r,zc_t,zp_r,zp_t,zf,re,te,ff,q_r,q_t,ad,D_r,D_t,Dpr,Dpt,qpr,qpt,cDr,cDt,cDpr,cDpt
             losses.update(add_prefix(self.decode_head.loss(df,data_samples,self.train_cfg),'deg_decode'))
             for head, feats, pfx in [
                 (self.common_decode_head, dzf, 'deg_common_decode'),
@@ -1029,6 +1013,9 @@ class QualityGatedMiTMamba(BaseSegmentor):
             rgb_pf_deg=re_d, t_pf_deg=te_d,
             final_fused_deg=fused_d,
             q_rgb_deg=q_r_d, q_t_deg=q_t_d,
+            q_rgb_priv_deg=qpr_d, q_t_priv_deg=qpt_d,
+            D_rgb_deg=D_r_d, D_t_deg=D_t_d,
+            D_rgb_priv_deg=Dpr_d, D_t_priv_deg=Dpt_d,
         )
 
     def _decode_head_predict_logits(self, feats, head=None):

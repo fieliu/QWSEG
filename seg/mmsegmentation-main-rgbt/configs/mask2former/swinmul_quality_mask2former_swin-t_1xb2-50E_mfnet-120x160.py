@@ -312,7 +312,7 @@ param_scheduler = [
         by_epoch=False),
 ]
 
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=50, val_interval=5)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=50, val_interval=2)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
@@ -321,9 +321,9 @@ default_hooks = dict(
     logger=dict(type='LoggerHook', interval=50, log_metric_by_epoch=True),
     param_scheduler=dict(type='ParamSchedulerHook'),
     checkpoint=dict(
-        type='CheckpointHook', by_epoch=True, interval=5,
+        type='CheckpointHook', by_epoch=True, interval=2,
         save_best='mIoU'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
     visualization=dict(type='SegVisualizationHook'))
 
-custom_hooks = [dict(type='TrainVisHook', interval=5, num_samples=2)]
+custom_hooks = [dict(type='TrainVisHook', interval=2, num_samples=2)]

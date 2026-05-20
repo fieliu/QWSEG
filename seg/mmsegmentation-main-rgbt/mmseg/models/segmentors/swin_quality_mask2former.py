@@ -697,7 +697,7 @@ class DualGateEnhancedFusion(nn.Module):
             fused_norm = fused.permute(0, 2, 3, 1).contiguous()
             fused_norm = self.post_norms[i](fused_norm).permute(0, 3, 1, 2).contiguous()
             # 主分支变换
-            out = self.post_convs[i](fused_norm.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+            out = self.post_convs[i](fused_norm)
             # 残差 = 归一化后的 fused
             fused_list.append(Fg + out)
 

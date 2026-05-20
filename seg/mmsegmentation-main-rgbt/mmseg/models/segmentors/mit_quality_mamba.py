@@ -185,11 +185,11 @@ class BiMambaFusion(nn.Module):
 
 class MultiScaleRefine(nn.Module):
     """Multi-scale refinement with dilated depthwise convs + channel attention.
-    All normalisation uses LayerNorm (channel-last)."""
+    Uses Pre-Norm: input is normalised first, residual is also normalised input."""
 
     def __init__(self, channels, dilations=(1, 2, 3)):
         super().__init__()
-        self.in_norm = nn.LayerNorm(channels)
+        self.norm = nn.LayerNorm(channels)
         self.dw_convs = nn.ModuleList([
             nn.Conv2d(channels, channels, 3, padding=d, dilation=d, groups=channels, bias=False)
             for d in dilations])
@@ -199,17 +199,16 @@ class MultiScaleRefine(nn.Module):
         self.channel_attn = nn.Sequential(
             nn.AdaptiveAvgPool2d(1), nn.Conv2d(channels, mid_ca, 1, bias=False),
             nn.ReLU(inplace=True), nn.Conv2d(mid_ca, channels, 1, bias=False), nn.Sigmoid())
-        self.out_norm = nn.LayerNorm(channels)
         self.out_conv = nn.Conv2d(channels, channels, 1, bias=False)
 
     def forward(self, x):
-        residual = x
-        x = self.in_norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        multi = [dw(x) for dw in self.dw_convs]
-        x = self.fuse_conv(torch.cat(multi, dim=1))
-        x = self.act(x) * self.channel_attn(x)
-        x = self.out_norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        return residual + self.out_conv(x)
+        x_norm = x.permute(0, 2, 3, 1).contiguous()
+        x_norm = self.norm(x_norm)
+        x_norm = x_norm.permute(0, 3, 1, 2).contiguous()
+        multi = [dw(x_norm) for dw in self.dw_convs]
+        x_fused = self.fuse_conv(torch.cat(multi, dim=1))
+        x_fused = self.act(x_fused) * self.channel_attn(x_fused)
+        return x_norm + self.out_conv(x_fused)
 
 
 class DualGateEnhancedFusion(nn.Module):
@@ -404,6 +403,8 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
                 x = x * D_q
 
         x = norm(x)
+        if cum_D is not None:
+            x = x * cum_D.detach().reshape(B_tok, H * W, 1)
         x = nlc_to_nchw(x, hw_shape)
         if i in backbone.out_indices:
             outs.append(x)
@@ -527,6 +528,8 @@ def _forward_branch_pruned(backbone, img, predictor_list, cum_D_prev_list,
                 x = x * D_q
 
         x = norm(x)
+        if cum_D is not None:
+            x = x * cum_D.detach().reshape(B_tok, H * W, 1)
         x = nlc_to_nchw(x, hw_shape)
         if i in backbone.out_indices:
             outs.append(x)
@@ -660,16 +663,11 @@ class QualityGatedMiTMamba(BaseSegmentor):
 
     @staticmethod
     def _build_pad_mask(data_samples, h, w, device):
-        valid = torch.ones(len(data_samples), h, w, dtype=torch.bool, device=device)
+        valid = torch.zeros(len(data_samples), h, w, dtype=torch.bool, device=device)
         for i, ds in enumerate(data_samples):
             ps = ds.metainfo.get('padding_size', [0, 0, 0, 0])
             pl, pr, pt, pb = ps
-            if pb > 0 or pr > 0:
-                valid[i, pt:h - pb, pl:w - pr] = True
-                if pt > 0: valid[i, :pt, :] = False
-                if pb > 0: valid[i, h - pb:, :] = False
-                if pl > 0: valid[i, :, :pl] = False
-                if pr > 0: valid[i, :, w - pr:] = False
+            valid[i, pt:h - pb, pl:w - pr] = True
         return valid
 
     def _get_training_phase(self, epoch):
@@ -776,13 +774,13 @@ class QualityGatedMiTMamba(BaseSegmentor):
             self.private_branch_rgb, rgb, self.predictors_priv_rgb,
             None, self.gumbel_tau, False, training=ug, force_all_keep=fa, phase=ph)
         for i in range(len(zp_r)):
-            if zp_r[i] is not None and Dpr[i] is not None: zp_r[i] = zp_r[i] * Dpr[i]
+            if zp_r[i] is not None and Dpr[i] is not None: zp_r[i] = zp_r[i] * Dpr[i].detach()
 
         zp_t, Dpt, qpt, cDpt = _forward_branch_pruned(
             self.private_branch_t, t, self.predictors_priv_t,
             None, self.gumbel_tau, False, training=ug, force_all_keep=fa, phase=ph)
         for i in range(len(zp_t)):
-            if zp_t[i] is not None and Dpt[i] is not None: zp_t[i] = zp_t[i] * Dpt[i]
+            if zp_t[i] is not None and Dpt[i] is not None: zp_t[i] = zp_t[i] * Dpt[i].detach()
 
         zf, re, te = [], [], []
         for i in range(len(self.embed_dims_list)):
@@ -865,8 +863,8 @@ class QualityGatedMiTMamba(BaseSegmentor):
             pm = self._build_pad_mask(data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
             for i in range(len(zc_r)):
                 if zc_r[i] is not None and zc_t[i] is not None:
-                    Dr = D_r[i] if D_r[i] is not None else torch.ones(B,1,zc_r[i].shape[2],zc_r[i].shape[3],device=zc_r[i].device)
-                    Dt = D_t[i] if D_t[i] is not None else torch.ones(B,1,zc_t[i].shape[2],zc_t[i].shape[3],device=zc_t[i].device)
+                    Dr = D_r[i].detach() if D_r[i] is not None else torch.ones(B,1,zc_r[i].shape[2],zc_r[i].shape[3],device=zc_r[i].device)
+                    Dt = D_t[i].detach() if D_t[i] is not None else torch.ones(B,1,zc_t[i].shape[2],zc_t[i].shape[3],device=zc_t[i].device)
                     qr = q_r[i].detach() if q_r[i] is not None else None
                     qt = q_t[i].detach() if q_t[i] is not None else None
                     lc += compute_cross_modal_contrastive_loss(
@@ -898,8 +896,8 @@ class QualityGatedMiTMamba(BaseSegmentor):
                 dlc, dcnt = 0., 0
                 for i in range(len(dzcr)):
                     if dzcr[i] is not None and dzct[i] is not None:
-                        dDr_i = dDr[i] if dDr is not None and i < len(dDr) and dDr[i] is not None else torch.ones(B,1,dzcr[i].shape[2],dzcr[i].shape[3],device=dzcr[i].device)
-                        dDt_i = dDt[i] if dDt is not None and i < len(dDt) and dDt[i] is not None else torch.ones(B,1,dzct[i].shape[2],dzct[i].shape[3],device=dzct[i].device)
+                        dDr_i = dDr[i].detach() if dDr is not None and i < len(dDr) and dDr[i] is not None else torch.ones(B,1,dzcr[i].shape[2],dzcr[i].shape[3],device=dzcr[i].device)
+                        dDt_i = dDt[i].detach() if dDt is not None and i < len(dDt) and dDt[i] is not None else torch.ones(B,1,dzct[i].shape[2],dzct[i].shape[3],device=dzct[i].device)
                         dqr_i = dqr[i].detach() if dqr is not None and i < len(dqr) and dqr[i] is not None else None
                         dqt_i = dqt[i].detach() if dqt is not None and i < len(dqt) and dqt[i] is not None else None
                         dlc += compute_cross_modal_contrastive_loss(

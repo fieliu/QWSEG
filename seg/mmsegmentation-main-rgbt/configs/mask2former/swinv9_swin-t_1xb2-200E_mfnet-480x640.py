@@ -125,9 +125,6 @@ model = dict(
     rgb_private_decode_head=_segformer_head,
     t_private_decode_head=_segformer_head,
     prune_mid_channels=32,  # kept for API compat, unused by QualityPredictor
-    gumbel_tau_init=1.0,
-    gumbel_tau_min=0.1,
-    gumbel_tau_decay=0.995,
     retention_min=0.3,
     retention_max=0.7,
     phase1_epochs=10,
@@ -165,7 +162,7 @@ for pred_name in ['predictors_common_rgb', 'predictors_common_t']:
     custom_keys[f'{pred_name}'] = dict(lr_mult=5.0, decay_mult=1.0)
     for stage_id in range(len(depths)):
         for sub in ['local_conv1', 'local_conv2', 'fuse_conv1', 'fuse_conv2',
-                    'gate_head', 'weight_head']:
+                    'score_head']:
             custom_keys[f'{pred_name}.{stage_id}.{sub}'] = dict(lr_mult=5.0, decay_mult=1.0)
 
 optimizer = dict(type='AdamW', lr=0.0001, weight_decay=0.05, eps=1e-8, betas=(0.9, 0.999))

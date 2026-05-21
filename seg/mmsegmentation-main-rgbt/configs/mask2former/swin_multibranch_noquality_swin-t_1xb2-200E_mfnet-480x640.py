@@ -4,7 +4,7 @@ _base_ = [
 ]
 
 custom_imports = dict(
-    imports=['mmseg.models.segmentors.mask2former_rgbt_add',
+    imports=['mmseg.models.segmentors.swin_multibranch_noquality',
              'mmseg.models.backbones.rgbt_swin',
              'mmseg.engine',
              'mmseg.datasets.mfnet',
@@ -133,39 +133,67 @@ _mask2former_head = dict(
             ]),
         sampler=dict(type='mmdet.MaskPseudoSampler')))
 
+_segformer_head = dict(
+    type='SegformerHead',
+    in_channels=[96, 192, 384, 768],
+    in_index=[0, 1, 2, 3],
+    channels=256,
+    num_classes=num_classes,
+    norm_cfg=dict(type='SyncBN', requires_grad=True),
+    align_corners=False,
+    loss_decode=dict(
+        type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0))
+
+swin_t = dict(
+    type='RGBTSwinTransformer',
+    embed_dims=96,
+    depths=depths,
+    num_heads=[3, 6, 12, 24],
+    window_size=7,
+    mlp_ratio=4,
+    qkv_bias=True,
+    qk_scale=None,
+    drop_rate=0.,
+    attn_drop_rate=0.,
+    drop_path_rate=0.3,
+    patch_norm=True,
+    out_indices=(0, 1, 2, 3),
+    with_cp=False,
+    frozen_stages=-1,
+    share_start_idx=4,
+    fusion_type='ADD',
+    init_cfg=dict(
+        type='Pretrained',
+        checkpoint='./pretrain/swin_tiny_patch4_window7_224_20220317-1cdeb081.pth'))
+
 model = dict(
-    type='Mask2FormerRGBTAdd',
+    type='SwinMultiBranchNoQuality',
     data_preprocessor=data_preprocessor,
     pretrained=None,
-    backbone=dict(
-        type='RGBTSwinTransformer',
-        embed_dims=96,
-        depths=depths,
-        num_heads=[3, 6, 12, 24],
-        window_size=7,
-        mlp_ratio=4,
-        qkv_bias=True,
-        qk_scale=None,
-        drop_rate=0.,
-        attn_drop_rate=0.,
-        drop_path_rate=0.3,
-        patch_norm=True,
-        out_indices=(0, 1, 2, 3),
-        with_cp=False,
-        frozen_stages=-1,
-        share_start_idx=4,
-        fusion_type='ADD',
-        init_cfg=dict(
-            type='Pretrained',
-            checkpoint='./pretrain/swin_tiny_patch4_window7_224_20220317-1cdeb081.pth')),
+    backbone=swin_t,
     decode_head=_mask2former_head,
-    fusion_type='add',
+    common_decode_head=_segformer_head,
+    rgb_private_decode_head=_segformer_head,
+    t_private_decode_head=_segformer_head,
+    loss_align_weight=0.1,
+    contrast_tau=0.07,
+    contrast_num_samples=512,
+    loss_distill_weight=0.3,
+    distill_temperature=4.0,
+    aux_loss_weight=0.3,
+    loss_invariant_weight=0.03,
+    missing_ratio=0.3,
+    global_deg_ratio=0.3,
+    local_deg_ratio=0.4,
+    mamba_d_state=16,
+    mamba_d_conv=4,
+    mamba_expand=2,
     train_cfg=dict(),
     test_cfg=dict(mode='slide', crop_size=crop_size, stride=(320, 427)))
 
 backbone_norm_multi = dict(lr_mult=0.1, decay_mult=0.0)
 backbone_embed_multi = dict(lr_mult=0.1, decay_mult=0.0)
-embed_multi = dict(lr_mult=1.0, decay_mult=0.0)
+embed_multi = dict(lr_mult=1.0, decay_mult=1.0)
 custom_keys = {
     'backbone': dict(lr_mult=0.1, decay_mult=1.0),
     'backbone.patch_embed.norm': backbone_norm_multi,
@@ -210,17 +238,6 @@ for priv_branch in ['private_branch_rgb', 'private_branch_t']:
         f'{priv_branch}.norm{i}': backbone_norm_multi
         for i in range(len(depths))
     })
-
-predictor_keys = {}
-for pred_name in ['predictors_common_rgb', 'predictors_common_t',
-                  'predictors_priv_rgb', 'predictors_priv_t']:
-    predictor_keys[f'{pred_name}'] = dict(lr_mult=5.0, decay_mult=1.0)
-    for stage_id in range(4):
-        for sub in ['norm1', 'conv1', 'norm2', 'conv2',
-                    'score_head']:
-            predictor_keys[f'{pred_name}.{stage_id}.{sub}'] = dict(lr_mult=5.0, decay_mult=1.0)
-
-custom_keys.update(predictor_keys)
 
 optimizer = dict(
     type='AdamW', lr=0.00006, weight_decay=0.01, eps=1e-8, betas=(0.9, 0.999))

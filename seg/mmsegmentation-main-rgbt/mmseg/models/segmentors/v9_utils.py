@@ -23,7 +23,7 @@ class QualityPredictor(nn.Module):
     """Per-stage quality predictor with masked global context.
 
     Input:  x [B, C, H, W] feature map, mask [B, 1, H, W] hard mask (detached).
-    Output: gate_logits [B, 2, H, W], q_weight [B, 1, H, W] in [1e-7, 1-1e-7].
+    Output: s [B, 1, H, W] continuous quality score in [1e-7, 1-1e-7].
     """
     def __init__(self, in_channels):
         super().__init__()
@@ -33,30 +33,87 @@ class QualityPredictor(nn.Module):
         self.conv1 = nn.Conv2d(in_channels, hidden, 1, bias=False)
         self.norm2 = nn.LayerNorm(hidden)
         self.conv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
-        self.gate_head = nn.Conv2d(hidden, 2, 1, bias=True)
-        self.weight_head = nn.Conv2d(hidden, 1, 1, bias=True)
-        nn.init.constant_(self.gate_head.bias, 0.0)
-        self.gate_head.bias.data[0] = 2.0
-        nn.init.constant_(self.weight_head.bias, 4.0)
+        self.score_head = nn.Conv2d(hidden, 1, 1, bias=True)
+        nn.init.constant_(self.score_head.bias, 4.0)
 
     def forward(self, x, mask):
-        # 第一组：Norm → Conv → GELU
         x = x.permute(0, 2, 3, 1)
         x = self.norm1(x).permute(0, 3, 1, 2)
         x = self.conv1(x)
         x = F.gelu(x)
-        # 第二组：Norm → Conv → GELU
         x = x.permute(0, 2, 3, 1)
         x = self.norm2(x).permute(0, 3, 1, 2)
         x = self.conv2(x)
         x = F.gelu(x)
-        
-        gate_logits = self.gate_head(x)
-        q_weight = torch.sigmoid(self.weight_head(x)).clamp(1e-7, 1 - 1e-7)
-        return gate_logits, q_weight
+        s = torch.sigmoid(self.score_head(x)).clamp(1e-7, 1 - 1e-7)
+        return s
 
 # backward-compat alias
 TokenPrunePredictor = QualityPredictor
+
+
+# ---------------------------------------------------------------------------
+# Piecewise modulation functions for continuous quality score
+# ---------------------------------------------------------------------------
+
+def f_attn(s, tau=0.3, alpha=10.0):
+    """Attention bias function: 0 for high-quality, negative bias for low-quality.
+
+    s > tau: 0.0 (no bias)
+    s <= tau: -alpha * (tau - s) / tau (continuous negative bias, range [0, -alpha])
+    """
+    return torch.where(s > tau, torch.zeros_like(s), -alpha * (tau - s) / tau)
+
+
+def f_fuse(s, tau=0.3, epsilon=1e-3, beta=2.0):
+    """Fusion weight function: quality-modulated weight.
+
+    s > tau: s (direct quality score as weight)
+    s <= tau: epsilon + (1 - epsilon) * (s / tau) ** beta (rapidly decaying weight)
+    """
+    return torch.where(s > tau, s, epsilon + (1 - epsilon) * (s / tau) ** beta)
+
+
+def f_hard_mask(s, tau_hard=0.05):
+    """Optional hard zeroing mask for extremely low-quality tokens.
+
+    s < tau_hard: 0.0 (completely zeroed)
+    s >= tau_hard: 1.0 (kept)
+    Must use .detach() to block gradient.
+    """
+    return (s >= tau_hard).float().detach()
+
+
+class QualityModulatedFusion(nn.Module):
+    """Unified quality-modulated private-common fusion.
+
+    Step 1: Quality-modulate private features with f_fuse(s_priv).
+    Step 2: Channel-concatenate [F_gen, priv_modulated].
+    Step 3: 1x1 conv MLP (2C -> C) + GELU.
+    Step 4: Residual + LayerNorm.
+    """
+
+    def __init__(self, d_model, tau=0.3, epsilon=1e-3, beta=2.0, tau_hard=0.05):
+        super().__init__()
+        self.tau = tau
+        self.epsilon = epsilon
+        self.beta = beta
+        self.tau_hard = tau_hard
+        self.fuse_conv = nn.Conv2d(d_model * 2, d_model, 1, bias=False)
+        self.act = nn.GELU()
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, F_gen, F_priv, s_priv):
+        w = f_fuse(s_priv, tau=self.tau, epsilon=self.epsilon, beta=self.beta)
+        priv_modulated = F_priv * w
+        hard_mask = f_hard_mask(s_priv, tau_hard=self.tau_hard)
+        priv_modulated = priv_modulated * hard_mask
+        x = torch.cat([F_gen, priv_modulated], dim=1)
+        x = self.fuse_conv(x)
+        x = self.act(x)
+        out = F_gen + x
+        out = self.norm(out.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        return out
 
 
 # ---------------------------------------------------------------------------

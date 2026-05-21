@@ -76,7 +76,11 @@ class MultiScaleRefine(nn.Module):
         multi = [dw(x_norm) for dw in self.dw_convs]
         x_fused = self.fuse_conv(torch.cat(multi, dim=1))
         x_fused = self.act(x_fused) * self.channel_attn(x_fused)
-        return x_norm + self.out_conv(x_fused)
+        out = x_norm + self.out_conv(x_fused)
+        out = out.permute(0, 2, 3, 1).contiguous()
+        out = F.layer_norm(out, [out.size(-1)])
+        out = out.permute(0, 3, 1, 2).contiguous()
+        return out
 
 
 class DualGateEnhancedFusion(nn.Module):
@@ -117,7 +121,11 @@ class DualGateEnhancedFusion(nn.Module):
             fused_norm = fused.permute(0, 2, 3, 1).contiguous()
             fused_norm = self.post_norms[i](fused_norm).permute(0, 3, 1, 2).contiguous()
             out = self.post_convs[i](fused_norm)
-            fused_list.append(Fg + out)
+            fused_out = Fg + out
+            fused_out = fused_out.permute(0, 2, 3, 1).contiguous()
+            fused_out = F.layer_norm(fused_out, [fused_out.size(-1)])
+            fused_out = fused_out.permute(0, 3, 1, 2).contiguous()
+            fused_list.append(fused_out)
         return fused_list
 
 
@@ -555,17 +563,11 @@ class QualityGatedMiTMamba(BaseSegmentor):
             self.private_branch_rgb, rgb, self.predictors_priv_rgb,
             training=self.training, force_all_keep=fa, phase=ph,
             tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard)
-        for i in range(len(zp_r)):
-            if zp_r[i] is not None and spr[i] is not None:
-                zp_r[i] = zp_r[i] * f_fuse(spr[i], tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
 
         zp_t, spt = _forward_branch_pruned(
             self.private_branch_t, t, self.predictors_priv_t,
             training=self.training, force_all_keep=fa, phase=ph,
             tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard)
-        for i in range(len(zp_t)):
-            if zp_t[i] is not None and spt[i] is not None:
-                zp_t[i] = zp_t[i] * f_fuse(spt[i], tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
 
         zf, re, te = [], [], []
         for i in range(len(self.embed_dims_list)):
@@ -652,11 +654,8 @@ class QualityGatedMiTMamba(BaseSegmentor):
                     Dt = (s_t[i] > self.tau).float().detach() if s_t[i] is not None else torch.ones(B,1,zc_t[i].shape[2],zc_t[i].shape[3],device=zc_t[i].device)
                     sr_i = s_r[i].detach() if s_r[i] is not None else None
                     st_i = s_t[i].detach() if s_t[i] is not None else None
-                    w = None
-                    if sr_i is not None and st_i is not None:
-                        w = torch.min(sr_i, st_i) * (1 - torch.abs(sr_i - st_i))
                     lc += compute_cross_modal_contrastive_loss(
-                        zc_r[i],zc_t[i],gt,Dr,Dt,w,w,
+                        zc_r[i],zc_t[i],gt,Dr,Dt,sr_i,st_i,
                         tau_c=self.contrast_tau,num_samples=self.contrast_num_samples,
                         ignore_label=255, pad_mask=pm)
                     cnt += 1
@@ -687,11 +686,8 @@ class QualityGatedMiTMamba(BaseSegmentor):
                         dDt_i = (ds_t[i] > self.tau).float().detach() if ds_t is not None and i < len(ds_t) and ds_t[i] is not None else torch.ones(B,1,dzct[i].shape[2],dzct[i].shape[3],device=dzct[i].device)
                         dsr_i = ds_r[i].detach() if ds_r is not None and i < len(ds_r) and ds_r[i] is not None else None
                         dst_i = ds_t[i].detach() if ds_t is not None and i < len(ds_t) and ds_t[i] is not None else None
-                        dw = None
-                        if dsr_i is not None and dst_i is not None:
-                            dw = torch.min(dsr_i, dst_i) * (1 - torch.abs(dsr_i - dst_i))
                         dlc += compute_cross_modal_contrastive_loss(
-                            dzcr[i],dzct[i],gt,dDr_i,dDt_i,dw,dw,
+                            dzcr[i],dzct[i],gt,dDr_i,dDt_i,dsr_i,dst_i,
                             tau_c=self.contrast_tau,num_samples=self.contrast_num_samples,
                             ignore_label=255, pad_mask=pm)
                         dcnt += 1
@@ -782,6 +778,9 @@ class QualityGatedMiTMamba(BaseSegmentor):
             final_fused=fused,
             s_rgb=s_r, s_t=s_t,
             s_rgb_priv=spr, s_t_priv=spt,
+            q_rgb_maps=s_r, q_t_maps=s_t,
+            q_rgb_priv=spr, q_t_priv=spt,
+            clean_rgb_img=rgb, clean_t_img=t,
             deg_rgb_img=deg_rgb, deg_t_img=deg_t,
             deg_type_rgb=deg_type_rgb[0] if isinstance(deg_type_rgb, list) else deg_type_rgb,
             deg_type_t=deg_type_t[0] if isinstance(deg_type_t, list) else deg_type_t,
@@ -792,6 +791,8 @@ class QualityGatedMiTMamba(BaseSegmentor):
             final_fused_deg=fused_d,
             s_rgb_deg=ds_r_d, s_t_deg=ds_t_d,
             s_rgb_priv_deg=dspr_d, s_t_priv_deg=dspt_d,
+            q_rgb_deg=ds_r_d, q_t_deg=ds_t_d,
+            q_rgb_priv_deg=dspr_d, q_t_priv_deg=dspt_d,
         )
 
     def _decode_head_predict_logits(self, feats, head=None):

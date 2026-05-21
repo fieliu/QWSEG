@@ -1332,30 +1332,12 @@ class TrainVisHook(Hook):
                        deg_q_rgb_mask, deg_q_t_mask,
                        deg_q_rgb_mask, deg_q_t_mask, None])
             aspect_ratio = (img_w / max(img_h, 1)) if (img_h and img_w) else 1.0
-            deg_rgb_vis = deg_t_vis = None
-            if 'deg_rgb_img' in feats:
-                try:
-                    deg_rgb_t = feats['deg_rgb_img']
-                    deg_t_t = feats['deg_t_img']
-                    rgb_np = deg_rgb_t[0].cpu().permute(1, 2, 0).numpy()
-                    t_np = deg_t_t[0].cpu().permute(1, 2, 0).numpy()
-                    deg_rgb_vis = _to_uint8(rgb_np)
-                    t_gray = cv2.cvtColor(_to_uint8(t_np), cv2.COLOR_RGB2GRAY)
-                    deg_t_vis = np.stack([t_gray, t_gray, t_gray], axis=-1)
-                    deg_type_rgb = feats.get('deg_type_rgb', 'none')
-                    deg_type_t = feats.get('deg_type_t', 'none')
-                    if deg_type_rgb == 'missing':
-                        deg_rgb_vis = _add_missing_overlay(rgb_vis) if rgb_vis is not None else _add_text_overlay(deg_rgb_vis, 'MISSING')
-                    elif deg_type_rgb != 'none':
-                        deg_rgb_vis = _add_text_overlay(deg_rgb_vis, str(deg_type_rgb))
-                    if deg_type_t == 'missing':
-                        deg_t_vis = _add_missing_overlay(t_vis) if t_vis is not None else _add_text_overlay(deg_t_vis, 'MISSING')
-                    elif deg_type_t != 'none':
-                        deg_t_vis = _add_text_overlay(deg_t_vis, str(deg_type_t))
-                except Exception:
-                    pass
+            clean_rgb_vis = self._render_clean_images(feats, model)
+            deg_rgb_vis, deg_t_vis = self._render_degraded_images(
+                feats, model, raw_rgb=clean_rgb_vis[0], raw_t=clean_rgb_vis[1])
+            clean_rgb_cell, clean_t_cell = clean_rgb_vis
             q_grid = self._compose_v9_quality_vis(
-                q_info, rgb_vis=rgb_vis, t_vis=t_vis, aspect_ratio=aspect_ratio,
+                q_info, rgb_vis=clean_rgb_cell, t_vis=clean_t_cell, aspect_ratio=aspect_ratio,
                 deg_q_info=deg_q_info, deg_rgb_vis=deg_rgb_vis, deg_t_vis=deg_t_vis)
             return feat_rows, q_grid, deg_feat_rows
         elif model_type == 'v7_quality_adaptive':
@@ -1682,10 +1664,6 @@ class TrainVisHook(Hook):
         q_t = feats['q_t_maps']
         q_rgb_priv = feats.get('q_rgb_priv', q_rgb)
         q_t_priv = feats.get('q_t_priv', q_t)
-        D_rgb = feats.get('cum_D_rgb', feats.get('D_rgb', q_rgb))
-        D_t = feats.get('cum_D_t', feats.get('D_t', q_t))
-        D_rgb_priv = feats.get('cum_D_rgb_priv', feats.get('D_rgb_priv', D_rgb))
-        D_t_priv = feats.get('cum_D_t_priv', feats.get('D_t_priv', D_t))
         if img_h is not None and img_w is not None:
             h, w = img_h, img_w
         else:
@@ -1701,10 +1679,10 @@ class TrainVisHook(Hook):
                 t_hm=_quality_to_rgb_heatmap(_to_np(q_t, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
                 rgb_priv_hm=_quality_to_rgb_heatmap(_to_np(q_rgb_priv, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
                 t_priv_hm=_quality_to_rgb_heatmap(_to_np(q_t_priv, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
-                rgb_mask=(_to_np(D_rgb, i) >= self.mask_threshold).astype(np.float32),
-                t_mask=(_to_np(D_t, i) >= self.mask_threshold).astype(np.float32),
-                rgb_priv_mask=(_to_np(D_rgb_priv, i) >= self.mask_threshold).astype(np.float32),
-                t_priv_mask=(_to_np(D_t_priv, i) >= self.mask_threshold).astype(np.float32),
+                rgb_mask=(_to_np(q_rgb, i) >= self.mask_threshold).astype(np.float32),
+                t_mask=(_to_np(q_t, i) >= self.mask_threshold).astype(np.float32),
+                rgb_priv_mask=(_to_np(q_rgb_priv, i) >= self.mask_threshold).astype(np.float32),
+                t_priv_mask=(_to_np(q_t_priv, i) >= self.mask_threshold).astype(np.float32),
             ))
         return dict(stages=stages)
 
@@ -1715,10 +1693,6 @@ class TrainVisHook(Hook):
             return None
         q_rgb_priv_deg = feats.get('q_rgb_priv_deg', q_rgb_deg)
         q_t_priv_deg = feats.get('q_t_priv_deg', q_t_deg)
-        D_rgb_deg = feats.get('cum_D_rgb_deg', feats.get('D_rgb_deg', feats.get('D_rgb', q_rgb_deg)))
-        D_t_deg = feats.get('cum_D_t_deg', feats.get('D_t_deg', feats.get('D_t', q_t_deg)))
-        D_rgb_priv_deg = feats.get('cum_D_rgb_priv_deg', feats.get('D_rgb_priv_deg', D_rgb_deg))
-        D_t_priv_deg = feats.get('cum_D_t_priv_deg', feats.get('D_t_priv_deg', D_t_deg))
         if img_h is not None and img_w is not None:
             h, w = img_h, img_w
         else:
@@ -1736,10 +1710,10 @@ class TrainVisHook(Hook):
                 t_hm=_quality_to_rgb_heatmap(_to_np(q_t_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
                 rgb_priv_hm=_quality_to_rgb_heatmap(_to_np(q_rgb_priv_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
                 t_priv_hm=_quality_to_rgb_heatmap(_to_np(q_t_priv_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
-                rgb_mask=(_to_np(D_rgb_deg, i) >= self.mask_threshold).astype(np.float32),
-                t_mask=(_to_np(D_t_deg, i) >= self.mask_threshold).astype(np.float32),
-                rgb_priv_mask=(_to_np(D_rgb_priv_deg, i) >= self.mask_threshold).astype(np.float32),
-                t_priv_mask=(_to_np(D_t_priv_deg, i) >= self.mask_threshold).astype(np.float32),
+                rgb_mask=(_to_np(q_rgb_deg, i) >= self.mask_threshold).astype(np.float32),
+                t_mask=(_to_np(q_t_deg, i) >= self.mask_threshold).astype(np.float32),
+                rgb_priv_mask=(_to_np(q_rgb_priv_deg, i) >= self.mask_threshold).astype(np.float32),
+                t_priv_mask=(_to_np(q_t_priv_deg, i) >= self.mask_threshold).astype(np.float32),
             ))
         return dict(stages=stages)
 
@@ -1881,6 +1855,32 @@ class TrainVisHook(Hook):
             q_2d = q_np
         mask = (q_2d >= self.mask_threshold).astype(np.float32)
         return mask
+
+    def _render_clean_images(self, feats, model):
+        clean_rgb = feats.get('clean_rgb_img')
+        clean_t = feats.get('clean_t_img')
+        if clean_rgb is None:
+            return None, None
+        try:
+            rgb_mean = model.data_preprocessor.mean[:3].flatten().cpu()
+            rgb_std = model.data_preprocessor.std[:3].flatten().cpu()
+            ir_mean = model.data_preprocessor.mean[3:].flatten().cpu()
+            ir_std = model.data_preprocessor.std[3:].flatten().cpu()
+            rgb_raw = clean_rgb[0].cpu() * rgb_std.view(3, 1, 1) + rgb_mean.view(3, 1, 1)
+            rgb_raw = rgb_raw.clamp(0, 255) / 255.0
+            rgb_np = rgb_raw.permute(1, 2, 0).numpy()
+            rgb_vis = _to_uint8(rgb_np)
+            t_raw = clean_t[0].cpu() * ir_std.view(3, 1, 1) + ir_mean.view(3, 1, 1)
+            t_raw = t_raw.clamp(0, 255) / 255.0
+            t_np = t_raw.permute(1, 2, 0).numpy()
+            t_gray = cv2.cvtColor(_to_uint8(t_np), cv2.COLOR_RGB2GRAY)
+            t_vis = np.stack([t_gray, t_gray, t_gray], axis=-1)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            rgb_vis = np.zeros((self.short_side, self.short_side, 3), dtype=np.uint8)
+            t_vis = np.zeros((self.short_side, self.short_side, 3), dtype=np.uint8)
+        return rgb_vis, t_vis
 
     def _render_degraded_images(self, feats, model, raw_rgb=None, raw_t=None):
         deg_rgb = feats['deg_rgb_img']
@@ -2154,8 +2154,12 @@ class TrainVisHook(Hook):
                           'v12_nodeg_quality_disentangle',
                           'ab_v9',
                           'mit_quality_mamba', 'swin_quality_mask2former') and 'deg_rgb_img' in feats:
+            if model_type in ('mit_quality_mamba', 'swin_quality_mask2former'):
+                clean_rgb_vis, clean_t_vis = self._render_clean_images(feats, model)
+            else:
+                clean_rgb_vis, clean_t_vis = rgb_vis, t_vis
             deg_rgb_vis, deg_t_vis = self._render_degraded_images(
-                feats, model, raw_rgb=rgb_vis, raw_t=t_vis)
+                feats, model, raw_rgb=clean_rgb_vis, raw_t=clean_t_vis)
 
             deg_rgb_t = feats['deg_rgb_img']
             deg_t_t = feats['deg_t_img']
@@ -2202,7 +2206,7 @@ class TrainVisHook(Hook):
                     deg_pred_vis=deg_pred_vis)
             elif model_type in ('mit_quality_mamba', 'swin_quality_mask2former'):
                 grid = _compose_v9_ablation_vis(
-                    rgb_vis, t_vis, feat_rows, label_vis, pred_vis,
+                    clean_rgb_vis, clean_t_vis, feat_rows, label_vis, pred_vis,
                     self.short_side, title=title,
                     col_headers=col_headers, row_labels=row_labels,
                     decoder_preds=decoder_preds, aspect_ratio=aspect_ratio,
@@ -2501,7 +2505,10 @@ class TrainVisHook(Hook):
             if loss_str:
                 title += f' | {loss_str}'
             if model_type in ('mit_quality_mamba', 'swin_quality_mask2former'):
-                grid = _compose_v9_ablation_vis(rgb_vis, t_vis, feat_rows, label_vis, pred_vis,
+                clean_rgb_vis2, clean_t_vis2 = self._render_clean_images(feats, model)
+                if clean_rgb_vis2 is None:
+                    clean_rgb_vis2, clean_t_vis2 = rgb_vis, t_vis
+                grid = _compose_v9_ablation_vis(clean_rgb_vis2, clean_t_vis2, feat_rows, label_vis, pred_vis,
                                                 self.short_side, title=title,
                                                 col_headers=col_headers, row_labels=row_labels,
                                                 decoder_preds=decoder_preds,

@@ -35,6 +35,15 @@ class QualityPredictor(nn.Module):
         self.conv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
         self.score_head = nn.Conv2d(hidden, 1, 1, bias=True)
         nn.init.constant_(self.score_head.bias, 4.0)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        nn.init.constant_(self.score_head.bias, 4.0)
 
     def forward(self, x, mask):
         x = x.permute(0, 2, 3, 1)

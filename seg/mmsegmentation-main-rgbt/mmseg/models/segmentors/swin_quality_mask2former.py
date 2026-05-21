@@ -349,14 +349,14 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
                 s_combined, window_size, shift_size, tau=tau, alpha=alpha)
             x = block(x, (H, W), quality_bias=quality_bias)
 
-        x = x * hard_mask.view(B_tok, H * W, 1)
-
         if i in swin_branch.out_indices:
             norm_layer = getattr(swin_branch, f'norm{i}', None)
             out = norm_layer(x) if norm_layer is not None else x
+            out = out * hard_mask.view(B_tok, H * W, 1)
             stage_out = out.view(B_tok, H, W, -1).permute(0, 3, 1, 2).contiguous()
             outs.append(stage_out)
 
+        x = x * hard_mask.view(B_tok, H * W, 1)
         if downsample is not None:
             x, (H, W) = downsample(x, (H, W))
 
@@ -413,14 +413,14 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
                 s, window_size, shift_size, tau=tau, alpha=alpha)
             x = block(x, (H, W), quality_bias=quality_bias)
 
-        x = x * hard_mask.view(B_tok, H * W, 1)
-
         if i in swin_branch.out_indices:
             norm_layer = getattr(swin_branch, f'norm{i}', None)
             out = norm_layer(x) if norm_layer is not None else x
+            out = out * hard_mask.view(B_tok, H * W, 1)
             stage_out = out.view(B_tok, H, W, -1).permute(0, 3, 1, 2).contiguous()
             outs.append(stage_out)
 
+        x = x * hard_mask.view(B_tok, H * W, 1)
         if downsample is not None:
             x, (H, W) = downsample(x, (H, W))
 
@@ -467,7 +467,11 @@ class MultiScaleRefine(nn.Module):
         x_fused = self.act(x_fused) * self.channel_attn(x_fused)
 
         # 4. 残差连接（使用归一化后的 x_norm），保持 Pre-Norm 范式
-        return x_norm + self.out_conv(x_fused)
+        out = x_norm + self.out_conv(x_fused)
+        out = out.permute(0, 2, 3, 1).contiguous()
+        out = F.layer_norm(out, [out.size(-1)])
+        out = out.permute(0, 3, 1, 2).contiguous()
+        return out
 
 class DualGateEnhancedFusion(nn.Module):
     def __init__(self, in_channels_list):
@@ -514,7 +518,11 @@ class DualGateEnhancedFusion(nn.Module):
             # 主分支变换
             out = self.post_convs[i](fused_norm)
             # 残差 = 归一化后的 fused
-            fused_list.append(Fg + out)
+            fused_out = Fg + out
+            fused_out = fused_out.permute(0, 2, 3, 1).contiguous()
+            fused_out = F.layer_norm(fused_out, [fused_out.size(-1)])
+            fused_out = fused_out.permute(0, 3, 1, 2).contiguous()
+            fused_list.append(fused_out)
 
         return fused_list
 
@@ -766,17 +774,11 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             self.private_branch_rgb, rgb, self.predictors_priv_rgb,
             training=self.training, force_all_keep=fa, phase=ph,
             tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard)
-        for i in range(len(zp_r)):
-            if zp_r[i] is not None and spr[i] is not None:
-                zp_r[i] = zp_r[i] * f_fuse(spr[i], tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
 
         zp_t, spt = _forward_swin_branch_pruned(
             self.private_branch_t, t, self.predictors_priv_t,
             training=self.training, force_all_keep=fa, phase=ph,
             tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard)
-        for i in range(len(zp_t)):
-            if zp_t[i] is not None and spt[i] is not None:
-                zp_t[i] = zp_t[i] * f_fuse(spt[i], tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
 
         zf, re, te = [], [], []
         for i in range(len(self.embed_dims_list)):
@@ -863,11 +865,8 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                     Dt = (s_t[i] > self.tau).float().detach() if s_t[i] is not None else torch.ones(B,1,zc_t[i].shape[2],zc_t[i].shape[3],device=zc_t[i].device)
                     sr_i = s_r[i].detach() if s_r[i] is not None else None
                     st_i = s_t[i].detach() if s_t[i] is not None else None
-                    w = None
-                    if sr_i is not None and st_i is not None:
-                        w = torch.min(sr_i, st_i) * (1 - torch.abs(sr_i - st_i))
                     lc += compute_cross_modal_contrastive_loss(
-                        zc_r[i],zc_t[i],gt,Dr,Dt,w,w,
+                        zc_r[i],zc_t[i],gt,Dr,Dt,sr_i,st_i,
                         tau_c=self.contrast_tau,num_samples=self.contrast_num_samples,
                         ignore_label=255, pad_mask=pm)
                     cnt += 1
@@ -898,11 +897,8 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                         dDt_i = (ds_t[i] > self.tau).float().detach() if ds_t is not None and i < len(ds_t) and ds_t[i] is not None else torch.ones(B,1,dzct[i].shape[2],dzct[i].shape[3],device=dzct[i].device)
                         dsr_i = ds_r[i].detach() if ds_r is not None and i < len(ds_r) and ds_r[i] is not None else None
                         dst_i = ds_t[i].detach() if ds_t is not None and i < len(ds_t) and ds_t[i] is not None else None
-                        dw = None
-                        if dsr_i is not None and dst_i is not None:
-                            dw = torch.min(dsr_i, dst_i) * (1 - torch.abs(dsr_i - dst_i))
                         dlc += compute_cross_modal_contrastive_loss(
-                            dzcr[i],dzct[i],gt,dDr_i,dDt_i,dw,dw,
+                            dzcr[i],dzct[i],gt,dDr_i,dDt_i,dsr_i,dst_i,
                             tau_c=self.contrast_tau,num_samples=self.contrast_num_samples,
                             ignore_label=255, pad_mask=pm)
                         dcnt += 1
@@ -996,6 +992,9 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             final_fused=fused,
             s_rgb=s_r, s_t=s_t,
             s_rgb_priv=spr, s_t_priv=spt,
+            q_rgb_maps=s_r, q_t_maps=s_t,
+            q_rgb_priv=spr, q_t_priv=spt,
+            clean_rgb_img=rgb, clean_t_img=t,
             deg_rgb_img=deg_rgb, deg_t_img=deg_t,
             deg_type_rgb=deg_type_rgb[0] if isinstance(deg_type_rgb, list) else deg_type_rgb,
             deg_type_t=deg_type_t[0] if isinstance(deg_type_t, list) else deg_type_t,
@@ -1006,6 +1005,8 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             final_fused_deg=fused_d,
             s_rgb_deg=ds_r_d, s_t_deg=ds_t_d,
             s_rgb_priv_deg=dspr_d, s_t_priv_deg=dspt_d,
+            q_rgb_deg=ds_r_d, q_t_deg=ds_t_d,
+            q_rgb_priv_deg=dspr_d, q_t_priv_deg=dspt_d,
         )
 
     def _decode_head_predict_logits(self, feats, head=None):

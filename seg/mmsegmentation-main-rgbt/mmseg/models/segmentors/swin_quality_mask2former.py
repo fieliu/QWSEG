@@ -308,6 +308,18 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
     for i, stage in enumerate(stages):
         blocks, downsample = stage.blocks, stage.downsample
 
+        if cum_D_rgb is not None or cum_D_t is not None:
+            prev_D_rgb = cum_D_rgb.float() if cum_D_rgb is not None else \
+                torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
+            prev_D_t = cum_D_t.float() if cum_D_t is not None else \
+                torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
+            if prev_D_rgb.shape[2:] != (H, W):
+                prev_D_rgb = F.adaptive_max_pool2d(prev_D_rgb, (H, W))
+            if prev_D_t.shape[2:] != (H, W):
+                prev_D_t = F.adaptive_max_pool2d(prev_D_t, (H, W))
+            prev_D = torch.cat([prev_D_rgb, prev_D_t], dim=0)
+            x = x * prev_D.detach().view(B_tok, H * W, 1)
+
         prev_mask_rgb = cum_D_rgb if cum_D_rgb is not None else \
             torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
         prev_mask_t = cum_D_t if cum_D_t is not None else \
@@ -421,6 +433,13 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
     for i, stage in enumerate(stages):
         blocks, downsample = stage.blocks, stage.downsample
         D_raw = q_weight = None
+
+        if cum_D is not None:
+            prev_D = cum_D.float()
+            if prev_D.shape[2:] != (H, W):
+                prev_D = F.adaptive_max_pool2d(prev_D, (H, W))
+            x = x * prev_D.detach().view(B_tok, H * W, 1)
+
         prev_mask = cum_D if cum_D is not None else \
             torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
 

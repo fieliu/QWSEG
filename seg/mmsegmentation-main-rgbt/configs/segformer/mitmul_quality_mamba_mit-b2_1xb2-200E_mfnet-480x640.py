@@ -129,7 +129,7 @@ for pred_name in ['predictors_common_rgb', 'predictors_common_t',
                   'predictors_priv_rgb', 'predictors_priv_t']:
     predictor_keys[f'{pred_name}'] = dict(lr_mult=5.0, decay_mult=1.0)
     for stage_id in range(4):
-        for sub in ['local_conv1', 'local_conv2', 'fuse_conv1', 'fuse_conv2',
+        for sub in ['norm1', 'conv1', 'norm2', 'conv2',
                     'gate_head', 'weight_head']:
             predictor_keys[f'{pred_name}.{stage_id}.{sub}'] = dict(lr_mult=5.0, decay_mult=1.0)
 

@@ -174,7 +174,9 @@ custom_keys = {
     'relative_position_bias_table': backbone_embed_multi,
     'query_embed': embed_multi,
     'query_feat': embed_multi,
-    'level_embed': embed_multi
+    'level_embed': embed_multi,
+    'private_branch_rgb': dict(lr_mult=0.1, decay_mult=1.0),
+    'private_branch_t': dict(lr_mult=0.1, decay_mult=1.0),
 }
 custom_keys.update({
     f'backbone.rgb_branch.stages.{stage_id}.blocks.{block_id}.norm': backbone_norm_multi
@@ -194,6 +196,31 @@ custom_keys.update({
     f'backbone.thr_branch.stages.{stage_id}.downsample.norm': backbone_norm_multi
     for stage_id in range(len(depths) - 1)
 })
+for priv_branch in ['private_branch_rgb', 'private_branch_t']:
+    custom_keys.update({
+        f'{priv_branch}.stages.{stage_id}.blocks.{block_id}.norm': backbone_norm_multi
+        for stage_id, num_blocks in enumerate(depths)
+        for block_id in range(num_blocks)
+    })
+    custom_keys.update({
+        f'{priv_branch}.stages.{stage_id}.downsample.norm': backbone_norm_multi
+        for stage_id in range(len(depths) - 1)
+    })
+    custom_keys.update({
+        f'{priv_branch}.norm{i}': backbone_norm_multi
+        for i in range(len(depths))
+    })
+
+predictor_keys = {}
+for pred_name in ['predictors_common_rgb', 'predictors_common_t',
+                  'predictors_priv_rgb', 'predictors_priv_t']:
+    predictor_keys[f'{pred_name}'] = dict(lr_mult=5.0, decay_mult=1.0)
+    for stage_id in range(4):
+        for sub in ['norm1', 'conv1', 'norm2', 'conv2',
+                    'gate_head', 'weight_head']:
+            predictor_keys[f'{pred_name}.{stage_id}.{sub}'] = dict(lr_mult=5.0, decay_mult=1.0)
+
+custom_keys.update(predictor_keys)
 
 optimizer = dict(
     type='AdamW', lr=0.00006, weight_decay=0.01, eps=1e-8, betas=(0.9, 0.999))

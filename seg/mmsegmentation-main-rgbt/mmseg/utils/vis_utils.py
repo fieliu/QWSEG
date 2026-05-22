@@ -221,6 +221,8 @@ def detect_model_type(model):
         return 'swin_quality_mask2former'
     if type_name == 'SwinBaselineMask2Former':
         return 'swin_baseline_mask2former'
+    if type_name == 'MiTBaselineMamba':
+        return 'mit_baseline_mamba'
     return 'unknown'
 
 

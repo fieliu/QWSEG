@@ -733,7 +733,8 @@ class TrainVisHook(Hook):
                             fused=fused_feats,
                             q_rgb_maps=q_rgb_maps, q_t_maps=q_t_maps)
             elif model_type in ('mit_quality_mamba', 'swin_quality_mask2former',
-                                'swin_baseline_mask2former'):
+                                'swin_baseline_mask2former',
+                                'mit_baseline_mamba'):
                 input_rgb = proc_inputs[:, :3, :, :]
                 input_ir = proc_inputs[:, 3:, :, :]
                 input_rgbt = torch.cat([input_rgb, input_ir], dim=0)
@@ -1336,7 +1337,7 @@ class TrainVisHook(Hook):
                 q_info, rgb_vis=clean_rgb_cell, t_vis=clean_t_cell, aspect_ratio=aspect_ratio,
                 deg_q_info=deg_q_info, deg_rgb_vis=deg_rgb_vis, deg_t_vis=deg_t_vis)
             return feat_rows, q_grid, deg_feat_rows
-        elif model_type == 'swin_baseline_mask2former':
+        elif model_type in ('swin_baseline_mask2former', 'mit_baseline_mamba'):
             feat_rows = _build_feat_rows(
                 [feats['zc_rgb'], feats['zc_t'], feats['zc_fused'],
                  feats['zp_rgb'], feats['zp_t'],
@@ -2107,7 +2108,7 @@ class TrainVisHook(Hook):
             aspect_ratio = proc_inputs.shape[-1] / max(proc_inputs.shape[-2], 1)
 
         if model_type in ('mit_quality_mamba', 'swin_quality_mask2former',
-                          'swin_baseline_mask2former'):
+                          'swin_baseline_mask2former', 'mit_baseline_mamba'):
             col_headers = ['zc_rgb', 'zc_t', 'zc_fused',
                            'zp_rgb', 'zp_t',
                            'rgb_pf', 't_pf', 'final']
@@ -2161,9 +2162,11 @@ class TrainVisHook(Hook):
                           'v12_nodeg_quality_disentangle',
                           'ab_v9',
                           'mit_quality_mamba', 'swin_quality_mask2former',
-                          'swin_baseline_mask2former') and 'deg_rgb_img' in feats:
+                          'swin_baseline_mask2former',
+                          'mit_baseline_mamba') and 'deg_rgb_img' in feats:
             if model_type in ('mit_quality_mamba', 'swin_quality_mask2former',
-                              'swin_baseline_mask2former'):
+                              'swin_baseline_mask2former',
+                              'mit_baseline_mamba'):
                 clean_rgb_vis, clean_t_vis = self._render_clean_images(feats, model)
             else:
                 clean_rgb_vis, clean_t_vis = rgb_vis, t_vis
@@ -2214,7 +2217,8 @@ class TrainVisHook(Hook):
                     deg_decoder_preds=deg_decoder_preds,
                     deg_pred_vis=deg_pred_vis)
             elif model_type in ('mit_quality_mamba', 'swin_quality_mask2former',
-                                'swin_baseline_mask2former'):
+                                'swin_baseline_mask2former',
+                                'mit_baseline_mamba'):
                 grid = _compose_v9_ablation_vis(
                     clean_rgb_vis, clean_t_vis, feat_rows, label_vis, pred_vis,
                     self.short_side, title=title,
@@ -2515,7 +2519,8 @@ class TrainVisHook(Hook):
             if loss_str:
                 title += f' | {loss_str}'
             if model_type in ('mit_quality_mamba', 'swin_quality_mask2former',
-                              'swin_baseline_mask2former'):
+                              'swin_baseline_mask2former',
+                              'mit_baseline_mamba'):
                 clean_rgb_vis2, clean_t_vis2 = self._render_clean_images(feats, model)
                 if clean_rgb_vis2 is None:
                     clean_rgb_vis2, clean_t_vis2 = rgb_vis, t_vis

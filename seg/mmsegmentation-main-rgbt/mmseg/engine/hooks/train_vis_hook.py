@@ -1318,8 +1318,6 @@ class TrainVisHook(Hook):
         elif model_type in ('mit_quality_mamba', 'swin_quality_mask2former'):
             q_info = self._create_v9_quality_vis(feats, img_h=img_h, img_w=img_w)
             deg_q_info = self._create_v9_deg_quality_vis(feats, img_h=img_h, img_w=img_w)
-            deg_q_rgb_mask = self._get_v12d_quality_mask(feats['q_rgb_deg'])
-            deg_q_t_mask = self._get_v12d_quality_mask(feats['q_t_deg'])
             feat_rows = _build_feat_rows(
                 [feats['zc_rgb'], feats['zc_t'], feats['zc_fused'],
                  feats['zp_rgb'], feats['zp_t'],
@@ -1327,14 +1325,11 @@ class TrainVisHook(Hook):
             deg_feat_rows = _build_feat_rows(
                 [feats['zc_rgb_deg'], feats['zc_t_deg'], feats['zc_fused_deg'],
                  feats['zp_rgb_deg'], feats['zp_t_deg'],
-                 feats['rgb_pf_deg'], feats['t_pf_deg'], feats['final_fused_deg']],
-                masks=[deg_q_rgb_mask, deg_q_t_mask, None,
-                       deg_q_rgb_mask, deg_q_t_mask,
-                       deg_q_rgb_mask, deg_q_t_mask, None])
+                 feats['rgb_pf_deg'], feats['t_pf_deg'], feats['final_fused_deg']])
             aspect_ratio = (img_w / max(img_h, 1)) if (img_h and img_w) else 1.0
-            clean_rgb_vis = self._render_clean_images(feats, model)
+            clean_rgb_vis = self._render_clean_images(feats, runner.model)
             deg_rgb_vis, deg_t_vis = self._render_degraded_images(
-                feats, model, raw_rgb=clean_rgb_vis[0], raw_t=clean_rgb_vis[1])
+                feats, runner.model, raw_rgb=clean_rgb_vis[0], raw_t=clean_rgb_vis[1])
             clean_rgb_cell, clean_t_cell = clean_rgb_vis
             q_grid = self._compose_v9_quality_vis(
                 q_info, rgb_vis=clean_rgb_cell, t_vis=clean_t_cell, aspect_ratio=aspect_ratio,

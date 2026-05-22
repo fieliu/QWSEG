@@ -74,16 +74,16 @@ def f_attn(s, tau=0.3, alpha=10.0):
     return torch.where(s > tau, torch.zeros_like(s), -alpha * (tau - s) / tau)
 
 
-def f_fuse(s, tau=0.3, epsilon=1e-3, beta=2.0):
+def f_fuse(s, tau=0.3, epsilon=1e-3, beta=6.0):
     """Fusion weight function: quality-modulated weight.
 
     s > tau: s (direct quality score as weight)
-    s <= tau: epsilon + (1 - epsilon) * (s / tau) ** beta (rapidly decaying weight)
+    s <= tau: epsilon + (tau - epsilon) * (s / tau) ** beta (rapidly decaying weight, continuous at tau)
     """
-    return torch.where(s > tau, s, epsilon + (1 - epsilon) * (s / tau) ** beta)
+    return torch.where(s > tau, s, epsilon + (tau - epsilon) * (s / tau) ** beta)
 
 
-def f_hard_mask(s, tau_hard=0.05):
+def f_hard_mask(s, tau_hard=0.2):
     """Optional hard zeroing mask for extremely low-quality tokens.
 
     s < tau_hard: 0.0 (completely zeroed)
@@ -99,10 +99,10 @@ class QualityModulatedFusion(nn.Module):
     Step 1: Quality-modulate private features with f_fuse(s_priv).
     Step 2: Channel-concatenate [F_gen, priv_modulated].
     Step 3: 1x1 conv MLP (2C -> C) + GELU.
-    Step 4: Residual + LayerNorm.
+    Step 4: LayerNorm.
     """
 
-    def __init__(self, d_model, tau=0.3, epsilon=1e-3, beta=2.0, tau_hard=0.05):
+    def __init__(self, d_model, tau=0.3, epsilon=1e-3, beta=6.0, tau_hard=0.2):
         super().__init__()
         self.tau = tau
         self.epsilon = epsilon
@@ -113,15 +113,14 @@ class QualityModulatedFusion(nn.Module):
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, F_gen, F_priv, s_priv):
+        hard_mask = f_hard_mask(s_priv, tau_hard=self.tau_hard)
+        F_priv = F_priv * hard_mask
         w = f_fuse(s_priv, tau=self.tau, epsilon=self.epsilon, beta=self.beta)
         priv_modulated = F_priv * w
-        hard_mask = f_hard_mask(s_priv, tau_hard=self.tau_hard)
-        priv_modulated = priv_modulated * hard_mask
         x = torch.cat([F_gen, priv_modulated], dim=1)
         x = self.fuse_conv(x)
         x = self.act(x)
-        out = F_gen + x
-        out = self.norm(out.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        out = self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         return out
 
 

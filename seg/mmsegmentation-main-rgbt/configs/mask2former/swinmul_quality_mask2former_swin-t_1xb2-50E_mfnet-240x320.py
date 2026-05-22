@@ -239,6 +239,11 @@ model = dict(
     missing_ratio=0.3,
     global_deg_ratio=0.3,
     local_deg_ratio=0.4,
+    tau=0.3,
+    alpha=10.0,
+    tau_hard=0.2,
+    fuse_epsilon=1e-3,
+    fuse_beta=6.0,
     test_cfg=dict(mode='slide', crop_size=crop_size, stride=(160, 214)))
 
 backbone_norm_multi = dict(lr_mult=0.1, decay_mult=0.0)
@@ -326,4 +331,4 @@ default_hooks = dict(
     sampler_seed=dict(type='DistSamplerSeedHook'),
     visualization=dict(type='SegVisualizationHook'))
 
-custom_hooks = [dict(type='TrainVisHook', interval=2, num_samples=2)]
+custom_hooks = [dict(type='TrainVisHook', interval=2, num_samples=2, mask_threshold=0.3)]

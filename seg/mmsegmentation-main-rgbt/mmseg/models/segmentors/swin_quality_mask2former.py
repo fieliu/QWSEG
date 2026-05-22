@@ -303,7 +303,7 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
                                       predictors_rgb, predictors_t,
                                       training=True,
                                       force_all_keep=False, phase=3,
-                                      tau=0.3, alpha=10.0, tau_hard=0.05):
+                                      tau=0.3, alpha=10.0, tau_hard=0.2):
     """Quality-aware forward through a single Swin backbone for both modalities.
 
     Uses continuous quality score with piecewise modulation instead of
@@ -370,7 +370,7 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
 def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
                                  training=True,
                                  force_all_keep=False, phase=3,
-                                 tau=0.3, alpha=10.0, tau_hard=0.05):
+                                 tau=0.3, alpha=10.0, tau_hard=0.2):
     """Quality-aware forward through a single Swin branch.
 
     Uses continuous quality score with piecewise modulation instead of
@@ -578,9 +578,9 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                  mamba_expand: int = 2,
                  tau: float = 0.3,
                  alpha: float = 10.0,
-                 tau_hard: float = 0.05,
+                 tau_hard: float = 0.2,
                  fuse_epsilon: float = 1e-3,
-                 fuse_beta: float = 2.0,
+                 fuse_beta: float = 6.0,
                  skip_phases: bool = False,
                  init_cfg: OptMultiConfig = None):
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
@@ -603,6 +603,11 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         depths = backbone.get('depths', [2, 2, 6, 2])
         self.embed_dims_list = [embed_dims * (2 ** i) for i in range(len(depths))]
 
+        self.tau = tau
+        self.alpha = alpha
+        self.tau_hard = tau_hard
+        self.fuse_epsilon = fuse_epsilon
+        self.fuse_beta = fuse_beta
         self._build_predictors()
         self._build_fusion(mamba_d_state, mamba_d_conv, mamba_expand)
         self.common_refine = nn.ModuleList([MultiScaleRefine(ch) for ch in self.embed_dims_list])
@@ -622,11 +627,6 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         self.missing_ratio, self.global_deg_ratio = missing_ratio, global_deg_ratio
         self.local_deg_ratio = local_deg_ratio
         self.skip_phases = skip_phases
-        self.tau = tau
-        self.alpha = alpha
-        self.tau_hard = tau_hard
-        self.fuse_epsilon = fuse_epsilon
-        self.fuse_beta = fuse_beta
 
     def _build_predictors(self):
         self.predictors_common_rgb = nn.ModuleList(
@@ -679,6 +679,8 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         return valid
 
     def _get_training_phase(self, epoch):
+        if self.skip_phases:
+            return 3
         if self.phase_mode == 'ratio':
             r = min(epoch / max(self.total_epochs, 1), 1.0)
             if r < 0.1: return 1

@@ -1,272 +1,228 @@
-# QWSEG: Quality-Aware RGB-Thermal Segmentation
+# QWSEG: Quality-Aware Piecewise Soft Modulation for RGB-Thermal Segmentation
 
 ## Architecture Overview
 
-QWSEG is a quality-aware multi-modal segmentation framework that disentangles RGB-Thermal features into **common (通用)** and **private (私有)** components, with quality-guided fusion at every stage.
+QWSEG is a quality-aware multi-modal segmentation framework that disentangles RGB-Thermal features into **common (通用)** and **private (私有)** components, with **piecewise soft modulation** guiding fusion at every stage.
+
+### Core Idea
+
+Instead of hard binary gating (keep/prune), QWSEG predicts continuous quality scores `s ∈ [0,1]` and applies three complementary piecewise functions — hard zeroing, attention bias, and fusion weight decay — to progressively control low-quality token influence.
 
 ### Core Pipeline
 
 ```
-Input RGB ──┐                              ┌── Quality Pyramid Net (RGB) ── q_rgb_maps
+Input RGB ──┐                              ┌── QualityPredictor (RGB) × 4 stages ── s_rgb
              │                              │
-             ├── Common Backbone (MiT/Swin) ├── Quality-Weighted Common Fusion ── zc_fused
-             │                              │
-Input T ────┘                              └── Quality Pyramid Net (T) ──── q_t_maps
+             ├── Common Backbone (Swin/MiT) ├── Quality-Weighted Common Fusion ── zc_fused
+             │   (weight-shared, RGB+T      │
+             │    concatenated along batch)  └── QualityPredictor (T) × 4 stages ── s_t
+             │
+Input T ────┘
 
-Input RGB ── Private Branch RGB ── zp_rgb ── CrossAttn Enhance ── rgb_enhanced ──┐
-                                                                                  ├── Quality-Weighted Final Fusion ── final_fused ── Decode Head
-Input T ──── Private Branch T ──── zp_t ─── CrossAttn Enhance ── t_enhanced ────┘
+Input RGB ── Private Branch RGB ── QualityPredictor × 4 ── zp_rgb ── QualityModulatedFusion ── rgb_enhanced ──┐
+                                                                                                               ├── DualGateEnhancedFusion ── final_fused ── Decode Head
+Input T ──── Private Branch T ──── QualityPredictor × 4 ── zp_t ──── QualityModulatedFusion ── t_enhanced ────┘
 ```
 
 ### Stage-by-Stage Detail
 
-#### 1. Quality Pyramid Network
+#### 1. QualityPredictor
 
-A lightweight network that predicts per-pixel quality scores for each modality at multiple scales.
+A lightweight per-stage module that predicts per-pixel quality scores from feature maps.
 
-- Input: RGB image / Thermal image
-- Output: Multi-scale quality maps `q_rgb_maps[i]`, `q_t_maps[i]` (i = 0..3)
-- Each quality map has shape `(B, 1, H_i, W_i)`, values in `[0, 1]`
-- Pretrained on quality classification, optionally frozen for initial epochs
+- Input: Feature map `x ∈ [B, C, H, W]` (detached from gradient for quality prediction)
+- Output: Quality score `s ∈ [B, 1, H, W]`, values in `[1e-7, 1-1e-7]`
+- Architecture: `LayerNorm(C) → Conv1×1(C→hidden) → GELU → LayerNorm(hidden) → Conv1×1(hidden→hidden) → GELU → Conv1×1(hidden→1, bias=4.0) → Sigmoid → clamp`
+- `hidden = min(128, max(64, C//2))`
+- Bias initialization = 4.0 → `sigmoid(4.0) ≈ 0.98`, preventing erroneous pruning at training start
+- All conv layers: Kaiming Normal (`fan_in`, adapted for GELU)
+- Total: 16 predictors (4 stages × 4 sets: common RGB, common T, private RGB, private T)
 
-#### 2. Common Branch (Quality-Aware Backbone)
+#### 2. Three-Level Progressive Quality Modulation
 
-Both modalities are concatenated along the batch dimension and processed by a shared backbone (MiT-B2 or Swin-T). At each stage:
+Given quality score `s ∈ [0,1]`, three piecewise functions work cooperatively:
 
-1. **Quality Mask Generation** (`_get_keep_mask_1d`):
-   - For each pixel position, if quality < threshold (default 0.3), the token is masked
-   - **Dual-low protection**: When both modalities are low quality at the same position, the modality with higher quality is **kept** (mask=1.0), the other is soft-masked (mask=0.01)
-   - This ensures no position is completely zeroed out
+| Function | Formula | Granularity | Role |
+|----------|---------|-------------|------|
+| `f_hard_mask` | `s < 0.2 → 0; s ≥ 0.2 → 1` (detached) | Coarsest | Safety net: completely remove hopeless tokens |
+| `f_attn` | `s > 0.3 → 0; s ≤ 0.3 → -10×(0.3-s)/0.3` | Intermediate | Suppress low-quality tokens in attention |
+| `f_fuse` | `s > 0.3 → s; s ≤ 0.3 → ε+(0.3-ε)×(s/0.3)^6` | Finest | Decay fusion weight for low-quality tokens |
 
-2. **Token Masking**: Features are multiplied by the keep_mask before entering the transformer block
-3. **Residual Zeroing**: After each attention sub-block, low-quality tokens' residuals are zeroed to prevent contamination
+**Synergy table:**
 
-Output: `zc_rgb_list[i]`, `zc_t_list[i]` — quality-aware common features per stage
+| Quality Range | f_hard_mask | f_attn | f_fuse | Effect |
+|---------------|-------------|--------|--------|--------|
+| s < 0.2 | 0 (zeroed) | Very strong negative bias | ≈ε | Completely removed |
+| 0.2 ≤ s < 0.3 | 1 (kept) | Negative bias (strong→weak) | 0.001→0.3 | Attention suppressed, fusion minimal |
+| s ≥ 0.3 | 1 (kept) | 0 (no bias) | s (0.3→1.0) | Normal participation |
 
-#### 3. Quality-Weighted Common Fusion
+#### 3. Common Branch (Quality-Aware Backbone)
 
-At each stage, RGB and Thermal common features are fused:
+Both modalities are concatenated along the batch dimension and processed by a shared backbone (Swin-T or MiT-B2). At each stage:
 
-```
-zc_fused = (q_rgb / (q_rgb + q_t + eps)) * zc_rgb + (q_t / (q_rgb + q_t + eps)) * zc_t
-```
+1. **Quality Prediction**: QualityPredictor predicts `s_rgb` and `s_t` from detached features
+2. **Attention Bias Injection**: `f_attn(s)` is added to attention scores, suppressing low-quality tokens
+   - **Swin**: Bias converted to per-window format via `_quality_score_to_swin_bias`, aligned with cyclic shift for SW-MSA
+   - **MiT**: Bias downsampled to match K resolution via `adaptive_avg_pool2d`
+3. **Hard Zeroing After Norm**: After stage norm_layer, features are multiplied by `f_hard_mask(s)` to ensure clean output
+4. **Hard Zeroing Before Downsample**: Before PatchMerging, features are multiplied by `f_hard_mask(s)` to prevent low-quality information spread
 
-- **Both-low handling**: When `q_rgb < threshold AND q_t < threshold`, directly use the feature from the higher-quality modality (no weighted sum, avoids NaN)
-- Result: `zc_fused_list[i]` — fully high-quality common features
+**Critical ordering**: `norm → mask` (not `mask → norm`), because LayerNorm maps zero vectors to learnable bias β, causing "resurrection".
 
-#### 4. Private Branch with Cross-Attention Enhancement
+Output: `zc_rgb[i]`, `zc_t[i]` — quality-aware common features per stage
 
-Each modality has its own private branch (same architecture as backbone, separate weights). Private features are enhanced via cross-attention with common features:
+#### 4. Quality-Weighted Common Fusion
 
-**CrossAttentionEnhance**:
-```
-Query  = Private Feature (zp_rgb or zp_t)     — carries modality-specific details
-Key    = Common Fused Feature (zc_fused)       — provides clean cross-modal context
-Value  = Common Fused Feature (zc_fused)       — stable, high-quality semantics
-```
-
-Steps:
-1. Compute cross-attention: `attn_out = softmax(Q @ K^T / sqrt(d)) @ V`
-2. Residual connection: `enhanced = zp + proj(attn_out)`
-3. **Quality zeroing**: Multiply by `keep_mask_1d` to ensure low-quality tokens remain zero
-4. LayerNorm + quality zeroing again
-
-This design ensures:
-- Private features gain complementary context from the other modality via common features
-- Low-quality tokens cannot "steal" common information to masquerade as valid features
-- The common branch (Key/Value) is not affected by private branch gradients through attention
-
-#### 5. Quality-Weighted Final Fusion
-
-Enhanced private features from both modalities are fused with quality-aware weighting:
+At each stage, RGB and Thermal common features are fused with quality weighting:
 
 ```
-# Normalized quality weights
-w_rgb = q_rgb / (q_rgb + q_t + eps)
-w_t   = q_t   / (q_rgb + q_t + eps)
-
-# Quality-weighted sum
-fused = w_rgb * rgb_enhanced + w_t * t_enhanced
-
-# Both-low fallback: use higher-quality modality directly
-if both_low:
-    fused = rgb_enhanced if q_rgb >= q_t else t_enhanced
+w_rgb = f_fuse(s_rgb, τ=0.3, ε=1e-3, β=6.0)
+w_t   = f_fuse(s_t,   τ=0.3, ε=1e-3, β=6.0)
+w_sum = w_rgb + w_t + 1e-8
+zc_fused = (w_rgb / w_sum) × zc_rgb + (w_t / w_sum) × zc_t
 ```
 
-Then:
-1. **Channel-Spatial Attention**: Apply channel attention + spatial attention to each modality's enhanced features, add to fused
-2. **MLP Enhancement**: Two-layer MLP with GroupNorm and GELU, residual connection
+Then refined by `MultiScaleRefine` (dilated depthwise convs + channel attention + LayerNorm).
 
-Output: `final_fused_list[i]` — the ultimate multi-scale features for segmentation
+Output: `zf[i]` — refined common fused features
 
-#### 6. Segmentation Head
+#### 5. QualityModulatedFusion (Private-Common Fusion)
 
-The final fused features are passed through a neck (optional) and decode head (SegFormer head or Mask2Former) to produce segmentation predictions.
+Each stage's private features are fused with common fused features:
+
+```
+Step 1: Hard zeroing
+  hard_mask = f_hard_mask(s_priv, τ_hard=0.2)
+  F_priv = F_priv × hard_mask
+
+Step 2: Soft weight modulation
+  w = f_fuse(s_priv, τ=0.3, ε=1e-3, β=6.0)
+  priv_modulated = F_priv × w
+
+Step 3: Concatenation + MLP
+  x = Concat([F_gen, priv_modulated], dim=1) → [B, 2C, H, W]
+  x = Conv1×1(2C → C)(x) → GELU
+
+Step 4: LayerNorm
+  out = LayerNorm(x)
+```
+
+Common and private features are concatenated and fused through MLP; no residual connection, output is fully determined by the fusion result.
+
+Output: `rgb_enhanced[i]`, `t_enhanced[i]`
+
+#### 6. DualGateEnhancedFusion (Final Fusion)
+
+Combines three feature streams per stage:
+
+```
+F_rgb, F_t, F_common → spatial alignment via bilinear interpolation
+  │
+  Concat(F_rgb, F_t) along channels
+  │
+  ├─ Channel Gate: Conv1×1 → ReLU → Conv1×1 → Sigmoid → split → ch_rgb, ch_t
+  ├─ Spatial Gate:  Conv3×3 → Sigmoid → split → sp_rgb, sp_t
+  │
+  F_fused = ch_rgb × sp_rgb × F_rgb + ch_t × sp_t × F_t
+  │
+  Pre-Norm residual: LayerNorm(F_fused) → Conv1×1 → GELU → + F_common
+  Export normalization: LayerNorm
+```
+
+Output: `final_fused[i]` — the ultimate multi-scale features for segmentation
+
+#### 7. Segmentation Heads
+
+- **Main decoder**: Mask2FormerHead (Swin variant) or SegformerHead (MiT variant) on `final_fused`
+- **Common auxiliary**: SegformerHead on `zf`
+- **RGB private auxiliary**: SegformerHead on `rgb_enhanced`
+- **T private auxiliary**: SegformerHead on `t_enhanced`
+
+All auxiliary losses weighted by `aux_loss_weight` (0.3).
+
+---
+
+## Training Strategy
+
+### Three-Phase Training
+
+| Phase | Epochs | Quality Score | Predictor State | force_all_keep | distill / inv |
+|-------|--------|---------------|-----------------|----------------|---------------|
+| 1 | 0 ~ phase1-1 | All 1 | All frozen | True | ❌ |
+| 2 | phase1 ~ phase1+phase2-1 | All 1 | All trainable | True | ❌ |
+| 3 | phase1+phase2 ~ end | From predictor | All trainable | False | ✅ |
+
+- **Phase 1**: Foundation learning with all features. Predictors frozen, modulation degenerates to "keep all".
+- **Phase 2**: Predictors fully unfrozen, learn quality assessment without gating pressure (`force_all_keep=True`).
+- **Phase 3**: Full adaptive modulation. Distillation and invariant losses activated.
+
+### Progressive Degradation Curriculum
+
+| Training Progress | Local Deg | Global Deg | Missing Modality | Levels |
+|-------------------|-----------|------------|------------------|--------|
+| 0–5% | 100% | 0% | 0% | Mild (L2-3) |
+| 5–10% | 100→70% | 0→30% | 0% | Mild-Moderate (L2-4) |
+| 10–15% | 70→50% | 30→40% | 0→10% | Moderate (L3-5) |
+| 15–25% | 50→35% | 40→35% | 10→30% | Moderate-Hard (L3-5) |
+| 25–40% | 35→30% | 35% | 30→35% | Hard (L4-5) |
+| 40%+ | 30% | 30% | 40% | Hard (L4-5) |
+
+Local degradation includes: global degradation types applied locally, and missing degradation (local regions zeroed out directly).
 
 ---
 
 ## Loss Functions
 
-### Main Losses (full gradient)
+```
+L_total = L_seg + L_aux + L_align + L_retention + L_deg + L_deg_aux
+          + L_distill (Phase 3) + L_inv (Phase 3)
+```
 
 | Loss | Description | Weight |
 |------|-------------|--------|
-| `loss.ce` | Cross-entropy on main decode head | 1.0 |
-| `loss.align` | Quality-weighted alignment between common features | `loss_align_weight` (0.5) |
-| `loss.invariant` | Unidirectional MSE: clean features (detached) → degraded features | `loss_invariant_weight` (1.0) |
-| `loss.distill_final` | KL distillation from clean to degraded final predictions | `loss_distill_weight` (1.0) |
-| `loss.distill_common` | KL distillation from clean to degraded common predictions | `loss_distill_weight` (1.0) |
-
-### Auxiliary Losses (gradient-isolated, quality-scaled)
-
-| Loss | Description | Effective Weight |
-|------|-------------|------------------|
-| `loss.common.*` | Common auxiliary head | `aux_loss_weight` (0.3) |
-| `loss.rgb_private.*` | RGB private auxiliary head | `0.3 * q_rgb_scale` |
-| `loss.t_private.*` | T private auxiliary head | `0.3 * q_t_scale` |
-
-**Gradient isolation**: Private auxiliary losses use `.detach()` on private features before computing loss, preventing gradients from flowing back to the common branch.
-
-**Quality scaling**: `q_rgb_scale = mean(q_rgb_clean[0] >= 0.5).clamp(min=0.1)` — auxiliary loss weight is proportional to the fraction of high-quality pixels.
-
-### Gradient Flow Summary
-
-```
-Main decode head       ← full gradient → Common + Private + CrossAttn + FinalFusion ✅
-Common auxiliary head  ← 0.3× gradient → Common branch ✅
-RGB private auxiliary  ← 0.3×q_scale×gradient → Private RGB + CrossAttn only ✅ (common detached)
-T private auxiliary    ← 0.3×q_scale×gradient → Private T + CrossAttn only ✅ (common detached)
-loss_invariant         ← one-way gradient → Only degraded branch ✅ (clean detached)
-loss_distill_final     ← full gradient → Degraded common + private + fusion ✅
-loss_distill_common    ← full gradient → Degraded common ✅
-```
+| `L_seg` | CE + Dice on main decoder (clean + degraded) | 1.0 |
+| `L_aux` | CE + Dice on auxiliary heads (clean + degraded) | 0.3 |
+| `L_align` | Category-aware InfoNCE contrastive loss | 0.1 |
+| `L_retention` | Retention rate regularization (r_min=0.5, r_max=0.95) | 2.0 |
+| `L_distill` | KL distillation (clean → degraded), Phase 3 only | 0.3 |
+| `L_inv` | Smooth L1 invariant loss (quality-gated), Phase 3 only | 0.03 |
 
 ---
 
 ## Model Variants
 
-| Model | Backbone | Quality Net | Degradation Training | Config Prefix |
-|-------|----------|-------------|---------------------|---------------|
-| `MiTMulV12DQualityDisentangle` | MiT-B2 | ✅ | ✅ | `mitmul_v12d_quality_disentangle` |
-| `MiTMulV12QualityDisentangleNoDeg` | MiT-B2 | ✅ | ❌ | `mitmul_v12_nodeg_quality_disentangle` |
-| `MiTMulV12DisentangleOnly` | MiT-B2 | ❌ | ❌ | `mitmul_v12_disentangle_only` |
-| `SwinMulV12DQualityDisentangle` | Swin-T | ✅ | ✅ | `swinmul_v12d_quality_disentangle` |
-| `SwinMulV12QualityDisentangleNoDeg` | Swin-T | ✅ | ❌ | `swinmul_v12_nodeg_quality_disentangle` |
-| `SwinMulV12DisentangleOnly` | Swin-T | ❌ | ❌ | `swinmul_v12_disentangle_only` |
+| Model | Backbone | Main Decoder | Quality Bias | Config |
+|-------|----------|-------------|-------------|--------|
+| `QualityGatedSwinMask2Former` | Swin-T × 3 | Mask2FormerHead | Window-level (cyclic-shift aligned) | `swinmul_quality_mask2former_swin-t_*.py` |
+| `QualityGatedMiTMamba` | MiT-B2 × 3 | SegformerHead | SR-attention K-level (avg-pooled) | `mitmul_quality_mamba_mit-b2_*.py` |
+
+> **Note**: `QualityGatedMiTMamba` class name contains "Mamba" as a legacy naming convention. The current version uses QualityModulatedFusion, not Mamba modules.
 
 ---
 
-## Training Commands
-
-### SegFormer Head (MiT-B2)
-
-```bash
-cd /home/lh/code/QWSEG/seg/mmsegmentation-main-rgbt
-
-# 1. Full model: Quality-aware + Degradation training
-python tools/train.py \
-    configs/segformer/mitmul_v12d_quality_disentangle_mit-b2_1xb2-50E_mfnet-240x320.py \
-    --amp
-
-# 2. Ablation: Quality-aware, no degradation
-python tools/train.py \
-    configs/segformer/mitmul_v12_nodeg_quality_disentangle_mit-b2_1xb2-50E_mfnet-240x320.py \
-    --amp
-
-# 3. Ablation: Disentangle only, no quality, no degradation
-python tools/train.py \
-    configs/segformer/mitmul_v12_disentangle_only_mit-b2_1xb2-50E_mfnet-240x320.py \
-    --amp
-```
-
-### SegFormer Head (Swin-T)
-
-```bash
-# 4. Full model: Swin-T + Quality-aware + Degradation
-python tools/train.py \
-    configs/segformer/swinmul_v12d_quality_disentangle_swin-t_1xb2-50E_mfnet-240x320.py \
-    --amp
-```
-
-### Mask2Former Head (Swin-T, MFNet dataset)
-
-```bash
-# 5. Full model with Mask2Former
-python tools/train.py \
-    configs/mask2former/swinmul_v12d_quality_disentangle_swin-t_1xb2-80K_mfnet-480x640.py \
-    --amp
-
-# 6. No degradation variant
-python tools/train.py \
-    configs/mask2former/swinmul_v12_nodeg_quality_disentangle_swin-t_1xb2-80K_mfnet-480x640.py \
-    --amp
-
-# 7. Disentangle only
-python tools/train.py \
-    configs/mask2former/swinmul_v12_disentangle_only_swin-t_1xb2-80K_mfnet-480x640.py \
-    --amp
-```
-
-### Mask2Former Head (Swin-T, FMB dataset)
-
-```bash
-# 8. Full model on FMB dataset
-python tools/train.py \
-    configs/mask2former/swinmul_v12d_quality_disentangle_swin-t_1xb2-80K_fmb-480x640.py \
-    --amp
-
-# 9. No degradation on FMB
-python tools/train.py \
-    configs/mask2former/swinmul_v12_nodeg_quality_disentangle_swin-t_1xb2-80K_fmb-480x640.py \
-    --amp
-```
-
-### With Visualization
-
-Add `--visualize --vis-interval 2 --vis-num-samples 2` to any command for training visualization:
-
-```bash
-python tools/train.py \
-    configs/segformer/mitmul_v12d_quality_disentangle_mit-b2_1xb2-50E_mfnet-240x320.py \
-    --amp --visualize --vis-interval 2 --vis-num-samples 2
-```
-
----
-
-## Key Hyperparameters
+## Key Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `quality_threshold` | 0.3 | Threshold for quality masking |
-| `loss_align_weight` | 0.5 | Weight for alignment loss |
-| `loss_invariant_weight` | 1.0 | Weight for invariant loss |
-| `loss_distill_weight` | 1.0 | Weight for distillation losses |
-| `aux_loss_weight` | 0.3 | Weight for auxiliary decode heads |
-| `missing_ratio` | 0.3 | Ratio of completely missing modality |
-| `global_deg_ratio` | 0.3 | Ratio of globally degraded samples |
-| `local_deg_ratio` | 0.4 | Ratio of locally degraded samples |
-| `quality_freeze_epochs` | 0 | Epochs to freeze quality net |
+| `tau` | 0.3 | Soft modulation boundary for f_attn and f_fuse |
+| `tau_hard` | 0.2 | Hard zeroing threshold |
+| `alpha` | 10.0 | Attention bias strength |
+| `fuse_beta` | 6.0 | Fusion weight decay exponent |
+| `fuse_epsilon` | 1e-3 | Fusion weight minimum |
+| `retention_min` | 0.5 | Retention rate lower bound |
+| `retention_max` | 0.95 | Retention rate upper bound |
+| `loss_distill_weight` | 0.3 | Distillation loss weight |
+| `loss_invariant_weight` | 0.03 | Invariant loss weight |
+| `aux_loss_weight` | 0.3 | Auxiliary decoder loss weight |
 
 ---
 
-## Architecture Change Log
+## Key Files
 
-### v2.0 — Cross-Attention Fusion (Current)
-
-Replaced STARS gate fusion with cross-attention enhancement + quality-weighted final fusion:
-
-| Component | Old (STARS) | New (CrossAttn) |
-|-----------|-------------|-----------------|
-| Private-Common Fusion | STARSFusionBlock (gate) | CrossAttentionEnhance (Q=private, KV=common) |
-| Final Fusion | FinalFusionBlock (concat+proj) | QualityWeightedFinalFusion (quality-weighted sum + CS-attention + MLP) |
-| Quality zeroing after fusion | ❌ | ✅ keep_mask applied after cross-attention residual |
-| Quality-weighted final fusion | ❌ | ✅ per-pixel quality weights |
-| Both-low handling | N/A | ✅ keep higher-quality modality |
-| MLP enhancement | ❌ | ✅ 2-layer MLP with residual |
-
-### v1.0 — Initial Release
-
-- STARS gate fusion for private-common interaction
-- Concat + projection for final fusion
-- Unidirectional invariant loss
-- Gradient isolation for auxiliary losses
+| File | Content |
+|------|---------|
+| `mmseg/models/segmentors/v9_utils.py` | QualityPredictor, f_attn/f_fuse/f_hard_mask, QualityModulatedFusion, degradation schedule, contrastive loss |
+| `mmseg/models/segmentors/swin_quality_mask2former.py` | Swin model + Swin-specific quality attention bias + fusion modules |
+| `mmseg/models/segmentors/mit_quality_mamba.py` | MiT model + MiT-specific quality attention bias + fusion modules |
+| `mmseg/datasets/transforms/quality_degradation.py` | Degradation type implementations |
+| `mmseg/engine/hooks/train_vis_hook.py` | Training visualization hook |

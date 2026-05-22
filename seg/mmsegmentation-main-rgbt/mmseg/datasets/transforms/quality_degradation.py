@@ -32,7 +32,7 @@ _QUALITY_RGB_DEG_TYPES = [
     'lowlight',
     'stain',
     'bad_block',
-    # 'missing' excluded — only triggered via explicit deg_type='missing'
+    'missing',
 ]
 
 _QUALITY_T_DEG_TYPES = [
@@ -43,7 +43,7 @@ _QUALITY_T_DEG_TYPES = [
     'thermal_halo',
     'stain',
     'bad_block',
-    # 'missing' excluded — only triggered via explicit deg_type='missing'
+    'missing',
 ]
 
 _QUALITY_LEVEL_CONFIGS = {
@@ -241,15 +241,14 @@ def apply_quality_degradation_rgb(img_tensor, deg_type, level, spatial_mask=None
         img_tensor = img_tensor * (mask >= ratio_map).float()
 
     elif deg_type == 'missing':
-        ratio = params['ratio']
-        if ratio <= 0:
-            return img_tensor
-        if uniform:
-            zero_mask = (torch.rand(B, 1, H, W, device=img_tensor.device) < ratio).float()
+        if not uniform:
+            img_tensor = img_tensor * (1 - spatial_mask.expand(B, C, H, W))
         else:
-            zero_prob = ratio * spatial_mask[:, 0:1]
-            zero_mask = (torch.rand_like(zero_prob) < zero_prob).float()
-        img_tensor = img_tensor * (1 - zero_mask)
+            ratio = params['ratio']
+            if ratio <= 0:
+                return img_tensor
+            zero_mask = (torch.rand(B, 1, H, W, device=img_tensor.device) < ratio).float()
+            img_tensor = img_tensor * (1 - zero_mask)
 
     return img_tensor
 
@@ -369,15 +368,14 @@ def apply_quality_degradation_t(img_tensor, deg_type, level, spatial_mask=None):
         img_tensor = img_tensor * (mask >= ratio_map).float()
 
     elif deg_type == 'missing':
-        ratio = params['ratio']
-        if ratio <= 0:
-            return img_tensor
-        if uniform:
-            zero_mask = (torch.rand(B, 1, H, W, device=img_tensor.device) < ratio).float()
+        if not uniform:
+            img_tensor = img_tensor * (1 - spatial_mask.expand(B, C, H, W))
         else:
-            zero_prob = ratio * spatial_mask[:, 0:1]
-            zero_mask = (torch.rand_like(zero_prob) < zero_prob).float()
-        img_tensor = img_tensor * (1 - zero_mask)
+            ratio = params['ratio']
+            if ratio <= 0:
+                return img_tensor
+            zero_mask = (torch.rand(B, 1, H, W, device=img_tensor.device) < ratio).float()
+            img_tensor = img_tensor * (1 - zero_mask)
 
     return img_tensor
 

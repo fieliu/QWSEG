@@ -74,6 +74,7 @@ def _make_cell(img, cell_h, cell_w, short_side=250):
 
 def _feat_top3_rgb(feature_map, sample_idx=0):
     feat = feature_map[sample_idx].cpu().float()
+    token_zero_mask = (feat.abs().sum(dim=0) < 1e-6).numpy()
     mean_activation = feat.abs().mean(dim=(1, 2))
     k = min(3, feat.shape[0])
     topk_indices = mean_activation.topk(k).indices
@@ -87,8 +88,9 @@ def _feat_top3_rgb(feature_map, sample_idx=0):
             ch = (ch - vmin) / (vmax - vmin)
         channels.append(ch)
     while len(channels) < 3:
-        channels.append(np.zeros_like(channels[0]))
+        channels.append(np.zeros_like(channels[0] if channels else np.zeros((1, 1))))
     rgb = np.stack(channels[:3], axis=-1)
+    rgb[token_zero_mask] = 0.0
     return (rgb * 255).astype(np.uint8)
 
 

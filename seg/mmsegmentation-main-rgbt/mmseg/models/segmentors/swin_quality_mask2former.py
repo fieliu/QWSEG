@@ -23,6 +23,7 @@ from mmseg.models.segmentors.v9_utils import (
     f_attn,
     f_fuse,
     f_hard_mask,
+    cascade_quality_suppress,
     downsample_mask,
     get_degradation_schedule,
     sample_level,
@@ -308,9 +309,12 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
 
     Uses continuous quality score with piecewise modulation instead of
     hard gating. No Gumbel-Softmax, no complementary fix, no cumulative masks.
+    Cross-stage cascading suppression ensures low-quality regions detected
+    in shallow stages are never "recovered" by deeper stages.
     """
     window_size = swin_branch.stages[0].blocks[0].attn.window_size
     outs, all_s_rgb, all_s_t = [], [], []
+    cum_rgb, cum_t = None, None
 
     stages = swin_branch.stages
     x, (H, W) = swin_branch.patch_embed(input_rgbt)
@@ -336,6 +340,9 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
             s_rgb = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
         if s_t is None:
             s_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
+
+        s_rgb, cum_rgb = cascade_quality_suppress(s_rgb, cum_rgb, H, W)
+        s_t, cum_t = cascade_quality_suppress(s_t, cum_t, H, W)
 
         all_s_rgb.append(s_rgb)
         all_s_t.append(s_t)
@@ -374,7 +381,8 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
     """Quality-aware forward through a single Swin branch.
 
     Uses continuous quality score with piecewise modulation instead of
-    hard gating.
+    hard gating. Cross-stage cascading suppression ensures low-quality
+    regions detected in shallow stages are never "recovered" by deeper stages.
 
     Returns:
         outs:        list of feature maps [B, C_i, H_i, W_i]
@@ -382,6 +390,7 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
     """
     window_size = swin_branch.stages[0].blocks[0].attn.window_size
     outs, all_s = [], []
+    cum_s = None
 
     stages = swin_branch.stages
     x, (H, W) = swin_branch.patch_embed(img)
@@ -403,6 +412,8 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
 
         if s is None:
             s = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
+
+        s, cum_s = cascade_quality_suppress(s, cum_s, H, W)
 
         all_s.append(s)
         hard_mask = f_hard_mask(s, tau_hard=tau_hard)
@@ -762,7 +773,7 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         B = rgb.shape[0]
         epoch = getattr(self, 'current_epoch', 0)
         ph = self._get_training_phase(epoch)
-        fa = (ph < 3)
+        fa = (ph < 2)
 
         zc_outs, s_r, s_t = _forward_swin_common_dual_pruned(
             self.backbone, torch.cat([rgb, t], dim=0), orig_B=B,
@@ -874,6 +885,16 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                     cnt += 1
             if cnt: losses['loss_align'] = (lc/cnt)*self.loss_align_weight
         if self.retention_loss_weight > 0: losses['loss_retention'] = self.retention_loss_weight*self._compute_retention_loss(all_s)
+        if ph == 2:
+            anchor_w = max(0.0, 1.0 - (epoch - self.phase1_epochs) / max(self.phase2_epochs, 1))
+            anchor_loss = torch.tensor(0.0, device=rgb.device)
+            cnt = 0
+            for s in all_s:
+                if s is not None:
+                    anchor_loss += ((1.0 - s) ** 2).mean()
+                    cnt += 1
+            if cnt > 0:
+                losses['loss_quality_anchor'] = anchor_w * anchor_loss / cnt
         if self.training:
             (dzcr,dzct,dzpr,dzpt,dzf,drl,dtl,df,ds_r,ds_t,dall_s,dspr,dspt) = self._train_with_degradation(rgb,ir)
             if torch.isnan(df[0]).any():

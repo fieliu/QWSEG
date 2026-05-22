@@ -93,6 +93,43 @@ def f_hard_mask(s, tau_hard=0.2):
     return (s >= tau_hard).float().detach()
 
 
+def cascade_quality_suppress(s_current, cumulative_prev, target_h, target_w,
+                              clamp_min=0.0):
+    """Cross-stage quality score cascading suppression.
+
+    Ensures that once a shallow stage detects a low-quality region, deeper
+    stages cannot "recover" it.  The cumulative product of all previous
+    stage scores (max-pooled to match resolution) is multiplied element-wise
+    with the current stage score.
+
+    Args:
+        s_current: [B, 1, H_k, W_k] current stage quality score
+        cumulative_prev: [B, 1, H_prev, W_prev] cumulative product of all
+            previous stage scores (or None for stage 0)
+        target_h, target_w: spatial size of s_current
+        clamp_min: lower bound for pooled_prev during early training
+            (e.g. 0.1 prevents shallow errors from being unrecoverable)
+
+    Returns:
+        s_adjusted: [B, 1, H_k, W_k] adjusted quality score
+        new_cumulative: [B, 1, H_k, W_k] updated cumulative product
+    """
+    if cumulative_prev is None:
+        return s_current, s_current.detach()
+
+    if cumulative_prev.shape[2:] != (target_h, target_w):
+        pooled_prev = F.adaptive_max_pool2d(cumulative_prev, (target_h, target_w))
+    else:
+        pooled_prev = cumulative_prev
+
+    if clamp_min > 0:
+        pooled_prev = pooled_prev.clamp(min=clamp_min)
+
+    s_adjusted = s_current * pooled_prev
+    new_cumulative = s_adjusted.detach()
+    return s_adjusted, new_cumulative
+
+
 class QualityModulatedFusion(nn.Module):
     """Unified quality-modulated private-common fusion.
 

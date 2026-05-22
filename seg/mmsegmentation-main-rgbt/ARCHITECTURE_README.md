@@ -38,7 +38,26 @@ A lightweight per-stage module that predicts per-pixel quality scores from featu
 - All conv layers: Kaiming Normal (`fan_in`, adapted for GELU)
 - Total: 16 predictors (4 stages × 4 sets: common RGB, common T, private RGB, private T)
 
-#### 2. Three-Level Progressive Quality Modulation
+#### 2. Cross-Stage Cascading Suppression
+
+Deeper stages may "forget" degradation regions identified by shallower stages (context aggregation can make corrupted regions appear normal). Cross-stage propagation ensures low-quality regions once detected are never "recovered":
+
+```
+For stage k ≥ 1:
+  cumulative_prev = s_0 × s_1 × ... × s_{k-1}  (detached each stage)
+  pooled_prev = AdaptiveMaxPool2d(cumulative_prev, (H_k, W_k))
+  s_k_adjusted = s_k × pooled_prev
+  new_cumulative = s_k_adjusted.detach()
+
+Stage 0: s_0_adjusted = s_0, cumulative = s_0.detach()
+```
+
+- **Max pooling** (not average): preserves low scores from shallow stages
+- **Differentiable**: deeper `s_k` gets gradient via `pooled_prev`; if `pooled_prev=0`, gradient is 0 (already zeroed, no adjustment needed)
+- **Detach**: prevents deep-to-shallow gradient interference
+- **Optional `clamp_min`**: early-training safety net (e.g. 0.1), reduced to 0 over training
+
+#### 3. Three-Level Progressive Quality Modulation
 
 Given quality score `s ∈ [0,1]`, three piecewise functions work cooperatively:
 
@@ -56,11 +75,11 @@ Given quality score `s ∈ [0,1]`, three piecewise functions work cooperatively:
 | 0.2 ≤ s < 0.3 | 1 (kept) | Negative bias (strong→weak) | 0.001→0.3 | Attention suppressed, fusion minimal |
 | s ≥ 0.3 | 1 (kept) | 0 (no bias) | s (0.3→1.0) | Normal participation |
 
-#### 3. Common Branch (Quality-Aware Backbone)
+#### 4. Common Branch (Quality-Aware Backbone)
 
 Both modalities are concatenated along the batch dimension and processed by a shared backbone (Swin-T or MiT-B2). At each stage:
 
-1. **Quality Prediction**: QualityPredictor predicts `s_rgb` and `s_t` from detached features
+1. **Quality Prediction**: QualityPredictor predicts `s_rgb` and `s_t` from detached features, then applies cross-stage cascading suppression (`s_k_adjusted = s_k × maxpool(cumulative_prev)`)
 2. **Attention Bias Injection**: `f_attn(s)` is added to attention scores, suppressing low-quality tokens
    - **Swin**: Bias converted to per-window format via `_quality_score_to_swin_bias`, aligned with cyclic shift for SW-MSA
    - **MiT**: Bias downsampled to match K resolution via `adaptive_avg_pool2d`
@@ -71,7 +90,7 @@ Both modalities are concatenated along the batch dimension and processed by a sh
 
 Output: `zc_rgb[i]`, `zc_t[i]` — quality-aware common features per stage
 
-#### 4. Quality-Weighted Common Fusion
+#### 5. Quality-Weighted Common Fusion
 
 At each stage, RGB and Thermal common features are fused with quality weighting:
 
@@ -86,7 +105,7 @@ Then refined by `MultiScaleRefine` (dilated depthwise convs + channel attention 
 
 Output: `zf[i]` — refined common fused features
 
-#### 5. QualityModulatedFusion (Private-Common Fusion)
+#### 6. QualityModulatedFusion (Private-Common Fusion)
 
 Each stage's private features are fused with common fused features:
 
@@ -111,7 +130,7 @@ Common and private features are concatenated and fused through MLP; no residual 
 
 Output: `rgb_enhanced[i]`, `t_enhanced[i]`
 
-#### 6. DualGateEnhancedFusion (Final Fusion)
+#### 7. DualGateEnhancedFusion (Final Fusion)
 
 Combines three feature streams per stage:
 
@@ -131,7 +150,7 @@ F_rgb, F_t, F_common → spatial alignment via bilinear interpolation
 
 Output: `final_fused[i]` — the ultimate multi-scale features for segmentation
 
-#### 7. Segmentation Heads
+#### 8. Segmentation Heads
 
 - **Main decoder**: Mask2FormerHead (Swin variant) or SegformerHead (MiT variant) on `final_fused`
 - **Common auxiliary**: SegformerHead on `zf`
@@ -149,12 +168,12 @@ All auxiliary losses weighted by `aux_loss_weight` (0.3).
 | Phase | Epochs | Quality Score | Predictor State | force_all_keep | distill / inv |
 |-------|--------|---------------|-----------------|----------------|---------------|
 | 1 | 0 ~ phase1-1 | All 1 | All frozen | True | ❌ |
-| 2 | phase1 ~ phase1+phase2-1 | All 1 | All trainable | True | ❌ |
+| 2 | phase1 ~ phase1+phase2-1 | Predictor + anchoring | All trainable | False | ❌ |
 | 3 | phase1+phase2 ~ end | From predictor | All trainable | False | ✅ |
 
 - **Phase 1**: Foundation learning with all features. Predictors frozen, modulation degenerates to "keep all".
-- **Phase 2**: Predictors fully unfrozen, learn quality assessment without gating pressure (`force_all_keep=True`).
-- **Phase 3**: Full adaptive modulation. Distillation and invariant losses activated.
+- **Phase 2**: Predictors unfrozen, `force_all_keep=False`. Predictor outputs participate in forward pass and receive gradients. Initial outputs ≈0.98 (bias=4.0), so modulation is mild. Quality anchoring loss `L_anchor = mean((1-s)²)` with linearly decaying weight (1.0→0.0) prevents premature deviation from 1.0.
+- **Phase 3**: Full adaptive modulation. Anchoring loss removed. Distillation and invariant losses activated.
 
 ### Progressive Degradation Curriculum
 
@@ -221,7 +240,7 @@ L_total = L_seg + L_aux + L_align + L_retention + L_deg + L_deg_aux
 
 | File | Content |
 |------|---------|
-| `mmseg/models/segmentors/v9_utils.py` | QualityPredictor, f_attn/f_fuse/f_hard_mask, QualityModulatedFusion, degradation schedule, contrastive loss |
+| `mmseg/models/segmentors/v9_utils.py` | QualityPredictor, f_attn/f_fuse/f_hard_mask, cascade_quality_suppress, QualityModulatedFusion, degradation schedule, contrastive loss |
 | `mmseg/models/segmentors/swin_quality_mask2former.py` | Swin model + Swin-specific quality attention bias + fusion modules |
 | `mmseg/models/segmentors/mit_quality_mamba.py` | MiT model + MiT-specific quality attention bias + fusion modules |
 | `mmseg/datasets/transforms/quality_degradation.py` | Degradation type implementations |

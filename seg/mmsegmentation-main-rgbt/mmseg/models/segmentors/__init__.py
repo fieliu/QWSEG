@@ -46,6 +46,7 @@ from .seg_tta import SegTTAModel
 from .swin_dual_add import SwinDualAdd
 from .mitmul_ablation import MiTMulABBaseline, MiTMulABV1, MiTMulABV2, MiTMulABV3, MiTMulABV5, MiTMulABV6, MiTMulABV7, MiTMulABV8
 from .swin_multibranch_noquality import SwinMultiBranchNoQuality
+from .swin_baseline_mask2former import SwinBaselineMask2Former
 
 __all__ = [
     'BaseSegmentor', 'EncoderDecoder', 'CascadeEncoderDecoder', 'SegTTAModel',
@@ -79,4 +80,5 @@ __all__ = [
     'AMDANet', 'EncoderDecoderMult',
     'CRMMask2Former', 'Mask2FormerRGBTAdd',
     'SwinMultiBranchNoQuality',
+    'SwinBaselineMask2Former',
 ]

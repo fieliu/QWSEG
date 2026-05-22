@@ -74,8 +74,8 @@ model = dict(
     common_decode_head=_segformer_head,
     rgb_private_decode_head=_segformer_head,
     t_private_decode_head=_segformer_head,
-    retention_min=0.5,
-    retention_max=0.95,
+    retention_min=0.4,
+    retention_max=0.98,
     retention_loss_weight=2.0,
     phase_mode='absolute',
     phase1_epochs=10,
@@ -88,9 +88,6 @@ model = dict(
     loss_distill_weight=0.3,
     distill_temperature=4.0,
     aux_loss_weight=0.3,
-    mamba_d_state=16,
-    mamba_d_conv=4,
-    mamba_expand=2,
     missing_ratio=0.3,
     global_deg_ratio=0.3,
     local_deg_ratio=0.4,
@@ -131,7 +128,7 @@ for pred_name in ['predictors_common_rgb', 'predictors_common_t',
                   'predictors_priv_rgb', 'predictors_priv_t']:
     predictor_keys[f'{pred_name}'] = dict(lr_mult=5.0, decay_mult=1.0)
     for stage_id in range(4):
-        for sub in ['norm1', 'conv1', 'norm2', 'conv2',
+        for sub in ['ctx_proj', 'norm1', 'conv1', 'norm2', 'conv2',
                     'score_head']:
             predictor_keys[f'{pred_name}.{stage_id}.{sub}'] = dict(lr_mult=5.0, decay_mult=1.0)
 

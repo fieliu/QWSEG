@@ -19,9 +19,9 @@ Input RGB ──┐                              ┌── QualityPredictor (RGB
              │
 Input T ────┘
 
-Input RGB ── Private Branch RGB ── QualityPredictor × 4 ── zp_rgb ── QualityModulatedFusion ── rgb_enhanced ──┐
-                                                                                                               ├── DualGateEnhancedFusion ── final_fused ── Decode Head
-Input T ──── Private Branch T ──── QualityPredictor × 4 ── zp_t ──── QualityModulatedFusion ── t_enhanced ────┘
+Input RGB ── Private Branch RGB ── QualityPredictor × 4 ── zp_rgb ── f_fuse modulate + zf ── LayerNorm ── rgb_enhanced ──┐
+                                                                                                                            ├── DualGateEnhancedFusion ── final_fused ── Decode Head
+Input T ──── Private Branch T ──── QualityPredictor × 4 ── zp_t ──── f_fuse modulate + zf ── LayerNorm ── t_enhanced ────┘
 ```
 
 ### Stage-by-Stage Detail
@@ -32,9 +32,10 @@ A lightweight per-stage module that predicts per-pixel quality scores from featu
 
 - Input: Feature map `x ∈ [B, C, H, W]` (detached from gradient for quality prediction)
 - Output: Quality score `s ∈ [B, 1, H, W]`, values in `[1e-7, 1-1e-7]`
-- Architecture: `LayerNorm(C) → Conv1×1(C→hidden) → GELU → LayerNorm(hidden) → Conv1×1(hidden→hidden) → GELU → Conv1×1(hidden→1, bias=4.0) → Sigmoid → clamp`
+- Architecture: `LayerNorm(C) → Conv1×1(C→hidden) → GELU → LayerNorm(hidden) → Conv1×1(hidden→hidden) → GELU → Conv1×1(hidden→1, bias=0.0) → Sigmoid → clamp`
 - `hidden = min(128, max(64, C//2))`
-- Bias initialization = 4.0 → `sigmoid(4.0) ≈ 0.98`, preventing erroneous pruning at training start
+- Bias initialization = 0.0 → `sigmoid(0.0) = 0.5`, quality scores start at midpoint, allowing bidirectional learning
+- Global feature injection: local features concatenated with global average pooling features, projected back via 1×1 conv `ctx_proj`
 - All conv layers: Kaiming Normal (`fan_in`, adapted for GELU)
 - Total: 16 predictors (4 stages × 4 sets: common RGB, common T, private RGB, private T)
 
@@ -44,18 +45,20 @@ Deeper stages may "forget" degradation regions identified by shallower stages (c
 
 ```
 For stage k ≥ 1:
-  cumulative_prev = s_0 × s_1 × ... × s_{k-1}  (detached each stage)
+  cumulative_prev = s_0 × s_1 × ... × s_{k-1}  (gradients propagated)
   pooled_prev = AdaptiveMaxPool2d(cumulative_prev, (H_k, W_k))
+  if clamp_min > 0:
+      pooled_prev = pooled_prev.clamp(min=clamp_min)
   s_k_adjusted = s_k × pooled_prev
-  new_cumulative = s_k_adjusted.detach()
+  new_cumulative = s_k_adjusted
 
-Stage 0: s_0_adjusted = s_0, cumulative = s_0.detach()
+Stage 0: s_0_adjusted = s_0, cumulative = s_0
 ```
 
 - **Max pooling** (not average): preserves low scores from shallow stages
 - **Differentiable**: deeper `s_k` gets gradient via `pooled_prev`; if `pooled_prev=0`, gradient is 0 (already zeroed, no adjustment needed)
-- **Detach**: prevents deep-to-shallow gradient interference
-- **Optional `clamp_min`**: early-training safety net (e.g. 0.1), reduced to 0 over training
+- **Gradient propagation**: `cumulative` not detached, allowing gradients to flow from deep to shallow predictors
+- **`clamp_min`**: Phase 3 first 5 epochs apply `clamp_min=0.1` to prevent irreversible zeroing; later reduced to 0
 
 #### 3. Three-Level Progressive Quality Modulation
 
@@ -80,7 +83,11 @@ Given quality score `s ∈ [0,1]`, three piecewise functions work cooperatively:
 Both modalities are concatenated along the batch dimension and processed by a shared backbone (Swin-T or MiT-B2). At each stage:
 
 1. **Quality Prediction**: QualityPredictor predicts `s_rgb` and `s_t` from detached features, then applies cross-stage cascading suppression (`s_k_adjusted = s_k × maxpool(cumulative_prev)`)
-2. **Attention Bias Injection**: `f_attn(s)` is added to attention scores, suppressing low-quality tokens
+2. **Attention Bias Injection**: Relative quality scores are used for attention bias generation
+   - `s_avg = (s_rgb + s_t) / 2 + 1e-8`, `rel_s = s / s_avg`
+   - When both modalities are low quality, `rel_s ≈ 1`, bias = 0 (no erroneous suppression)
+   - `f_attn(rel_s)` is added to attention scores, suppressing low-quality tokens
+   - Fusion weights `f_fuse` still use absolute scores `s_rgb` and `s_t`
    - **Swin**: Bias converted to per-window format via `_quality_score_to_swin_bias`, aligned with cyclic shift for SW-MSA
    - **MiT**: Bias downsampled to match K resolution via `adaptive_avg_pool2d`
 3. **Hard Zeroing After Norm**: After stage norm_layer, features are multiplied by `f_hard_mask(s)` to ensure clean output
@@ -101,32 +108,27 @@ w_sum = w_rgb + w_t + 1e-8
 zc_fused = (w_rgb / w_sum) × zc_rgb + (w_t / w_sum) × zc_t
 ```
 
-Then refined by `MultiScaleRefine` (dilated depthwise convs + channel attention + LayerNorm).
+Then LayerNorm-normalized (no MultiScaleRefine).
 
-Output: `zf[i]` — refined common fused features
+Output: `zf[i]` — common fused features
 
-#### 6. QualityModulatedFusion (Private-Common Fusion)
+#### 6. Private-Common Feature Fusion (Simplified)
 
-Each stage's private features are fused with common fused features:
+Each stage's private features are directly added to common fused features:
 
 ```
-Step 1: Hard zeroing
-  hard_mask = f_hard_mask(s_priv, τ_hard=0.2)
-  F_priv = F_priv × hard_mask
+Step 1: Soft weight modulation
+  w_priv = f_fuse(s_priv, τ, ε, β)
+  priv_mod = zp × w_priv
 
-Step 2: Soft weight modulation
-  w = f_fuse(s_priv, τ=0.3, ε=1e-3, β=6.0)
-  priv_modulated = F_priv × w
+Step 2: Feature addition
+  out = zf + priv_mod
 
-Step 3: Concatenation + MLP
-  x = Concat([F_gen, priv_modulated], dim=1) → [B, 2C, H, W]
-  x = Conv1×1(2C → C)(x) → GELU
-
-Step 4: LayerNorm
-  out = LayerNorm(x)
+Step 3: LayerNorm normalization
+  out = LayerNorm(out)
 ```
 
-Common and private features are concatenated and fused through MLP; no residual connection, output is fully determined by the fusion result.
+Private features are soft-weighted by `f_fuse` and directly added to common features, then LayerNorm-normalized. No MLP or MultiScaleRefine.
 
 Output: `rgb_enhanced[i]`, `t_enhanced[i]`
 
@@ -168,12 +170,12 @@ All auxiliary losses weighted by `aux_loss_weight` (0.3).
 | Phase | Epochs | Quality Score | Predictor State | force_all_keep | distill / inv |
 |-------|--------|---------------|-----------------|----------------|---------------|
 | 1 | 0 ~ phase1-1 | All 1 | All frozen | True | ❌ |
-| 2 | phase1 ~ phase1+phase2-1 | Predictor + anchoring | All trainable | False | ❌ |
+| 2 | phase1 ~ phase1+phase2-1 | All 1 | All frozen | True | ❌ |
 | 3 | phase1+phase2 ~ end | From predictor | All trainable | False | ✅ |
 
 - **Phase 1**: Foundation learning with all features. Predictors frozen, modulation degenerates to "keep all".
-- **Phase 2**: Predictors unfrozen, `force_all_keep=False`. Predictor outputs participate in forward pass and receive gradients. Initial outputs ≈0.98 (bias=4.0), so modulation is mild. Quality anchoring loss `L_anchor = mean((1-s)²)` with linearly decaying weight (1.0→0.0) prevents premature deviation from 1.0.
-- **Phase 3**: Full adaptive modulation. Anchoring loss removed. Distillation and invariant losses activated.
+- **Phase 2**: Continued foundation learning. Same as Phase 1 — `force_all_keep=True`, predictors remain frozen. No anchoring loss.
+- **Phase 3**: Full adaptive modulation. `force_all_keep=False`, predictors unfrozen. Distillation and invariant losses activated. First 5 epochs apply `clamp_min=0.1` for cross-stage propagation safety.
 
 ### Progressive Degradation Curriculum
 
@@ -194,7 +196,7 @@ Local degradation includes: global degradation types applied locally, and missin
 
 ```
 L_total = L_seg + L_aux + L_align + L_retention + L_deg + L_deg_aux
-          + L_distill (Phase 3) + L_inv (Phase 3)
+          + L_distill (Phase 3) + L_inv (Phase 3) + L_priv_align (Phase 3)
 ```
 
 | Loss | Description | Weight |
@@ -202,9 +204,10 @@ L_total = L_seg + L_aux + L_align + L_retention + L_deg + L_deg_aux
 | `L_seg` | CE + Dice on main decoder (clean + degraded) | 1.0 |
 | `L_aux` | CE + Dice on auxiliary heads (clean + degraded) | 0.3 |
 | `L_align` | Category-aware InfoNCE contrastive loss | 0.1 |
-| `L_retention` | Retention rate regularization (r_min=0.5, r_max=0.95) | 2.0 |
+| `L_retention` | Retention rate regularization (r_min=0.4, r_max=0.98) | 2.0 |
 | `L_distill` | KL distillation (clean → degraded), Phase 3 only | 0.3 |
 | `L_inv` | Smooth L1 invariant loss (quality-gated), Phase 3 only | 0.03 |
+| `L_priv_align` | MSE private-common quality distillation, Phase 3 only | 0.5 |
 
 ---
 
@@ -228,8 +231,8 @@ L_total = L_seg + L_aux + L_align + L_retention + L_deg + L_deg_aux
 | `alpha` | 10.0 | Attention bias strength |
 | `fuse_beta` | 6.0 | Fusion weight decay exponent |
 | `fuse_epsilon` | 1e-3 | Fusion weight minimum |
-| `retention_min` | 0.5 | Retention rate lower bound |
-| `retention_max` | 0.95 | Retention rate upper bound |
+| `retention_min` | 0.4 | Retention rate lower bound |
+| `retention_max` | 0.98 | Retention rate upper bound |
 | `loss_distill_weight` | 0.3 | Distillation loss weight |
 | `loss_invariant_weight` | 0.03 | Invariant loss weight |
 | `aux_loss_weight` | 0.3 | Auxiliary decoder loss weight |
@@ -240,7 +243,7 @@ L_total = L_seg + L_aux + L_align + L_retention + L_deg + L_deg_aux
 
 | File | Content |
 |------|---------|
-| `mmseg/models/segmentors/v9_utils.py` | QualityPredictor, f_attn/f_fuse/f_hard_mask, cascade_quality_suppress, QualityModulatedFusion, degradation schedule, contrastive loss |
+| `mmseg/models/segmentors/v9_utils.py` | QualityPredictor, f_attn/f_fuse/f_hard_mask, cascade_quality_suppress, degradation schedule, contrastive loss |
 | `mmseg/models/segmentors/swin_quality_mask2former.py` | Swin model + Swin-specific quality attention bias + fusion modules |
 | `mmseg/models/segmentors/mit_quality_mamba.py` | MiT model + MiT-specific quality attention bias + fusion modules |
 | `mmseg/datasets/transforms/quality_degradation.py` | Degradation type implementations |

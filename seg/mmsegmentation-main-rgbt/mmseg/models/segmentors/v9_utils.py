@@ -20,13 +20,15 @@ from mmseg.datasets.transforms.quality_degradation import (
 # QualityPredictor
 # ---------------------------------------------------------------------------
 class QualityPredictor(nn.Module):
-    """Per-stage quality predictor with masked global context.
+    """Per-stage quality predictor with global context injection.
 
     Input:  x [B, C, H, W] feature map, mask [B, 1, H, W] hard mask (detached).
     Output: s [B, 1, H, W] continuous quality score in [1e-7, 1-1e-7].
     """
     def __init__(self, in_channels):
         super().__init__()
+        self.in_channels = in_channels
+        self.ctx_proj = nn.Conv2d(in_channels * 2, in_channels, 1, bias=False)
         hidden = min(128, max(64, in_channels // 2))
         self.hidden = hidden
         self.norm1 = nn.LayerNorm(in_channels)
@@ -34,7 +36,7 @@ class QualityPredictor(nn.Module):
         self.norm2 = nn.LayerNorm(hidden)
         self.conv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
         self.score_head = nn.Conv2d(hidden, 1, 1, bias=True)
-        nn.init.constant_(self.score_head.bias, 4.0)
+        nn.init.constant_(self.score_head.bias, 0.0)
         self._init_weights()
 
     def _init_weights(self):
@@ -43,9 +45,12 @@ class QualityPredictor(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        nn.init.constant_(self.score_head.bias, 4.0)
+        nn.init.constant_(self.score_head.bias, 0.0)
 
     def forward(self, x, mask):
+        B, C, H, W = x.shape
+        glob = F.adaptive_avg_pool2d(x.detach(), 1).expand(-1, -1, H, W)
+        x = self.ctx_proj(torch.cat([x.detach(), glob], dim=1))
         x = x.permute(0, 2, 3, 1)
         x = self.norm1(x).permute(0, 3, 1, 2)
         x = self.conv1(x)
@@ -115,7 +120,7 @@ def cascade_quality_suppress(s_current, cumulative_prev, target_h, target_w,
         new_cumulative: [B, 1, H_k, W_k] updated cumulative product
     """
     if cumulative_prev is None:
-        return s_current, s_current.detach()
+        return s_current, s_current
 
     if cumulative_prev.shape[2:] != (target_h, target_w):
         pooled_prev = F.adaptive_max_pool2d(cumulative_prev, (target_h, target_w))
@@ -126,39 +131,8 @@ def cascade_quality_suppress(s_current, cumulative_prev, target_h, target_w,
         pooled_prev = pooled_prev.clamp(min=clamp_min)
 
     s_adjusted = s_current * pooled_prev
-    new_cumulative = s_adjusted.detach()
+    new_cumulative = s_adjusted
     return s_adjusted, new_cumulative
-
-
-class QualityModulatedFusion(nn.Module):
-    """Unified quality-modulated private-common fusion.
-
-    Step 1: Quality-modulate private features with f_fuse(s_priv).
-    Step 2: Channel-concatenate [F_gen, priv_modulated].
-    Step 3: 1x1 conv MLP (2C -> C) + GELU.
-    Step 4: LayerNorm.
-    """
-
-    def __init__(self, d_model, tau=0.3, epsilon=1e-3, beta=6.0, tau_hard=0.2):
-        super().__init__()
-        self.tau = tau
-        self.epsilon = epsilon
-        self.beta = beta
-        self.tau_hard = tau_hard
-        self.fuse_conv = nn.Conv2d(d_model * 2, d_model, 1, bias=False)
-        self.act = nn.GELU()
-        self.norm = nn.LayerNorm(d_model)
-
-    def forward(self, F_gen, F_priv, s_priv):
-        hard_mask = f_hard_mask(s_priv, tau_hard=self.tau_hard)
-        F_priv = F_priv * hard_mask
-        w = f_fuse(s_priv, tau=self.tau, epsilon=self.epsilon, beta=self.beta)
-        priv_modulated = F_priv * w
-        x = torch.cat([F_gen, priv_modulated], dim=1)
-        x = self.fuse_conv(x)
-        x = self.act(x)
-        out = self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        return out
 
 
 # ---------------------------------------------------------------------------

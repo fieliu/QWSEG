@@ -219,8 +219,8 @@ model = dict(
             dict(type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0),
             dict(type='DiceLoss', use_sigmoid=False, activate=True, loss_weight=1.0),
         ]),
-    retention_min=0.5,
-    retention_max=0.95,
+    retention_min=0.4,
+    retention_max=0.98,
     retention_loss_weight=2.0,
     phase_mode='absolute',
     phase1_epochs=10,
@@ -287,7 +287,7 @@ for pred_name in ['predictors_common_rgb', 'predictors_common_t',
                   'predictors_priv_rgb', 'predictors_priv_t']:
     predictor_keys[f'{pred_name}'] = dict(lr_mult=5.0, decay_mult=1.0)
     for stage_id in range(4):
-        for sub in ['local_conv1', 'local_conv2', 'fuse_conv1', 'fuse_conv2',
+        for sub in ['ctx_proj', 'norm1', 'conv1', 'norm2', 'conv2',
                     'score_head']:
             predictor_keys[f'{pred_name}.{stage_id}.{sub}'] = dict(lr_mult=5.0, decay_mult=1.0)
 

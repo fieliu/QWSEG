@@ -101,6 +101,15 @@ class MiTBaselineMamba(BaseSegmentor):
       - Final fusion: DualGateEnhancedFusion (same as quality model)
       - SegformerHead main decoder + auxiliary decoders
       - Degradation training + contrastive + distillation + invariant losses
+
+    Three-phase training curriculum (same schedule as quality model):
+      Phase 1 (epoch 0 ~ phase1_epochs):   Clean-only warmup,
+            no degradation branch, no distill/invariant loss.
+      Phase 2 (phase1_epochs ~ phase1+phase2): Robustness warmup,
+            mild local+global degradation (no missing),
+            distill + invariant loss activated.
+      Phase 3 (phase1+phase2 ~ end):        Full degradation,
+            missing introduced progressively.
     """
 
     def __init__(self,
@@ -128,6 +137,8 @@ class MiTBaselineMamba(BaseSegmentor):
                  global_deg_ratio: float = 0.3,
                  local_deg_ratio: float = 0.4,
                  total_epochs: int = 200,
+                 phase1_epochs: int = 15,
+                 phase2_epochs: int = 15,
                  init_cfg: OptMultiConfig = None):
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
         if pretrained is not None:
@@ -159,6 +170,8 @@ class MiTBaselineMamba(BaseSegmentor):
         self.global_deg_ratio = global_deg_ratio
         self.local_deg_ratio = local_deg_ratio
         self.total_epochs = total_epochs
+        self.phase1_epochs = phase1_epochs
+        self.phase2_epochs = phase2_epochs
 
     def _init_decode_head(self, decode_head):
         self.decode_head = MODELS.build(decode_head)
@@ -177,6 +190,11 @@ class MiTBaselineMamba(BaseSegmentor):
     @property
     def with_neck(self):
         return hasattr(self, 'neck') and self.neck is not None
+
+    def _get_training_phase(self, epoch):
+        if epoch < self.phase1_epochs: return 1
+        elif epoch < self.phase1_epochs + self.phase2_epochs: return 2
+        return 3
 
     @staticmethod
     def _stack_batch_gt(data_samples):
@@ -299,6 +317,8 @@ class MiTBaselineMamba(BaseSegmentor):
     def loss(self, inputs, data_samples):
         rgb, ir = inputs[:, :3], inputs[:, 3:]
         B = rgb.shape[0]
+        ep = getattr(self, 'current_epoch', 0)
+        ph = self._get_training_phase(ep)
 
         zc_r, zc_t, zp_r, zp_t, zf, re, te, ff = self._extract_feat_single(rgb, ir)
 
@@ -332,13 +352,8 @@ class MiTBaselineMamba(BaseSegmentor):
             if cnt:
                 losses['loss_align'] = (lc / cnt) * self.loss_align_weight
 
-        if self.training:
+        if self.training and ph >= 2:
             dzcr, dzct, dzpr, dzpt, dzf, drl, dtl, df = self._train_with_degradation(rgb, ir)
-            if torch.isnan(df[0]).any():
-                import logging
-                logging.getLogger(__name__).warning(
-                    'NaN in degraded features — falling back to clean features for deg losses')
-                dzcr, dzct, dzpr, dzpt, dzf, drl, dtl, df = zc_r, zc_t, zp_r, zp_t, zf, re, te, ff
 
             losses.update(add_prefix(self.decode_head.loss(df, data_samples, self.train_cfg), 'deg_decode'))
             for head, feats, pfx in [

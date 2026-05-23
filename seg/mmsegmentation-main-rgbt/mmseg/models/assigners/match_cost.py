@@ -79,7 +79,7 @@ class ClassificationCost(BaseMatchCost):
             "pred_instances must contain 'scores'"
         assert hasattr(gt_instances, 'labels'), \
             "gt_instances must contain 'labels'"
-        pred_scores = pred_instances.scores
+        pred_scores = pred_instances.scores.float()
         gt_labels = gt_instances.labels
 
         pred_scores = pred_scores.softmax(-1)
@@ -125,7 +125,7 @@ class DiceCost(BaseMatchCost):
         Returns:
             Tensor: Dice cost matrix in shape (num_queries, num_gt).
         """
-        mask_preds = mask_preds.flatten(1)
+        mask_preds = mask_preds.flatten(1).float()
         gt_masks = gt_masks.flatten(1).float()
         numerator = 2 * torch.einsum('nc,mc->nm', mask_preds, gt_masks)
         if self.naive_dice:

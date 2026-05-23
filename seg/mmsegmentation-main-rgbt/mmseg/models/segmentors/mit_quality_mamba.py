@@ -2,7 +2,17 @@
 
 Token pruning (DynamicViT-style) on a multi-branch MiT backbone with
 Gumbel-Softmax hard gating, quality-modulated fusion, and three-phase
-training.  Fully self-contained — only depends on BaseSegmentor + v9_utils.
+training curriculum:
+  Phase 1 (epoch 0 ~ phase1_epochs):   Clean-only warmup. QP frozen,
+        force_all_keep=True, no degradation branch, no distill/invariant loss.
+  Phase 2 (phase1_epochs ~ phase1+phase2): Robustness warmup. QP frozen,
+        force_all_keep=True, mild local+global degradation (no missing),
+        distill + invariant loss activated (uniform quality weights).
+  Phase 3 (phase1+phase2 ~ end):        Quality-aware. QP unfrozen,
+        force_all_keep=False, missing degradation introduced progressively,
+        distill + invariant loss with quality-weighted gating,
+        retention loss activated.
+Fully self-contained — only depends on BaseSegmentor + v9_utils.
 """
 
 import math
@@ -20,7 +30,6 @@ from mmseg.models.segmentors.v9_utils import (
     QualityPredictor,
     f_attn,
     f_fuse,
-    f_hard_mask,
     cascade_quality_suppress,
     downsample_mask,
     get_degradation_schedule,
@@ -144,12 +153,9 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
         all_s_rgb.append(s_rgb)
         all_s_t.append(s_t)
 
-        s_avg = (s_rgb + s_t) / 2 + 1e-8
-        rel_s_rgb = s_rgb / s_avg
-        rel_s_t = s_t / s_avg
-        rel_s_combined = torch.cat([rel_s_rgb, rel_s_t], dim=0)
-        s_combined = torch.cat([s_rgb, s_t], dim=0)
-        hard_mask = f_hard_mask(s_combined, tau_hard=tau_hard)
+        bias_rgb = torch.where(s_rgb < s_t, f_attn(s_rgb, tau=tau, alpha=alpha), torch.zeros_like(s_rgb))
+        bias_t = torch.where(s_t < s_rgb, f_attn(s_t, tau=tau, alpha=alpha), torch.zeros_like(s_t))
+        bias_combined = torch.cat([bias_rgb, bias_t], dim=0)
 
         for j, block in enumerate(blocks):
             residual = x
@@ -194,8 +200,8 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
             attn = (Q @ K.transpose(-2, -1)) * scale
 
             H_k, W_k = hw_shape_k
-            s_k = downsample_mask(rel_s_combined, H_k, W_k)
-            attn_bias = f_attn(s_k, tau=tau, alpha=alpha).reshape(Bb, 1, 1, -1)
+            s_k = downsample_mask(bias_combined, H_k, W_k)
+            attn_bias = s_k.reshape(Bb, 1, 1, -1)
             attn = attn + attn_bias.to(attn.dtype)
 
             attn = attn.float().softmax(dim=-1).to(V.dtype)
@@ -214,7 +220,6 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
             x = residual + ffn_out
 
         x = norm(x)
-        x = x * hard_mask.view(B_tok, H * W, 1)
         x = nlc_to_nchw(x, hw_shape)
         if i in backbone.out_indices:
             outs.append(x)
@@ -260,7 +265,6 @@ def _forward_branch_pruned(backbone, img, predictor_list,
         s, cum_s = cascade_quality_suppress(s, cum_s, H, W, clamp_min=clamp_min)
 
         all_s.append(s)
-        hard_mask = f_hard_mask(s, tau_hard=tau_hard)
 
         for j, block in enumerate(blocks):
             residual = x
@@ -325,7 +329,6 @@ def _forward_branch_pruned(backbone, img, predictor_list,
             x = residual + ffn_out
 
         x = norm(x)
-        x = x * hard_mask.view(B_tok, H * W, 1)
         x = nlc_to_nchw(x, hw_shape)
         if i in backbone.out_indices:
             outs.append(x)
@@ -460,10 +463,9 @@ class QualityGatedMiTMamba(BaseSegmentor):
             return 3
         if self.phase_mode == 'ratio':
             r = min(epoch / max(self.total_epochs, 1), 1.0)
-            if r < 0.1: return 1
-            elif r < 0.3: return 2
+            if r < 0.075: return 1
+            elif r < 0.15: return 2
             return 3
-        # absolute (default)
         if epoch < self.phase1_epochs: return 1
         elif epoch < self.phase1_epochs + self.phase2_epochs: return 2
         return 3
@@ -472,7 +474,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
         phase = self._get_training_phase(epoch)
         all_p = [self.predictors_common_rgb, self.predictors_common_t,
                  self.predictors_priv_rgb, self.predictors_priv_t]
-        if phase == 1 or phase == 2:
+        if phase < 3:
             for pl in all_p:
                 for m in pl:
                     for p in m.parameters(): p.requires_grad = False
@@ -650,15 +652,9 @@ class QualityGatedMiTMamba(BaseSegmentor):
                         ignore_label=255, pad_mask=pm)
                     cnt += 1
             if cnt: losses['loss_align'] = (lc/cnt)*self.loss_align_weight
-        if self.retention_loss_weight > 0: losses['loss_retention'] = self.retention_loss_weight*self._compute_retention_loss(all_s)
-        if self.training:
+        if self.retention_loss_weight > 0 and ph >= 3: losses['loss_retention'] = self.retention_loss_weight*self._compute_retention_loss(all_s)
+        if self.training and ph >= 2:
             (dzcr,dzct,dzpr,dzpt,dzf,drl,dtl,df,ds_r,ds_t,dall_s,dspr,dspt) = self._train_with_degradation(rgb,ir)
-            if torch.isnan(df[0]).any():
-                import logging
-                logging.getLogger(__name__).warning(
-                    'NaN in degraded features — falling back to clean features for deg losses')
-                (dzcr,dzct,dzpr,dzpt,dzf,drl,dtl,df,ds_r,ds_t,dall_s,dspr,dspt) = \
-                    zc_r,zc_t,zp_r,zp_t,zf,re,te,ff,s_r,s_t,all_s,spr,spt
             losses.update(add_prefix(self.decode_head.loss(df,data_samples,self.train_cfg),'deg_decode'))
             for head, feats, pfx in [
                 (self.common_decode_head, dzf, 'deg_common_decode'),
@@ -682,7 +678,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
                             ignore_label=255, pad_mask=pm)
                         dcnt += 1
                 if dcnt: losses['loss_align_deg'] = (dlc/dcnt)*self.loss_align_weight
-            if self.loss_distill_weight > 0 and ph >= 3:
+            if self.loss_distill_weight > 0:
                 T = self.distill_temperature
                 cl = self.decode_head.forward(ff).float(); dl_ = self.decode_head.forward(df).float()
                 tp = F.softmax(cl.detach()/T,dim=1); sp = F.log_softmax(dl_/T,dim=1)
@@ -691,7 +687,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
                 dm_f = dm.float()
                 losses['loss_distill'] = self.loss_distill_weight*(T*T)*(kl*dm_f).sum()/dm_f.sum().clamp(min=1)
 
-            if self.loss_invariant_weight > 0 and ph >= 3:
+            if self.loss_invariant_weight > 0:
                 inv_loss = torch.tensor(0.0, device=ff[0].device)
                 cnt = 0
                 for i in range(len(zf)):

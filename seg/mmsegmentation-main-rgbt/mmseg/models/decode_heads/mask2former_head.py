@@ -147,7 +147,7 @@ class Mask2FormerHead(MMDET_Mask2FormerHead):
                 mask_point_targets = point_sample(
                     mask_targets.unsqueeze(1).float(), points_coords).squeeze(1)
             mask_point_preds = point_sample(
-                mask_preds_pos.unsqueeze(1), points_coords).squeeze(1)
+                mask_preds_pos.unsqueeze(1).float(), points_coords).squeeze(1)
 
             loss_dice = self.loss_dice(
                 mask_point_preds, mask_point_targets,

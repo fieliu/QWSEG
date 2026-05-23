@@ -123,7 +123,7 @@ def cascade_quality_suppress(s_current, cumulative_prev, target_h, target_w,
         return s_current, s_current
 
     if cumulative_prev.shape[2:] != (target_h, target_w):
-        pooled_prev = F.adaptive_max_pool2d(cumulative_prev, (target_h, target_w))
+        pooled_prev = F.adaptive_avg_pool2d(cumulative_prev, (target_h, target_w))
     else:
         pooled_prev = cumulative_prev
 
@@ -193,7 +193,7 @@ def complementary_fix(D_rgb_raw, D_t_raw, q_rgb_weight, q_t_weight):
 def downsample_mask(D, H_k, W_k):
     if D.shape[2] == H_k and D.shape[3] == W_k:
         return D
-    return F.adaptive_max_pool2d(D.float(), (H_k, W_k))
+    return F.adaptive_avg_pool2d(D.float(), (H_k, W_k))
 
 
 # ---------------------------------------------------------------------------
@@ -255,38 +255,39 @@ def _lerp(a, b, t):
 def get_degradation_schedule(r):
     """Return probability dict for each degradation type at training progress r.
 
-    Progressive curriculum:
-    - Phase 1 (r<0.05):  local-only, mild, no missing/global
-    - Phase 2 (0.05-0.15):  local + global, mild-moderate, no missing
-    - Phase 3 early (0.15-0.3):  introduce missing modality gradually
-    - Phase 3 late (0.3+):  full mix with 40% missing
+    Three-phase progressive curriculum (aligned with training phases):
+    - Phase 1 (r<0.075):  no degradation (clean-only warmup)
+    - Phase 2 (0.075-0.15):  local + global, mild, no missing (robustness warmup)
+    - Phase 3 early (0.15-0.25):  introduce missing modality gradually (QP unfreezes)
+    - Phase 3 mid (0.25-0.40):  missing increases, moderate-heavy
+    - Phase 3 full (0.40+):  full mix with 40% missing
     """
-    if r < 0.05:          # epoch  0- 9  (200 total) — Phase 1
-        t = r / 0.05
-        p_local, p_global, p_missing = 1.0, 0.0, 0.0
-        local_levels  = {2: _lerp(0.8, 0.5, t), 3: _lerp(0.2, 0.5, t), 4: 0.0, 5: 0.0}
+    if r < 0.075:        # Phase 1 (epoch 0-14): no degradation
+        p_local, p_global, p_missing = 0.0, 0.0, 0.0
+        local_levels  = {2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
         global_levels = {2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
-    elif r < 0.10:         # epoch 10-19 — Phase 2 early
-        t = (r - 0.05) / 0.05
-        p_local, p_global, p_missing = _lerp(1.0, 0.7, t), _lerp(0.0, 0.3, t), 0.0
-        local_levels  = {2: _lerp(0.5, 0.2, t), 3: _lerp(0.5, 0.4, t), 4: _lerp(0.0, 0.4, t), 5: 0.0}
-        global_levels = {2: _lerp(1.0, 0.7, t), 3: _lerp(0.0, 0.3, t), 4: 0.0, 5: 0.0}
-    elif r < 0.15:         # epoch 20-29 — Phase 2 late
-        t = (r - 0.10) / 0.05
-        p_local, p_global, p_missing = _lerp(0.7, 0.5, t), _lerp(0.3, 0.4, t), _lerp(0.0, 0.1, t)
-        local_levels  = {2: 0.1, 3: _lerp(0.4, 0.3, t), 4: _lerp(0.4, 0.5, t), 5: _lerp(0.1, 0.2, t)}
-        global_levels = {2: _lerp(0.6, 0.3, t), 3: _lerp(0.3, 0.5, t), 4: _lerp(0.1, 0.2, t), 5: 0.0}
-    elif r < 0.25:         # epoch 30-49 — Phase 3 early
+    elif r < 0.15:       # Phase 2 (epoch 15-29): local+global, mild, no missing
+        t = (r - 0.075) / 0.075
+        p_local  = _lerp(0.7, 0.5, t)
+        p_global = _lerp(0.3, 0.5, t)
+        p_missing = 0.0
+        local_levels  = {2: _lerp(0.8, 0.5, t), 3: _lerp(0.2, 0.5, t), 4: 0.0, 5: 0.0}
+        global_levels = {2: _lerp(1.0, 0.6, t), 3: _lerp(0.0, 0.4, t), 4: 0.0, 5: 0.0}
+    elif r < 0.25:       # Phase 3 early (epoch 30-49): introduce missing
         t = (r - 0.15) / 0.10
-        p_local, p_global, p_missing = _lerp(0.5, 0.35, t), _lerp(0.4, 0.35, t), _lerp(0.1, 0.3, t)
-        local_levels  = {2: 0.0, 3: _lerp(0.3, 0.2, t), 4: _lerp(0.5, 0.4, t), 5: _lerp(0.2, 0.4, t)}
-        global_levels = {2: 0.2, 3: _lerp(0.5, 0.3, t), 4: _lerp(0.3, 0.4, t), 5: _lerp(0.0, 0.3, t)}
-    elif r < 0.40:         # epoch 50-79 — Phase 3 mid
+        p_local  = _lerp(0.5, 0.4, t)
+        p_global = _lerp(0.5, 0.35, t)
+        p_missing = _lerp(0.0, 0.25, t)
+        local_levels  = {2: 0.3, 3: 0.4, 4: _lerp(0.2, 0.2, t), 5: _lerp(0.1, 0.1, t)}
+        global_levels = {2: 0.3, 3: 0.4, 4: _lerp(0.2, 0.2, t), 5: _lerp(0.0, 0.1, t)}
+    elif r < 0.40:       # Phase 3 mid (epoch 50-79): missing increases
         t = (r - 0.25) / 0.15
-        p_local, p_global, p_missing = _lerp(0.35, 0.3, t), 0.35, _lerp(0.3, 0.35, t)
-        local_levels  = {2: 0.0, 3: 0.1, 4: _lerp(0.4, 0.3, t), 5: _lerp(0.5, 0.6, t)}
-        global_levels = {2: 0.1, 3: _lerp(0.3, 0.3, t), 4: _lerp(0.4, 0.3, t), 5: _lerp(0.2, 0.4, t)}
-    else:                   # epoch 80+ — fully trained
+        p_local  = _lerp(0.4, 0.3, t)
+        p_global = 0.3
+        p_missing = _lerp(0.25, 0.4, t)
+        local_levels  = {2: 0.1, 3: 0.2, 4: 0.4, 5: 0.3}
+        global_levels = {2: 0.2, 3: 0.3, 4: 0.3, 5: _lerp(0.0, 0.2, t)}
+    else:                # Phase 3 full (epoch 80+): full mix
         p_local, p_global, p_missing = 0.3, 0.3, 0.4
         local_levels  = {2: 0.0, 3: 0.1, 4: 0.3, 5: 0.6}
         global_levels = {2: 0.1, 3: 0.3, 4: 0.3, 5: 0.3}

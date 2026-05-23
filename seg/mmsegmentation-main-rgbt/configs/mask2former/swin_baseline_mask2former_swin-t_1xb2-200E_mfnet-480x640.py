@@ -220,6 +220,8 @@ model = dict(
             dict(type='DiceLoss', use_sigmoid=False, activate=True, loss_weight=1.0),
         ]),
     total_epochs=200,
+    phase1_epochs=15,
+    phase2_epochs=15,
     loss_align_weight=0.1,
     contrast_tau=0.07,
     contrast_num_samples=512,

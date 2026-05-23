@@ -74,6 +74,7 @@ class HungarianAssigner(BaseAssigner):
 
         device = cost.device
         cost = cost.detach().cpu()
+        cost = torch.nan_to_num(cost, nan=0.0, posinf=1e6, neginf=-1e6)
         if linear_sum_assignment is None:
             raise ImportError('Please run "pip install scipy" '
                               'to install scipy first.')

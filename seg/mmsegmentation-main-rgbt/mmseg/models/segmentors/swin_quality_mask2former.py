@@ -1034,7 +1034,8 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
 
     def _generate_degraded_vis_inputs(self, rgb, ir):
         """Visualization degradation — follows the same schedule as training."""
-        return self._generate_degraded_inputs(rgb, ir)
+        dr, di, dtr, dtt, _, _ = self._generate_degraded_inputs(rgb, ir)
+        return dr, di, dtr, dtt
 
     def _forward(self, inputs, data_samples=None):
         rgb, t = inputs[:,:3], inputs[:,3:]

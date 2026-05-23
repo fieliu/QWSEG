@@ -196,6 +196,89 @@ def downsample_mask(D, H_k, W_k):
     return F.adaptive_avg_pool2d(D.float(), (H_k, W_k))
 
 
+def quality_guided_loss(s_clean_list, s_deg_list, deg_level,
+                        num_stages=4, max_rank_samples=512,
+                        margin=0.2, extreme_thresh=0.1):
+    """Degradation-region quality-guided loss.
+
+    Three sub-losses per (predictor, stage):
+      1. Extreme constraint (level 5): force s_deg <= extreme_thresh
+      2. Relative ranking (level 2-4): s_deg <= s_clean + margin
+      3. Clean consistency (level 0): |s_deg - s_clean| -> 0
+
+    Args:
+        s_clean_list: list of per-stage clean quality scores [B,1,H_i,W_i]
+        s_deg_list:   list of per-stage degraded quality scores [B,1,H_i,W_i]
+        deg_level:    [B,1,H_orig,W_orig] long tensor, 0/2/3/4/5
+        num_stages:   number of backbone stages
+        max_rank_samples: max sampled pairs for ranking loss
+        margin:       hinge margin for ranking loss
+        extreme_thresh: threshold for extreme degradation constraint
+
+    Returns:
+        scalar loss (averaged over all valid sub-losses)
+    """
+    total_loss = torch.tensor(0.0, device=deg_level.device)
+    count = 0
+
+    for i in range(min(num_stages, len(s_clean_list), len(s_deg_list))):
+        s_c = s_clean_list[i].float()
+        s_d = s_deg_list[i].float()
+        H_s, W_s = s_d.shape[2], s_d.shape[3]
+
+        if s_c.shape[2:] != s_d.shape[2:]:
+            s_c = F.interpolate(s_c, size=(H_s, W_s), mode='bilinear', align_corners=False)
+
+        lvl = F.adaptive_max_pool2d(deg_level.float(), (H_s, W_s)).long()
+
+        mask5 = (lvl == 5)
+        if mask5.any():
+            total_loss = total_loss + F.relu(s_d[mask5] - extreme_thresh).pow(2).mean()
+            count += 1
+
+        mask_degr = (lvl >= 2) & (lvl <= 4)
+        mask_clean = (lvl == 0)
+        if mask_clean.any() and mask_degr.any():
+            n_sample = min(max_rank_samples, mask_degr.sum().item(), mask_clean.sum().item())
+            if n_sample > 0:
+                B_s = s_d.shape[0]
+                all_deg_vals = []
+                all_clean_vals = []
+                for b in range(B_s):
+                    deg_mask_b = mask_degr[b, 0]
+                    clean_mask_b = mask_clean[b, 0]
+                    if not deg_mask_b.any() or not clean_mask_b.any():
+                        continue
+                    deg_coords = deg_mask_b.nonzero(as_tuple=False)
+                    clean_coords = clean_mask_b.nonzero(as_tuple=False)
+                    n_b = min(n_sample, deg_coords.size(0), clean_coords.size(0))
+                    if n_b == 0:
+                        continue
+                    perm_d = torch.randperm(deg_coords.size(0), device=deg_coords.device)[:n_b]
+                    perm_c = torch.randperm(clean_coords.size(0), device=clean_coords.device)[:n_b]
+                    d_idx = deg_coords[perm_d]
+                    c_idx = clean_coords[perm_c]
+                    all_deg_vals.append(s_d[b, 0, d_idx[:, 0], d_idx[:, 1]])
+                    all_clean_vals.append(s_c[b, 0, c_idx[:, 0], c_idx[:, 1]])
+                if all_deg_vals:
+                    s_deg_vals = torch.cat(all_deg_vals)
+                    s_clean_vals = torch.cat(all_clean_vals)
+                    total_loss = total_loss + F.relu(s_deg_vals - s_clean_vals.detach() + margin).mean()
+                    count += 1
+
+        if mask_clean.any():
+            total_loss = total_loss + F.l1_loss(s_d[mask_clean], s_c[mask_clean].detach())
+            count += 1
+
+    if count > 0:
+        total_loss = total_loss / count
+
+    if torch.isnan(total_loss) or torch.isinf(total_loss):
+        return torch.tensor(0.0, device=deg_level.device, requires_grad=True)
+
+    return total_loss
+
+
 # ---------------------------------------------------------------------------
 # Quality degradation (progressive curriculum)
 # ---------------------------------------------------------------------------

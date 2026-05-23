@@ -85,6 +85,7 @@ model = dict(
     contrast_tau=0.07,
     contrast_num_samples=512,
     loss_invariant_weight=0.03,
+    loss_q_guide_weight=0.1,
     loss_distill_weight=0.3,
     distill_temperature=4.0,
     aux_loss_weight=0.3,

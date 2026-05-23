@@ -37,6 +37,7 @@ from mmseg.models.segmentors.v9_utils import (
     _apply_degradation,
     _generate_local_mask,
     compute_cross_modal_contrastive_loss,
+    quality_guided_loss,
 )
 from mmseg.registry import MODELS
 from mmseg.structures import SegDataSample
@@ -369,6 +370,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
                  distill_temperature: float = 4.0,
                  aux_loss_weight: float = 0.3,
                  loss_invariant_weight: float = 0.03,
+                 loss_q_guide_weight: float = 0.0,
                  missing_ratio: float = 0.3,
                  global_deg_ratio: float = 0.3,
                  local_deg_ratio: float = 0.4,
@@ -415,6 +417,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
         self.distill_temperature = distill_temperature
         self.aux_loss_weight = aux_loss_weight
         self.loss_invariant_weight = loss_invariant_weight
+        self.loss_q_guide_weight = loss_q_guide_weight
         self.missing_ratio, self.global_deg_ratio = missing_ratio, global_deg_ratio
         self.local_deg_ratio = local_deg_ratio
         self.skip_phases = skip_phases
@@ -582,8 +585,9 @@ class QualityGatedMiTMamba(BaseSegmentor):
         return zc_r, zc_t, zp_r, zp_t, zf, re, te, ff, s_r, s_t, all_s, spr, spt
 
     def _train_with_degradation(self, rgb, ir):
-        dr, di, _, _ = self._generate_degraded_inputs(rgb, ir)
-        return self._extract_feat_single(dr, di)
+        dr, di, _, _, deg_level_rgb, deg_level_t = self._generate_degraded_inputs(rgb, ir)
+        feats = self._extract_feat_single(dr, di)
+        return feats + (deg_level_rgb, deg_level_t)
 
     def _generate_degraded_inputs(self, rgb, ir):
         B, C, H, W = rgb.shape
@@ -592,6 +596,8 @@ class QualityGatedMiTMamba(BaseSegmentor):
         im = self.data_preprocessor.mean[3:].to(dev); iss = self.data_preprocessor.std[3:].to(dev)
         dr, di = rgb.clone(), ir.clone()
         dtr, dtt = ['none']*B, ['none']*B
+        deg_level_rgb = torch.zeros(B, 1, H, W, device=dev, dtype=torch.long)
+        deg_level_t = torch.zeros(B, 1, H, W, device=dev, dtype=torch.long)
         ep = getattr(self,'current_epoch',0)
         sched = get_degradation_schedule(min(ep/max(self.total_epochs,1),1.0))
         for b in range(B):
@@ -600,25 +606,31 @@ class QualityGatedMiTMamba(BaseSegmentor):
                 if random.random() < 0.5:
                     dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,deg_type='missing',level=5)
                     dtr[b]='missing'
+                    deg_level_rgb[b:b+1] = 5
                 else:
                     di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,deg_type='missing',level=5)
                     dtt[b]='missing'
+                    deg_level_t[b:b+1] = 5
             elif r < sched['p_missing']+sched['p_global']:
                 lv = sample_level(sched['global_levels'])
                 if random.random() < 0.5:
                     dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,level=lv); dtr[b]='global'
+                    deg_level_rgb[b:b+1] = lv
                 else:
                     di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,level=lv); dtt[b]='global'
+                    deg_level_t[b:b+1] = lv
             else:
                 lv = sample_level(sched['local_levels'])
                 lm = _generate_local_mask(1,H,W,num_regions=3,device=dev,level=lv)
                 if random.random() < 0.5:
                     dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,level=lv,is_local=True,local_mask=lm)
                     dtr[b]='local'
+                    deg_level_rgb[b:b+1] = (lm > 0).long() * lv
                 else:
                     di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,level=lv,is_local=True,local_mask=lm)
                     dtt[b]='local'
-        return dr, di, dtr, dtt
+                    deg_level_t[b:b+1] = (lm > 0).long() * lv
+        return dr, di, dtr, dtt, deg_level_rgb, deg_level_t
 
     # ---- loss / predict / inference ----
 
@@ -654,7 +666,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
             if cnt: losses['loss_align'] = (lc/cnt)*self.loss_align_weight
         if self.retention_loss_weight > 0 and ph >= 3: losses['loss_retention'] = self.retention_loss_weight*self._compute_retention_loss(all_s)
         if self.training and ph >= 2:
-            (dzcr,dzct,dzpr,dzpt,dzf,drl,dtl,df,ds_r,ds_t,dall_s,dspr,dspt) = self._train_with_degradation(rgb,ir)
+            (dzcr,dzct,dzpr,dzpt,dzf,drl,dtl,df,ds_r,ds_t,dall_s,dspr,dspt,deg_level_rgb,deg_level_t) = self._train_with_degradation(rgb,ir)
             losses.update(add_prefix(self.decode_head.loss(df,data_samples,self.train_cfg),'deg_decode'))
             for head, feats, pfx in [
                 (self.common_decode_head, dzf, 'deg_common_decode'),
@@ -717,6 +729,21 @@ class QualityGatedMiTMamba(BaseSegmentor):
                             cnt += 1
                 if cnt:
                     losses['loss_inv'] = self.loss_invariant_weight * inv_loss / cnt
+
+            if self.loss_q_guide_weight > 0 and ph >= 3:
+                num_stages = len(s_r)
+                lqg = torch.tensor(0.0, device=ff[0].device)
+                lqg_cnt = 0
+                for s_clean_l, s_deg_l, deg_lv in [
+                    (s_r, ds_r, deg_level_rgb),
+                    (s_t, ds_t, deg_level_t),
+                    (spr, dspr, deg_level_rgb),
+                    (spt, dspt, deg_level_t),
+                ]:
+                    lqg = lqg + quality_guided_loss(s_clean_l, s_deg_l, deg_lv, num_stages=num_stages)
+                    lqg_cnt += 1
+                if lqg_cnt > 0:
+                    losses['loss_q_guide'] = self.loss_q_guide_weight * lqg / lqg_cnt
 
             pass
         return losses

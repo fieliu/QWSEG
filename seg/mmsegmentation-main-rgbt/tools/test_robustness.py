@@ -385,20 +385,15 @@ def get_batch_scenarios():
 
     scenarios.append(('clean', 'CleanDegradation', {}))
 
-    scenarios.append(('emm_rgb_missing', 'RGBMissingDegradation', {}))
-    scenarios.append(('emm_thermal_missing', 'ThermalMissingDegradation', {}))
+    scenarios.append(('rgb_missing', 'RGBMissingDegradation', {}))
 
-    for intensity in ['low', 'medium', 'high']:
-        scenarios.append(
-            (f'global_{intensity}', 'GlobalDegradation',
-             {'deg_type': 'random', 'intensity': intensity,
-              'dual_prob': 0.1}))
+    scenarios.append(('thermal_missing', 'ThermalMissingDegradation', {}))
 
-    for intensity in ['low', 'medium', 'high']:
-        scenarios.append(
-            (f'local_{intensity}', 'LocalDegradation',
-             {'deg_type': 'random', 'intensity': intensity,
-              'dual_prob': 0.1}))
+    scenarios.append(('local_rgb_missing_50', 'LocalRGBMissingDegradation',
+                      {'area_ratio': 0.5}))
+
+    scenarios.append(('local_thermal_missing_50', 'LocalThermalMissingDegradation',
+                      {'area_ratio': 0.5}))
 
     return scenarios
 

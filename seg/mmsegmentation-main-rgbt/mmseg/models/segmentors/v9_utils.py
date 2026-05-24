@@ -36,7 +36,7 @@ class QualityPredictor(nn.Module):
         self.norm2 = nn.LayerNorm(hidden)
         self.conv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
         self.score_head = nn.Conv2d(hidden, 1, 1, bias=True)
-        nn.init.constant_(self.score_head.bias, 0.0)
+        nn.init.constant_(self.score_head.bias, 4.0)
         self._init_weights()
 
     def _init_weights(self):
@@ -45,7 +45,7 @@ class QualityPredictor(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        nn.init.constant_(self.score_head.bias, 0.0)
+        nn.init.constant_(self.score_head.bias, 4.0)
 
     def forward(self, x, mask):
         B, C, H, W = x.shape
@@ -198,13 +198,15 @@ def downsample_mask(D, H_k, W_k):
 
 def quality_guided_loss(s_clean_list, s_deg_list, deg_level,
                         num_stages=4, max_rank_samples=512,
-                        margin=0.2, extreme_thresh=0.1):
+                        margin=0.2, extreme_thresh=0.1,
+                        clean_thresh=0.7):
     """Degradation-region quality-guided loss.
 
-    Three sub-losses per (predictor, stage):
+    Four sub-losses per (predictor, stage):
       1. Extreme constraint (level 5): force s_deg <= extreme_thresh
       2. Relative ranking (level 2-4): s_deg <= s_clean + margin
       3. Clean consistency (level 0): |s_deg - s_clean| -> 0
+      4. Clean score floor (level 0): force s_clean >= clean_thresh
 
     Args:
         s_clean_list: list of per-stage clean quality scores [B,1,H_i,W_i]
@@ -214,6 +216,7 @@ def quality_guided_loss(s_clean_list, s_deg_list, deg_level,
         max_rank_samples: max sampled pairs for ranking loss
         margin:       hinge margin for ranking loss
         extreme_thresh: threshold for extreme degradation constraint
+        clean_thresh: minimum quality score for clean regions
 
     Returns:
         scalar loss (averaged over all valid sub-losses)
@@ -270,6 +273,10 @@ def quality_guided_loss(s_clean_list, s_deg_list, deg_level,
             total_loss = total_loss + F.l1_loss(s_d[mask_clean], s_c[mask_clean].detach())
             count += 1
 
+        if mask_clean.any():
+            total_loss = total_loss + F.relu(clean_thresh - s_c[mask_clean]).pow(2).mean()
+            count += 1
+
     if count > 0:
         total_loss = total_loss / count
 
@@ -293,101 +300,74 @@ def _renorm_from_01(tensor_01, mean, std):
     return (raw - mean) / std
 
 
-def _apply_degradation(img_tensor, modality, mean, std,
-                       deg_type=None, level=None,
-                       is_local=False, local_mask=None):
+def _apply_missing_degradation(img_tensor, mean, std):
     B, C, H, W = img_tensor.shape
     img_01 = _denorm_to_01(img_tensor, mean, std)
-    if deg_type is None:
-        deg_type = random.choice(
-            _QUALITY_RGB_DEG_TYPES if modality == 'rgb' else _QUALITY_T_DEG_TYPES)
-    if level is None:
-        level = random.randint(2, 5)
-    if modality == 'rgb':
-        deg_img_01 = apply_quality_degradation_rgb(img_01, deg_type, level)
-    else:
-        deg_img_01 = apply_quality_degradation_t(img_01, deg_type, level)
-    if is_local and local_mask is not None:
-        if local_mask.shape[2:] != (H, W):
-            local_mask = F.interpolate(local_mask.float(), size=(H, W), mode='nearest')
-        local_mask_01 = local_mask.expand(B, C, H, W)
-        deg_img_01 = img_01 * (1 - local_mask_01) + deg_img_01 * local_mask_01
-    return _renorm_from_01(deg_img_01, mean, std)
+    img_01 = torch.zeros_like(img_01)
+    return _renorm_from_01(img_01, mean, std)
 
 
-def _generate_local_mask(B, H, W, num_regions=3, device='cpu', level=2):
+def _apply_local_missing(img_tensor, mean, std, local_mask):
+    B, C, H, W = img_tensor.shape
+    img_01 = _denorm_to_01(img_tensor, mean, std)
+    if local_mask.shape[2:] != (H, W):
+        local_mask = F.interpolate(local_mask.float(), size=(H, W), mode='nearest')
+    local_mask_01 = local_mask.expand(B, C, H, W)
+    img_01 = img_01 * (1 - local_mask_01)
+    return _renorm_from_01(img_01, mean, std)
+
+
+def _generate_single_rect_mask(B, H, W, area_ratio, device='cpu'):
     mask = torch.zeros(B, 1, H, W, device=device)
-    coverage = {2: 0.20, 3: 0.35, 4: 0.50, 5: 0.70}
-    target_area = coverage.get(level, 0.20) * H * W / num_regions
     for b in range(B):
-        for _ in range(num_regions):
-            aspect = random.uniform(0.5, 2.0)
-            area = target_area * random.uniform(0.7, 1.3)
-            rh = max(min(int(math.sqrt(area / aspect)), H), 8)
-            rw = max(min(int(math.sqrt(area * aspect)), W), 8)
-            y1 = random.randint(0, max(H - rh, 0))
-            x1 = random.randint(0, max(W - rw, 0))
-            mask[b, 0, y1:y1 + rh, x1:x1 + rw] = 1.0
+        area = H * W * area_ratio
+        aspect = random.uniform(0.5, 2.0)
+        rh = max(min(int(math.sqrt(area / aspect)), H), 4)
+        rw = max(min(int(math.sqrt(area * aspect)), W), 4)
+        y1 = random.randint(0, max(H - rh, 0))
+        x1 = random.randint(0, max(W - rw, 0))
+        mask[b, 0, y1:y1 + rh, x1:x1 + rw] = 1.0
     return mask
 
 
 def _lerp(a, b, t):
-    return a + (b - a) * t
+    return a + (b - a) * max(0.0, min(1.0, t))
 
 
-def get_degradation_schedule(r):
-    """Return probability dict for each degradation type at training progress r.
+def get_missing_schedule(r):
+    """Return degradation schedule for missing-only training.
 
-    Three-phase progressive curriculum (aligned with training phases):
-    - Phase 1 (r<0.075):  no degradation (clean-only warmup)
-    - Phase 2 (0.075-0.15):  local + global, mild, no missing (robustness warmup)
-    - Phase 3 early (0.15-0.25):  introduce missing modality gradually (QP unfreezes)
-    - Phase 3 mid (0.25-0.40):  missing increases, moderate-heavy
-    - Phase 3 full (0.40+):  full mix with 40% missing
+    Three-phase progressive curriculum:
+    - Phase 1 (r < 0.075):  no degradation (clean-only warmup)
+    - Phase 2 (0.075 - 0.15):  local missing only, area 10% -> 30%
+    - Phase 3 (0.15+):  local missing 30% -> 60%, global missing 20% -> 60%
+
+    Returns:
+        dict with keys:
+            p_local: probability of local missing
+            p_global: probability of global missing (entire modality zeroed)
+            local_area: area ratio for local missing rectangle
     """
-    if r < 0.075:        # Phase 1 (epoch 0-14): no degradation
-        p_local, p_global, p_missing = 0.0, 0.0, 0.0
-        local_levels  = {2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
-        global_levels = {2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
-    elif r < 0.15:       # Phase 2 (epoch 15-29): local+global, mild, no missing
+    if r < 0.075:
+        return dict(p_local=0.0, p_global=0.0, local_area=0.0)
+    elif r < 0.15:
         t = (r - 0.075) / 0.075
-        p_local  = _lerp(0.7, 0.5, t)
-        p_global = _lerp(0.3, 0.5, t)
-        p_missing = 0.0
-        local_levels  = {2: _lerp(0.8, 0.5, t), 3: _lerp(0.2, 0.5, t), 4: 0.0, 5: 0.0}
-        global_levels = {2: _lerp(1.0, 0.6, t), 3: _lerp(0.0, 0.4, t), 4: 0.0, 5: 0.0}
-    elif r < 0.25:       # Phase 3 early (epoch 30-49): introduce missing
-        t = (r - 0.15) / 0.10
-        p_local  = _lerp(0.5, 0.4, t)
-        p_global = _lerp(0.5, 0.35, t)
-        p_missing = _lerp(0.0, 0.25, t)
-        local_levels  = {2: 0.3, 3: 0.4, 4: _lerp(0.2, 0.2, t), 5: _lerp(0.1, 0.1, t)}
-        global_levels = {2: 0.3, 3: 0.4, 4: _lerp(0.2, 0.2, t), 5: _lerp(0.0, 0.1, t)}
-    elif r < 0.40:       # Phase 3 mid (epoch 50-79): missing increases
-        t = (r - 0.25) / 0.15
-        p_local  = _lerp(0.4, 0.3, t)
-        p_global = 0.3
-        p_missing = _lerp(0.25, 0.4, t)
-        local_levels  = {2: 0.1, 3: 0.2, 4: 0.4, 5: 0.3}
-        global_levels = {2: 0.2, 3: 0.3, 4: 0.3, 5: _lerp(0.0, 0.2, t)}
-    else:                # Phase 3 full (epoch 80+): full mix
-        p_local, p_global, p_missing = 0.3, 0.3, 0.4
-        local_levels  = {2: 0.0, 3: 0.1, 4: 0.3, 5: 0.6}
-        global_levels = {2: 0.1, 3: 0.3, 4: 0.3, 5: 0.3}
-    return dict(p_local=p_local, p_global=p_global, p_missing=p_missing,
-                local_levels=local_levels, global_levels=global_levels)
+        local_area = _lerp(0.10, 0.30, t)
+        return dict(p_local=1.0, p_global=0.0, local_area=local_area)
+    else:
+        t = min((r - 0.15) / 0.85, 1.0)
+        local_area = _lerp(0.30, 0.60, t)
+        p_global = _lerp(0.20, 0.60, t)
+        p_local = 1.0 - p_global
+        return dict(p_local=p_local, p_global=p_global, local_area=local_area)
 
+
+get_degradation_schedule = get_missing_schedule
+_apply_degradation = _apply_missing_degradation
+_generate_local_mask = _generate_single_rect_mask
 
 def sample_level(level_dist):
-    levels, probs = [], []
-    for lv in [2, 3, 4, 5]:
-        p = level_dist.get(lv, 0.0)
-        if p > 0:
-            levels.append(lv); probs.append(p)
-    if not levels:
-        return 2
-    probs = [p / sum(probs) for p in probs]
-    return random.choices(levels, weights=probs, k=1)[0]
+    return 5
 
 
 # ---------------------------------------------------------------------------

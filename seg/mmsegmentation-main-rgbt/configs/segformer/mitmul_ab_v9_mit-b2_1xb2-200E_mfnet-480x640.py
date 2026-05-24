@@ -77,7 +77,6 @@ model = dict(
     prune_mid_channels=32,  # kept for API compat, unused by QualityPredictor
     retention_min=0.5,
     retention_max=0.95,
-    retention_loss_weight=2.0,
     phase1_epochs=10,
     phase2_epochs=20,
     loss_align_weight=0.1,

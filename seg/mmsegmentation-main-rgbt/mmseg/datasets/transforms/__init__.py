@@ -7,7 +7,7 @@ from .loading import (LoadAnnotations, LoadBiomedicalAnnotation,
                       LoadRGBTImageFromFile, LoadRGBTImageFrom4Channel)
 from .robustness_degradation import (
     CleanDegradation, RGBMissingDegradation, ThermalMissingDegradation,
-    GlobalDegradation, LocalDegradation, MultiDegradation)
+    LocalRGBMissingDegradation, LocalThermalMissingDegradation)
 from .degradation import (
     apply_degradation, apply_multi_region_degradation)
 from .rgbt_augmentation import (
@@ -39,8 +39,8 @@ __all__ = [
     'RandomFlip', 'Resize', 'LoadRGBTImageFromFile', 'LoadRGBTImageFrom4Channel',
     'RGBTPhotoMetricDistortion',
     'CleanDegradation', 'RGBMissingDegradation',
-    'ThermalMissingDegradation', 'GlobalDegradation', 'LocalDegradation',
-    'MultiDegradation',
+    'ThermalMissingDegradation', 'LocalRGBMissingDegradation',
+    'LocalThermalMissingDegradation',
     'RGBTNoiseDegradation', 'RGBTBlurDegradation', 'RGBTMissingDegradation',
     'RGBTLowLightDegradation', 'RGBTOverexposureDegradation',
     'RGBTPatchDegradation', 'RGBTCombinedDegradation', 'RGBTModalDegradation',

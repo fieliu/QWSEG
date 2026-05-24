@@ -76,7 +76,6 @@ model = dict(
     t_private_decode_head=_segformer_head,
     retention_min=0.4,
     retention_max=0.98,
-    retention_loss_weight=2.0,
     phase_mode='absolute',
     phase1_epochs=15,
     phase2_epochs=15,
@@ -170,4 +169,5 @@ default_hooks = dict(
     sampler_seed=dict(type='DistSamplerSeedHook'),
     visualization=dict(type='SegVisualizationHook'))
 
-custom_hooks = [dict(type='TrainVisHook', interval=5, num_samples=2, mask_threshold=0.3)]
+custom_hooks = [dict(type='TrainVisHook', interval=5, num_samples=2, mask_threshold=0.3),
+                dict(type='ValDegradationHook')]

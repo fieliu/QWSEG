@@ -34,10 +34,10 @@ from mmseg.models.segmentors.v9_utils import (
     f_fuse,
     cascade_quality_suppress,
     downsample_mask,
-    get_degradation_schedule,
-    sample_level,
-    _apply_degradation,
-    _generate_local_mask,
+    get_missing_schedule,
+    _apply_missing_degradation,
+    _apply_local_missing,
+    _generate_single_rect_mask,
     compute_cross_modal_contrastive_loss,
     quality_guided_loss,
 )
@@ -540,7 +540,6 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                  pretrained: Optional[str] = None,
                  retention_min: float = 0.4,
                  retention_max: float = 0.98,
-                 retention_loss_weight: float = 2.0,
                  phase1_epochs: int = 10,
                  phase2_epochs: int = 20,
                  total_epochs: int = 200,
@@ -595,7 +594,6 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         self.final_fusion = DualGateEnhancedFusion(self.embed_dims_list)
 
         self.retention_min, self.retention_max = retention_min, retention_max
-        self.retention_loss_weight = retention_loss_weight
         self.phase1_epochs, self.phase2_epochs = phase1_epochs, phase2_epochs
         self.total_epochs = total_epochs
         self.phase_mode = phase_mode
@@ -674,22 +672,6 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                 for m in pl:
                     for p in m.parameters(): p.requires_grad = True
         return phase
-
-    def _compute_retention_loss(self, all_s):
-        dev = None
-        for s in all_s:
-            if s is not None:
-                dev = s.device
-                break
-        loss = torch.tensor(0., device=dev or 'cpu')
-        cnt = 0
-        for s in all_s:
-            if s is None: continue
-            r = (s > self.tau).float().mean()
-            if r < self.retention_min: loss += (self.retention_min - r)**2
-            elif r > self.retention_max: loss += (r - self.retention_max)**2
-            cnt += 1
-        return loss / max(cnt, 1) if cnt else loss
 
     def _quality_weighted_common_fusion(self, zc_rgb, zc_t, s_rgb, s_t):
         if s_rgb.shape[2:] != zc_rgb.shape[2:]:
@@ -805,37 +787,32 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         deg_level_rgb = torch.zeros(B, 1, H, W, device=dev, dtype=torch.long)
         deg_level_t = torch.zeros(B, 1, H, W, device=dev, dtype=torch.long)
         ep = getattr(self,'current_epoch',0)
-        sched = get_degradation_schedule(min(ep/max(self.total_epochs,1),1.0))
+        sched = get_missing_schedule(min(ep/max(self.total_epochs,1),1.0))
         for b in range(B):
+            modality = random.choice(['rgb', 'thermal'])
             r = random.random()
-            if r < sched['p_missing']:
-                if random.random() < 0.5:
-                    dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,deg_type='missing',level=5)
-                    dtr[b]='missing'
+            if r < sched['p_global']:
+                if modality == 'rgb':
+                    dr[b:b+1] = _apply_missing_degradation(rgb[b:b+1], rm, rs)
+                    dtr[b] = 'global_missing'
                     deg_level_rgb[b:b+1] = 5
                 else:
-                    di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,deg_type='missing',level=5)
-                    dtt[b]='missing'
+                    di[b:b+1] = _apply_missing_degradation(ir[b:b+1], im, iss)
+                    dtt[b] = 'global_missing'
                     deg_level_t[b:b+1] = 5
-            elif r < sched['p_missing']+sched['p_global']:
-                lv = sample_level(sched['global_levels'])
-                if random.random() < 0.5:
-                    dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,level=lv); dtr[b]='global'
-                    deg_level_rgb[b:b+1] = lv
+            elif r < sched['p_global'] + sched['p_local']:
+                area = sched['local_area']
+                if area <= 0:
+                    continue
+                lm = _generate_single_rect_mask(1, H, W, area, device=dev)
+                if modality == 'rgb':
+                    dr[b:b+1] = _apply_local_missing(rgb[b:b+1], rm, rs, lm)
+                    dtr[b] = f'local_missing_{area:.0%}'
+                    deg_level_rgb[b:b+1] = (lm > 0).long() * 5
                 else:
-                    di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,level=lv); dtt[b]='global'
-                    deg_level_t[b:b+1] = lv
-            else:
-                lv = sample_level(sched['local_levels'])
-                lm = _generate_local_mask(1,H,W,num_regions=3,device=dev,level=lv)
-                if random.random() < 0.5:
-                    dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,level=lv,is_local=True,local_mask=lm)
-                    dtr[b]='local'
-                    deg_level_rgb[b:b+1] = (lm > 0).long() * lv
-                else:
-                    di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,level=lv,is_local=True,local_mask=lm)
-                    dtt[b]='local'
-                    deg_level_t[b:b+1] = (lm > 0).long() * lv
+                    di[b:b+1] = _apply_local_missing(ir[b:b+1], im, iss, lm)
+                    dtt[b] = f'local_missing_{area:.0%}'
+                    deg_level_t[b:b+1] = (lm > 0).long() * 5
         return dr.to(rgb.dtype), di.to(ir.dtype), dtr, dtt, deg_level_rgb, deg_level_t
 
     # ---- loss / predict / inference ----
@@ -870,7 +847,6 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                         ignore_label=255, pad_mask=pm)
                     cnt += 1
             if cnt: losses['loss_align'] = (lc/cnt)*self.loss_align_weight
-        if self.retention_loss_weight > 0 and ph >= 3: losses['loss_retention'] = self.retention_loss_weight*self._compute_retention_loss(all_s)
         if self.training and ph >= 2:
             (dzcr,dzct,dzpr,dzpt,dzf,drl,dtl,df,ds_r,ds_t,dall_s,dspr,dspt,deg_level_rgb,deg_level_t) = self._train_with_degradation(rgb,ir)
             losses.update(add_prefix(self.decode_head.loss(df,data_samples,self.train_cfg),'deg_decode'))
@@ -1050,6 +1026,88 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             bm = [dict(ori_shape=inputs.shape[2:],img_shape=inputs.shape[2:],pad_shape=inputs.shape[2:],padding_size=[0,0,0,0])]*inputs.shape[0]
         sl = self.encode_decode(inputs, bm)
         return self.postprocess_result(sl, data_samples)
+
+    @torch.no_grad()
+    def val_step(self, data):
+        data = self.data_preprocessor(data, False)
+        inputs = data['inputs']
+        data_samples = data.get('data_samples', None)
+        results = self._run_forward(data, mode='predict')
+
+        if not hasattr(self, '_val_deg_accum'):
+            self._val_deg_accum = {}
+        if data_samples is None:
+            return results
+
+        dev = inputs.device
+        rm = self.data_preprocessor.mean[:3].to(dev)
+        rs = self.data_preprocessor.std[:3].to(dev)
+        im = self.data_preprocessor.mean[3:].to(dev)
+        iss = self.data_preprocessor.std[3:].to(dev)
+        rgb, ir = inputs[:, :3], inputs[:, 3:]
+        num_classes = self.num_classes
+        ignore_index = 255
+
+        for deg_name, deg_rgb, deg_ir in [
+            ('rgb_missing',
+             _apply_missing_degradation(rgb, rm, rs), ir),
+            ('thermal_missing',
+             rgb, _apply_missing_degradation(ir, im, iss)),
+        ]:
+            deg_inputs = torch.cat([deg_rgb, deg_ir], dim=1)
+            bm = [ds.metainfo for ds in data_samples]
+            seg_logits = self.encode_decode(deg_inputs, bm)
+            B, C, H, W = seg_logits.shape
+            preds = seg_logits.argmax(dim=1)
+
+            acc = self._val_deg_accum.setdefault(
+                deg_name,
+                dict(area_intersect=torch.zeros(num_classes, device=dev, dtype=torch.long),
+                     area_union=torch.zeros(num_classes, device=dev, dtype=torch.long),
+                     area_pred=torch.zeros(num_classes, device=dev, dtype=torch.long),
+                     area_label=torch.zeros(num_classes, device=dev, dtype=torch.long)))
+
+            for b in range(B):
+                pred = preds[b]
+                label = data_samples[b].gt_sem_seg.data.squeeze().to(dev)
+                if pred.shape != label.shape:
+                    pred = F.interpolate(
+                        pred.unsqueeze(0).unsqueeze(0).float(),
+                        size=label.shape, mode='nearest').squeeze()
+                mask = (label != ignore_index)
+                pred_m = pred[mask]
+                label_m = label[mask]
+                for c in range(num_classes):
+                    pc = (pred_m == c)
+                    lc = (label_m == c)
+                    acc['area_intersect'][c] += (pc & lc).sum()
+                    acc['area_union'][c] += (pc | lc).sum()
+                    acc['area_pred'][c] += pc.sum()
+                    acc['area_label'][c] += lc.sum()
+
+        return results
+
+    def reset_val_deg_accum(self):
+        self._val_deg_accum = {}
+
+    def compute_val_deg_metrics(self):
+        from mmengine.logging import MMLogger
+        logger = MMLogger.get_current_instance()
+        if not hasattr(self, '_val_deg_accum') or not self._val_deg_accum:
+            return
+        for deg_name, acc in self._val_deg_accum.items():
+            iou_per_class = acc['area_intersect'].float() / (
+                acc['area_union'].float() + 1e-10)
+            valid = acc['area_union'] > 0
+            miou = iou_per_class[valid].mean().item() * 100 if valid.any() else 0.0
+            acc_per_class = acc['area_intersect'].float() / (
+                acc['area_label'].float() + 1e-10)
+            macc = acc_per_class[valid].mean().item() * 100 if valid.any() else 0.0
+            all_acc = acc['area_intersect'].sum().float() / (
+                acc['area_label'].sum().float() + 1e-10) * 100
+            logger.info(
+                f'[{deg_name}] aAcc: {all_acc:.2f}  mAcc: {macc:.2f}  mIoU: {miou:.2f}')
+        self._val_deg_accum = {}
 
     def postprocess_result(self, seg_logits, data_samples):
         from mmengine.structures import PixelData

@@ -221,7 +221,6 @@ model = dict(
         ]),
     retention_min=0.4,
     retention_max=0.98,
-    retention_loss_weight=2.0,
     phase_mode='absolute',
     phase1_epochs=0,
     phase2_epochs=0,

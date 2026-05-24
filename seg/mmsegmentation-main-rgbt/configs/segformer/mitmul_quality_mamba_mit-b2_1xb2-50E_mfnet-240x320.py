@@ -76,7 +76,6 @@ model = dict(
     t_private_decode_head=_segformer_head,
     retention_min=0.4,
     retention_max=0.98,
-    retention_loss_weight=2.0,
     phase1_epochs=10,
     phase2_epochs=20,
     loss_align_weight=0.1,

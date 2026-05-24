@@ -1,6 +1,8 @@
 from mmengine.hooks import Hook
+from mmengine.registry import HOOKS
 
 
+@HOOKS.register_module()
 class ValDegradationHook(Hook):
     priority = 'LOW'
 

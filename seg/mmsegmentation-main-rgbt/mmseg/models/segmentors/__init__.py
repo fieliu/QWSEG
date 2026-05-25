@@ -49,6 +49,7 @@ from .swin_multibranch_noquality import SwinMultiBranchNoQuality
 from .swin_baseline_mask2former import SwinBaselineMask2Former
 from .mit_baseline_mamba import MiTBaselineMamba
 from .single_modality_segformer import SingleModalitySegFormer
+from .single_modality_swin_mask2former import SingleModalitySwinMask2Former
 
 __all__ = [
     'BaseSegmentor', 'EncoderDecoder', 'CascadeEncoderDecoder', 'SegTTAModel',
@@ -85,4 +86,5 @@ __all__ = [
     'SwinBaselineMask2Former',
     'MiTBaselineMamba',
     'SingleModalitySegFormer',
+    'SingleModalitySwinMask2Former',
 ]

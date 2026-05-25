@@ -202,24 +202,22 @@ def quality_guided_loss(s_clean_list, s_deg_list, deg_level,
                         clean_thresh=0.7):
     """Degradation-region quality-guided loss.
 
-    Four sub-losses per (predictor, stage):
-      1. Extreme constraint (level 5): force s_deg <= extreme_thresh
-      2. Relative ranking (level 2-4): s_deg <= s_clean + margin
-      3. Clean consistency (level 0): |s_deg - s_clean| -> 0
-      4. Clean score floor (level 0): force s_clean >= clean_thresh
+    Sub-losses per (predictor, stage):
+      1. Extreme:   degraded regions → s_deg should be low (weighted by degradation proportion)
+      2. Ranking:   same-position comparison → s_deg[pos] + margin < s_clean[pos]
+                    for moderately degraded regions (level 2-4, reserved for future)
+      3. Consistency: fully clean regions → s_deg ≈ s_clean
+      4. Clean floor: fully clean regions → s_clean >= clean_thresh
+
+    Uses adaptive_avg_pool2d (not max_pool) to avoid over-expanding the
+    degradation mask when downsampling to stage resolution.
+    Degradation proportion weighting handles boundary regions smoothly.
 
     Args:
-        s_clean_list: list of per-stage clean quality scores [B,1,H_i,W_i]
-        s_deg_list:   list of per-stage degraded quality scores [B,1,H_i,W_i]
-        deg_level:    [B,1,H_orig,W_orig] long tensor, 0/2/3/4/5
-        num_stages:   number of backbone stages
-        max_rank_samples: max sampled pairs for ranking loss
-        margin:       hinge margin for ranking loss
-        extreme_thresh: threshold for extreme degradation constraint
-        clean_thresh: minimum quality score for clean regions
-
-    Returns:
-        scalar loss (averaged over all valid sub-losses)
+        s_clean_list: per-stage clean quality scores [B,1,H_i,W_i]
+        s_deg_list:   per-stage degraded quality scores [B,1,H_i,W_i]
+        deg_level:    [B,1,H_orig,W_orig] long tensor, 0=clean, 5=missing
+                      (2-4 reserved for future non-missing degradation types)
     """
     total_loss = torch.tensor(0.0, device=deg_level.device)
     count = 0
@@ -232,49 +230,48 @@ def quality_guided_loss(s_clean_list, s_deg_list, deg_level,
         if s_c.shape[2:] != s_d.shape[2:]:
             s_c = F.interpolate(s_c, size=(H_s, W_s), mode='bilinear', align_corners=False)
 
-        lvl = F.adaptive_max_pool2d(deg_level.float(), (H_s, W_s)).long()
+        # avg_pool → [0,5] continuous degradation proportion
+        lvl = F.adaptive_avg_pool2d(deg_level.float(), (H_s, W_s))
+        deg_w = lvl / 5.0          # [0, 1] degradation proportion
+        clean_w = 1.0 - deg_w      # [0, 1] clean proportion
 
-        mask5 = (lvl == 5)
-        if mask5.any():
-            total_loss = total_loss + F.relu(s_d[mask5] - extreme_thresh).pow(2).mean()
+        # 1. Extreme: degraded regions → s_deg should be low
+        #    Weighted by degradation proportion (partial missing → partial penalty)
+        if (deg_w > 0).any():
+            loss1 = (deg_w * F.relu(s_d - extreme_thresh).pow(2)).sum() / (deg_w.sum() + 1e-6)
+            total_loss = total_loss + loss1
             count += 1
 
-        mask_degr = (lvl >= 2) & (lvl <= 4)
-        mask_clean = (lvl == 0)
-        if mask_clean.any() and mask_degr.any():
-            n_sample = min(max_rank_samples, mask_degr.sum().item(), mask_clean.sum().item())
-            if n_sample > 0:
-                B_s = s_d.shape[0]
-                all_deg_vals = []
-                all_clean_vals = []
-                for b in range(B_s):
-                    deg_mask_b = mask_degr[b, 0]
-                    clean_mask_b = mask_clean[b, 0]
-                    if not deg_mask_b.any() or not clean_mask_b.any():
-                        continue
-                    deg_coords = deg_mask_b.nonzero(as_tuple=False)
-                    clean_coords = clean_mask_b.nonzero(as_tuple=False)
-                    n_b = min(n_sample, deg_coords.size(0), clean_coords.size(0))
-                    if n_b == 0:
-                        continue
-                    perm_d = torch.randperm(deg_coords.size(0), device=deg_coords.device)[:n_b]
-                    perm_c = torch.randperm(clean_coords.size(0), device=clean_coords.device)[:n_b]
-                    d_idx = deg_coords[perm_d]
-                    c_idx = clean_coords[perm_c]
-                    all_deg_vals.append(s_d[b, 0, d_idx[:, 0], d_idx[:, 1]])
-                    all_clean_vals.append(s_c[b, 0, c_idx[:, 0], c_idx[:, 1]])
-                if all_deg_vals:
-                    s_deg_vals = torch.cat(all_deg_vals)
-                    s_clean_vals = torch.cat(all_clean_vals)
-                    total_loss = total_loss + F.relu(s_deg_vals - s_clean_vals.detach() + margin).mean()
-                    count += 1
+        # 2. Clean floor: clean regions → both s_c and s_d should be high
+        #    Weighted by clean proportion
+        if (clean_w > 0).any():
+            loss2a = (clean_w * F.relu(clean_thresh - s_c).pow(2)).sum() / (clean_w.sum() + 1e-6)
+            total_loss = total_loss + loss2a
+            count += 1
+            loss2b = (clean_w * F.relu(clean_thresh - s_d).pow(2)).sum() / (clean_w.sum() + 1e-6)
+            total_loss = total_loss + loss2b
+            count += 1
 
+        # 3. Ranking (level 2-4): at the SAME spatial position,
+        #    degraded quality < clean quality (with margin)
+        #    Reserved for future non-missing degradation types (noise, blur, etc.)
+        mask_rank = (lvl > 1.0) & (lvl < 5.0)  # moderate but not full missing
+        if mask_rank.any():
+            n = int(mask_rank.sum().item())
+            n_sample = min(max_rank_samples, n)
+            if n_sample > 0:
+                idx = mask_rank.nonzero(as_tuple=False)
+                perm = torch.randperm(n, device=idx.device)[:n_sample]
+                si = idx[perm]  # [n_sample, 4] indices into [B, 1, H, W]
+                s_d_vals = s_d[si[:, 0], si[:, 1], si[:, 2], si[:, 3]]
+                s_c_vals = s_c[si[:, 0], si[:, 1], si[:, 2], si[:, 3]]
+                total_loss = total_loss + F.relu(s_d_vals - s_c_vals.detach() + margin).mean()
+                count += 1
+
+        # 4. Consistency: fully clean regions → s_deg ≈ s_clean
+        mask_clean = (lvl < 1.0)
         if mask_clean.any():
             total_loss = total_loss + F.l1_loss(s_d[mask_clean], s_c[mask_clean].detach())
-            count += 1
-
-        if mask_clean.any():
-            total_loss = total_loss + F.relu(clean_thresh - s_c[mask_clean]).pow(2).mean()
             count += 1
 
     if count > 0:
@@ -321,11 +318,11 @@ def _generate_single_rect_mask(B, H, W, area_ratio, device='cpu'):
     mask = torch.zeros(B, 1, H, W, device=device)
     for b in range(B):
         area = H * W * area_ratio
-        aspect = random.uniform(0.5, 2.0)
+        aspect = 0.5 + torch.rand(1, device=device).item() * 1.5  # [0.5, 2.0]
         rh = max(min(int(math.sqrt(area / aspect)), H), 4)
         rw = max(min(int(math.sqrt(area * aspect)), W), 4)
-        y1 = random.randint(0, max(H - rh, 0))
-        x1 = random.randint(0, max(W - rw, 0))
+        y1 = torch.randint(0, max(H - rh, 0) + 1, (1,), device=device).item()
+        x1 = torch.randint(0, max(W - rw, 0) + 1, (1,), device=device).item()
         mask[b, 0, y1:y1 + rh, x1:x1 + rw] = 1.0
     return mask
 
@@ -337,10 +334,10 @@ def _lerp(a, b, t):
 def get_missing_schedule(r):
     """Return degradation schedule for missing-only training.
 
-    Three-phase progressive curriculum:
-    - Phase 1 (r < 0.075):  no degradation (clean-only warmup)
-    - Phase 2 (0.075 - 0.15):  local missing only, area 10% -> 30%
-    - Phase 3 (0.15+):  local missing 30% -> 60%, global missing 20% -> 60%
+    Progressive curriculum:
+    - r < 0.01:     no degradation (2-epoch clean-only warmup at 200E)
+    - 0.01 - 0.10:  local missing only, area 5% -> 30%
+    - 0.10+:        local missing 30% -> 60%, global missing 20% -> 60%
 
     Returns:
         dict with keys:
@@ -348,14 +345,14 @@ def get_missing_schedule(r):
             p_global: probability of global missing (entire modality zeroed)
             local_area: area ratio for local missing rectangle
     """
-    if r < 0.075:
+    if r < 0.01:
         return dict(p_local=0.0, p_global=0.0, local_area=0.0)
-    elif r < 0.15:
-        t = (r - 0.075) / 0.075
-        local_area = _lerp(0.10, 0.30, t)
+    elif r < 0.10:
+        t = (r - 0.01) / 0.09
+        local_area = _lerp(0.05, 0.30, t)
         return dict(p_local=1.0, p_global=0.0, local_area=local_area)
     else:
-        t = min((r - 0.15) / 0.85, 1.0)
+        t = min((r - 0.10) / 0.90, 1.0)
         local_area = _lerp(0.30, 0.60, t)
         p_global = _lerp(0.20, 0.60, t)
         p_local = 1.0 - p_global

@@ -716,8 +716,8 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         ep = getattr(self,'current_epoch',0)
         sched = get_missing_schedule(min(ep/max(self.total_epochs,1),1.0))
         for b in range(B):
-            modality = random.choice(['rgb', 'thermal'])
-            r = random.random()
+            modality = 'rgb' if torch.rand(1, device=dev).item() < 0.5 else 'thermal'
+            r = torch.rand(1, device=dev).item()
             if r < sched['p_global']:
                 if modality == 'rgb':
                     dr[b:b+1] = _apply_missing_degradation(rgb[b:b+1], rm, rs)

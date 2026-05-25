@@ -48,6 +48,7 @@ from .mitmul_ablation import MiTMulABBaseline, MiTMulABV1, MiTMulABV2, MiTMulABV
 from .swin_multibranch_noquality import SwinMultiBranchNoQuality
 from .swin_baseline_mask2former import SwinBaselineMask2Former
 from .mit_baseline_mamba import MiTBaselineMamba
+from .single_modality_segformer import SingleModalitySegFormer
 
 __all__ = [
     'BaseSegmentor', 'EncoderDecoder', 'CascadeEncoderDecoder', 'SegTTAModel',
@@ -83,4 +84,5 @@ __all__ = [
     'SwinMultiBranchNoQuality',
     'SwinBaselineMask2Former',
     'MiTBaselineMamba',
+    'SingleModalitySegFormer',
 ]

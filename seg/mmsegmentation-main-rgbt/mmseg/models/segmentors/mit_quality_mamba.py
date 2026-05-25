@@ -108,6 +108,15 @@ class DualGateEnhancedFusion(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# STE hard-zero helper
+# ---------------------------------------------------------------------------
+
+def ste_hard_zero(x, mask):
+    """Forward: zero out where mask==0; Backward: gradient passes through unchanged."""
+    return x - (1 - mask) * x.detach()
+
+
+# ---------------------------------------------------------------------------
 # Quality-aware MiT forward functions
 # ---------------------------------------------------------------------------
 
@@ -116,7 +125,8 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
                                  training=True,
                                  force_all_keep=False, phase=3,
                                  tau=0.3, alpha=10.0, tau_hard=0.2,
-                                 clamp_min=0.0):
+                                 clamp_min=0.0,
+                                 use_hard_zero=False):
     """Quality-aware forward through a single MiT backbone for both modalities.
 
     Uses continuous quality score with piecewise modulation instead of
@@ -153,6 +163,24 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
 
         all_s_rgb.append(s_rgb)
         all_s_t.append(s_t)
+
+        if use_hard_zero:
+            low_rgb = s_rgb < tau_hard
+            low_t = s_t < tau_hard
+            both_low = low_rgb & low_t
+            only_rgb_low = low_rgb & (~low_t)
+            only_t_low = low_t & (~low_rgb)
+            hard_mask_rgb = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
+            hard_mask_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
+            hard_mask_rgb[only_rgb_low] = 0.0
+            hard_mask_t[only_t_low] = 0.0
+            hard_mask_rgb[both_low] = 0.0
+            hard_mask_t[both_low] = 0.0
+            keep_rgb = both_low & (s_rgb >= s_t)
+            keep_t = both_low & (s_t > s_rgb)
+            hard_mask_rgb[keep_rgb] = 1.0
+            hard_mask_t[keep_t] = 1.0
+            hard_mask_combined = torch.cat([hard_mask_rgb, hard_mask_t], dim=0).detach()
 
         bias_rgb = torch.where(s_rgb < s_t, f_attn(s_rgb, tau=tau, alpha=alpha), torch.zeros_like(s_rgb))
         bias_t = torch.where(s_t < s_rgb, f_attn(s_t, tau=tau, alpha=alpha), torch.zeros_like(s_t))
@@ -220,7 +248,13 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
             ffn_out = block.ffn.dropout_layer(ffn_out)
             x = residual + ffn_out
 
+        if use_hard_zero:
+            mask_nlc = hard_mask_combined.reshape(B_tok, H * W, 1)
+            x = ste_hard_zero(x, mask_nlc)
+
         x = norm(x)
+        if use_hard_zero:
+            x = ste_hard_zero(x, mask_nlc)
         x = nlc_to_nchw(x, hw_shape)
         if i in backbone.out_indices:
             outs.append(x)
@@ -233,7 +267,8 @@ def _forward_branch_pruned(backbone, img, predictor_list,
                             training=True,
                             force_all_keep=False, phase=3,
                             tau=0.3, alpha=10.0, tau_hard=0.2,
-                            clamp_min=0.0):
+                            clamp_min=0.0,
+                            use_hard_zero=False):
     """Quality-aware forward through a single-branch MiT backbone.
 
     Uses continuous quality score with piecewise modulation instead of
@@ -266,6 +301,9 @@ def _forward_branch_pruned(backbone, img, predictor_list,
         s, cum_s = cascade_quality_suppress(s, cum_s, H, W, clamp_min=clamp_min)
 
         all_s.append(s)
+
+        if use_hard_zero:
+            hard_mask = (s >= tau_hard).float().detach()
 
         for j, block in enumerate(blocks):
             residual = x
@@ -329,7 +367,13 @@ def _forward_branch_pruned(backbone, img, predictor_list,
             ffn_out = block.ffn.dropout_layer(ffn_out)
             x = residual + ffn_out
 
+        if use_hard_zero:
+            mask_nlc = hard_mask.reshape(B_tok, H * W, 1)
+            x = ste_hard_zero(x, mask_nlc)
+
         x = norm(x)
+        if use_hard_zero:
+            x = ste_hard_zero(x, mask_nlc)
         x = nlc_to_nchw(x, hw_shape)
         if i in backbone.out_indices:
             outs.append(x)
@@ -508,6 +552,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
         fa = (ph < 3)
         phase3_start = self.phase1_epochs + self.phase2_epochs
         clamp_min = 0.1 if (ph == 3 and epoch < phase3_start + 5) else 0.0
+        use_hz = (ph == 3 and epoch >= phase3_start + 10) or (not self.training)
 
         zc_outs, s_r, s_t = _forward_common_dual_pruned(
             self.backbone, torch.cat([rgb, t], dim=0), orig_B=B,
@@ -515,20 +560,20 @@ class QualityGatedMiTMamba(BaseSegmentor):
             predictors_t=self.predictors_common_t,
             training=self.training, force_all_keep=fa, phase=ph,
             tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard,
-            clamp_min=clamp_min)
+            clamp_min=clamp_min, use_hard_zero=use_hz)
         zc_r = [f[:B] for f in zc_outs]; zc_t = [f[B:] for f in zc_outs]
 
         zp_r, spr = _forward_branch_pruned(
             self.private_branch_rgb, rgb, self.predictors_priv_rgb,
             training=self.training, force_all_keep=fa, phase=ph,
             tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard,
-            clamp_min=clamp_min)
+            clamp_min=clamp_min, use_hard_zero=use_hz)
 
         zp_t, spt = _forward_branch_pruned(
             self.private_branch_t, t, self.predictors_priv_t,
             training=self.training, force_all_keep=fa, phase=ph,
             tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard,
-            clamp_min=clamp_min)
+            clamp_min=clamp_min, use_hard_zero=use_hz)
 
         zf, re, te = [], [], []
         for i in range(len(self.embed_dims_list)):
@@ -829,6 +874,11 @@ class QualityGatedMiTMamba(BaseSegmentor):
         if data_samples is None:
             return results
 
+        if not hasattr(self, '_class_names') and data_samples:
+            metainfo = data_samples[0].metainfo
+            if 'classes' in metainfo:
+                self._class_names = list(metainfo['classes'])
+
         dev = inputs.device
         rm = self.data_preprocessor.mean[:3].to(dev)
         rs = self.data_preprocessor.std[:3].to(dev)
@@ -885,18 +935,28 @@ class QualityGatedMiTMamba(BaseSegmentor):
         logger = MMLogger.get_current_instance()
         if not hasattr(self, '_val_deg_accum') or not self._val_deg_accum:
             return
+        class_names = getattr(self, '_class_names', None)
+        if class_names is None:
+            class_names = [f'class_{i}' for i in range(self.num_classes)]
         for deg_name, acc in self._val_deg_accum.items():
             iou_per_class = acc['area_intersect'].float() / (
-                acc['area_union'].float() + 1e-10)
+                acc['area_union'].float() + 1e-10) * 100
             valid = acc['area_union'] > 0
-            miou = iou_per_class[valid].mean().item() * 100 if valid.any() else 0.0
+            miou = iou_per_class[valid].mean().item() if valid.any() else 0.0
             acc_per_class = acc['area_intersect'].float() / (
-                acc['area_label'].float() + 1e-10)
-            macc = acc_per_class[valid].mean().item() * 100 if valid.any() else 0.0
+                acc['area_label'].float() + 1e-10) * 100
+            macc = acc_per_class[valid].mean().item() if valid.any() else 0.0
             all_acc = acc['area_intersect'].sum().float() / (
                 acc['area_label'].sum().float() + 1e-10) * 100
-            logger.info(
-                f'[{deg_name}] aAcc: {all_acc:.2f}  mAcc: {macc:.2f}  mIoU: {miou:.2f}')
+            cw = [max(len(str(class_names[i])), 8) for i in range(self.num_classes)]
+            header = f'+{"-"*14}+' + '+'.join([f'{"-"*(cw[i]+2)}' for i in range(self.num_classes)]) + f'+{"-"*8}+{"-"*8}+{"-"*8}+'
+            sep = '|' + f'{deg_name:^14}|' + '|'.join(
+                [f'{class_names[i]:^{cw[i]+2}}' for i in range(self.num_classes)]
+            ) + f'|{"mIoU":^8}|{"mAcc":^8}|{"aAcc":^8}|'
+            vals = '|' + f'{"IoU(%)":^14}|' + '|'.join(
+                [f'{iou_per_class[i].item():^{cw[i]+2}.2f}' if valid[i] else f'{"N/A":^{cw[i]+2}}' for i in range(self.num_classes)]
+            ) + f'|{miou:^8.2f}|{macc:^8.2f}|{all_acc:^8.2f}|'
+            logger.info('\n' + header + '\n' + sep + '\n' + header + '\n' + vals + '\n' + header)
         self._val_deg_accum = {}
 
     def postprocess_result(self, seg_logits, data_samples):

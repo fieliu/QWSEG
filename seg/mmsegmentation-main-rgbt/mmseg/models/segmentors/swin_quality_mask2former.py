@@ -552,7 +552,7 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         self.refine_gates_t = nn.ModuleList(
             [nn.Conv2d(ch * 2 + 1, 1, 1) for ch in self.embed_dims_list])
         self.final_gates = nn.ModuleList(
-            [nn.Conv2d(ch * 2 + 2, 2, 1) for ch in self.embed_dims_list])
+            [nn.Conv2d(ch * 3 + 2, 2, 1) for ch in self.embed_dims_list])
 
     # ---- BaseSegmentor overrides ----
 

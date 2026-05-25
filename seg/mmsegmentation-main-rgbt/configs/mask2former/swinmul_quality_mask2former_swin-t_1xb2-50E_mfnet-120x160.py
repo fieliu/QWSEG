@@ -219,11 +219,6 @@ model = dict(
             dict(type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0),
             dict(type='DiceLoss', use_sigmoid=False, activate=True, loss_weight=1.0),
         ]),
-    retention_min=0.4,
-    retention_max=0.98,
-    phase_mode='absolute',
-    phase1_epochs=0,
-    phase2_epochs=0,
     total_epochs=50,
     loss_align_weight=0.1,
     contrast_tau=0.07,
@@ -237,9 +232,8 @@ model = dict(
     local_deg_ratio=0.4,
     tau=0.3,
     alpha=10.0,
-    tau_hard=0.2,
-    fuse_epsilon=1e-3,
-    fuse_beta=6.0,
+    fuse_epsilon=1e-6,
+    fuse_beta=3.0,
     test_cfg=dict(mode='slide', crop_size=crop_size, stride=(80, 107)))
 
 backbone_norm_multi = dict(lr_mult=0.1, decay_mult=0.0)

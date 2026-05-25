@@ -74,10 +74,6 @@ model = dict(
     common_decode_head=_segformer_head,
     rgb_private_decode_head=_segformer_head,
     t_private_decode_head=_segformer_head,
-    retention_min=0.4,
-    retention_max=0.98,
-    phase1_epochs=10,
-    phase2_epochs=20,
     loss_align_weight=0.1,
     contrast_tau=0.07,
     contrast_num_samples=512,
@@ -92,9 +88,8 @@ model = dict(
     local_deg_ratio=0.4,
     tau=0.3,
     alpha=10.0,
-    tau_hard=0.2,
-    fuse_epsilon=1e-3,
-    fuse_beta=6.0,
+    fuse_epsilon=1e-6,
+    fuse_beta=3.0,
     test_cfg=dict(mode='slide', crop_size=crop_size, stride=(160, 214)))
 
 custom_keys = {

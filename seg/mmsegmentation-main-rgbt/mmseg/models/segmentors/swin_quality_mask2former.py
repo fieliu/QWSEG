@@ -576,6 +576,11 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
     def _update_training_phase(self, epoch):
         return self._get_training_phase(epoch)
 
+    @property
+    def force_all_keep(self):
+        ph = self._get_training_phase(getattr(self, 'current_epoch', 0))
+        return ph < 2
+
     def _get_seg_logits(self, features, data_samples=None):
         if data_samples is not None:
             batch_data_samples = data_samples
@@ -631,16 +636,24 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             spr_i = spr[i] if spr[i] is not None else torch.ones(B1,1,zc_ri.shape[2],zc_ri.shape[3],device=dev)
             spt_i = spt[i] if spt[i] is not None else torch.ones(B1,1,zc_ti.shape[2],zc_ti.shape[3],device=dev)
 
-            # STE quality masks
-            mask_r  = ste_hard_mask(sri,  tau=self.tau)
-            mask_t  = ste_hard_mask(sti,  tau=self.tau)
-            mask_pr = ste_hard_mask(spr_i, tau=self.tau)
-            mask_pt = ste_hard_mask(spt_i, tau=self.tau)
+            if self.force_all_keep:
+                mask_r = torch.ones(B1, 1, zc_ri.shape[2], zc_ri.shape[3], device=dev)
+                mask_t = torch.ones(B1, 1, zc_ti.shape[2], zc_ti.shape[3], device=dev)
+                mask_pr = torch.ones(B1, 1, zc_ri.shape[2], zc_ri.shape[3], device=dev)
+                mask_pt = torch.ones(B1, 1, zc_ti.shape[2], zc_ti.shape[3], device=dev)
+            else:
+                mask_r  = ste_hard_mask(sri,  tau=self.tau)
+                mask_t  = ste_hard_mask(sti,  tau=self.tau)
+                mask_pr = ste_hard_mask(spr_i, tau=self.tau)
+                mask_pt = ste_hard_mask(spt_i, tau=self.tau)
 
-            # Safeguard: both common modalities bad → keep the one with higher s
-            both_bad = (mask_r + mask_t) < 0.5
-            mask_r = torch.where(both_bad & (sri >= sti), torch.ones_like(mask_r), mask_r)
-            mask_t = torch.where(both_bad & (sti > sri),  torch.ones_like(mask_t), mask_t)
+                both_bad = (mask_r + mask_t) < 0.5
+                keep_r = (sri >= sti).float()
+                keep_t = (sti > sri).float()
+                fix_r = (both_bad.float() * keep_r + (1 - both_bad.float()) * mask_r)
+                fix_t = (both_bad.float() * keep_t + (1 - both_bad.float()) * mask_t)
+                mask_r = fix_r + sri - sri.detach()
+                mask_t = fix_t + sti - sti.detach()
 
             # Common base: equal-weight average
             zf_i = (zc_ri * mask_r + zc_ti * mask_t) / (mask_r + mask_t + 1e-6)

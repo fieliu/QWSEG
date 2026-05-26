@@ -36,7 +36,7 @@ class QualityPredictor(nn.Module):
         self.norm2 = nn.LayerNorm(hidden)
         self.conv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
         self.score_head = nn.Conv2d(hidden, 1, 1, bias=True)
-        nn.init.constant_(self.score_head.bias, 2.0)
+        nn.init.constant_(self.score_head.bias, 0.5)
         self._init_weights()
 
     def _init_weights(self):
@@ -45,7 +45,7 @@ class QualityPredictor(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        nn.init.constant_(self.score_head.bias, 2.0)
+        nn.init.constant_(self.score_head.bias, 0.5)
 
     def forward(self, x, mask):
         B, C, H, W = x.shape
@@ -71,12 +71,20 @@ TokenPrunePredictor = QualityPredictor
 # ---------------------------------------------------------------------------
 
 def f_attn(s, tau=0.3, alpha=10.0):
-    """Attention bias function: 0 for high-quality, negative bias for low-quality.
+    """Attention bias function with continuous gradient.
 
-    s > tau: 0.0 (no bias)
-    s <= tau: -alpha * (tau - s) / tau (continuous negative bias, range [0, -alpha])
+    s >> tau: 0.0 (no bias, tiny gradient pulling s toward tau if overshoot)
+    s > tau:  smooth quadratic ramp near tau for gradient continuity
+    s <= tau: -alpha * (tau - s) / tau (strong negative bias)
+    Gradient is non-zero everywhere so QP can always learn.
     """
-    return torch.where(s > tau, torch.zeros_like(s), -alpha * (tau - s) / tau)
+    ramp_width = 0.1
+    low_bias = -alpha * (tau - s) / tau
+    high_ramp = -alpha * ramp_width / tau * ((tau + ramp_width - s) / ramp_width).pow(2)
+    return torch.where(
+        s > tau + ramp_width,
+        torch.zeros_like(s),
+        torch.where(s > tau, high_ramp, low_bias))
 
 
 def f_fuse(s, tau=0.3, epsilon=1e-6, beta=3.0):
@@ -90,9 +98,10 @@ def f_fuse(s, tau=0.3, epsilon=1e-6, beta=3.0):
 
 def ste_hard_mask(s, tau=0.3):
     """STE quality mask: s > tau → 1, s <= tau → 0.
-    Forward: binary gate. Backward: gradient passes through unchanged.
+    Forward: binary gate. Backward: identity gradient (STE).
     """
-    return (s > tau).float().detach()
+    hard = (s > tau).float()
+    return hard + s - s.detach()
 
 
 def f_hard_mask(s, tau_hard=0.2):

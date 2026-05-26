@@ -173,5 +173,5 @@ class SingleModalitySegFormer(BaseSegmentor):
             if not hasattr(data_samples[i], 'pred_sem_seg'):
                 from mmengine.structures import PixelData
                 data_samples[i].pred_sem_seg = PixelData()
-            data_samples[i].pred_sem_seg.data = seg_logits[i]
+            data_samples[i].pred_sem_seg.data = seg_logits[i].argmax(dim=0)
         return data_samples

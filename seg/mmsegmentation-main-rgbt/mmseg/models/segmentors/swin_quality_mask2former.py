@@ -520,7 +520,7 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         self.fuse_epsilon = fuse_epsilon
         self.fuse_beta = fuse_beta
         self._build_predictors()
-        self._build_gates()
+        self._build_fusion_convs()
 
         self.phase1_epochs, self.phase2_epochs = phase1_epochs, phase2_epochs
         self.total_epochs = total_epochs
@@ -532,8 +532,6 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         self.aux_loss_weight = aux_loss_weight
         self.loss_invariant_weight = loss_invariant_weight
         self.loss_q_guide_weight = loss_q_guide_weight
-        self.missing_ratio, self.global_deg_ratio = missing_ratio, global_deg_ratio
-        self.local_deg_ratio = local_deg_ratio
         self.skip_phases = skip_phases
 
     def _build_predictors(self):
@@ -546,13 +544,12 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         self.predictors_priv_t = nn.ModuleList(
             [QualityPredictor(ch) for ch in self.embed_dims_list])
 
-    def _build_gates(self):
-        self.refine_gates_r = nn.ModuleList(
-            [nn.Conv2d(ch * 2 + 1, 1, 1) for ch in self.embed_dims_list])
-        self.refine_gates_t = nn.ModuleList(
-            [nn.Conv2d(ch * 2 + 1, 1, 1) for ch in self.embed_dims_list])
-        self.final_gates = nn.ModuleList(
-            [nn.Conv2d(ch * 3 + 2, 2, 1) for ch in self.embed_dims_list])
+    def _build_fusion_convs(self):
+        self.fusion_convs = nn.ModuleList(
+            [nn.Sequential(
+                nn.Conv2d(ch * 3, ch, 1, bias=False),
+                nn.GELU(),
+            ) for ch in self.embed_dims_list])
 
     # ---- BaseSegmentor overrides ----
 
@@ -664,34 +661,26 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             zf_i = zf_i.permute(0,3,1,2).contiguous()
             zf.append(zf_i)
 
-            # RGB 私有调制（f_fuse 保险丝 + learned refine）
-            priv_r_raw = zp_r[i] * f_fuse(spr_i, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
-            refine_r_input = torch.cat([zp_r[i], zf_i, spr_i], dim=1)
-            refine_r = self.refine_gates_r[i](refine_r_input).sigmoid()
-            priv_r_mod = priv_r_raw * refine_r
+            # 私有特征调制（纯质量门控 f_fuse，无 learned gates）
+            priv_r_mod = zp_r[i] * f_fuse(spr_i, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
+            priv_t_mod = zp_t[i] * f_fuse(spt_i, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
+
+            # 辅助头: 通用底版 + 私有增强
             re_i = zf_i + priv_r_mod
             re_i = re_i.permute(0,2,3,1).contiguous()
             re_i = F.layer_norm(re_i, [re_i.size(-1)])
             re_i = re_i.permute(0,3,1,2).contiguous()
             re.append(re_i)
 
-            # T 私有调制（f_fuse 保险丝 + learned refine）
-            priv_t_raw = zp_t[i] * f_fuse(spt_i, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
-            refine_t_input = torch.cat([zp_t[i], zf_i, spt_i], dim=1)
-            refine_t = self.refine_gates_t[i](refine_t_input).sigmoid()
-            priv_t_mod = priv_t_raw * refine_t
             te_i = zf_i + priv_t_mod
             te_i = te_i.permute(0,2,3,1).contiguous()
             te_i = F.layer_norm(te_i, [te_i.size(-1)])
             te_i = te_i.permute(0,3,1,2).contiguous()
             te.append(te_i)
 
-            # 最终门控融合（zf 只做底版一次，用纯私有调制）
-            gate_input = torch.cat([zf_i, priv_r_mod, priv_t_mod, spr_i, spt_i], dim=1)
-            gate_f = self.final_gates[i](gate_input).sigmoid()
-            gate_fr, gate_ft = gate_f.split(1, dim=1)
-            ff_i = zf_i + gate_fr * priv_r_mod + gate_ft * priv_t_mod
-            ff_i = ff_i.permute(0,2,3,1).contiguous()
+            # 最终融合: 质量调制后的特征 concat + Conv1x1 通道混合
+            fused = self.fusion_convs[i](torch.cat([zf_i, priv_r_mod, priv_t_mod], dim=1))
+            ff_i = fused.permute(0,2,3,1).contiguous()
             ff_i = F.layer_norm(ff_i, [ff_i.size(-1)])
             ff_i = ff_i.permute(0,3,1,2).contiguous()
             ff.append(ff_i)

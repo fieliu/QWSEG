@@ -36,7 +36,7 @@ class QualityPredictor(nn.Module):
         self.norm2 = nn.LayerNorm(hidden)
         self.conv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
         self.score_head = nn.Conv2d(hidden, 1, 1, bias=True)
-        nn.init.constant_(self.score_head.bias, 0.0)
+        nn.init.constant_(self.score_head.bias, 2.0)
         self._init_weights()
 
     def _init_weights(self):
@@ -45,7 +45,7 @@ class QualityPredictor(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        nn.init.constant_(self.score_head.bias, 0.0)
+        nn.init.constant_(self.score_head.bias, 2.0)
 
     def forward(self, x, mask):
         B, C, H, W = x.shape
@@ -86,6 +86,13 @@ def f_fuse(s, tau=0.3, epsilon=1e-6, beta=3.0):
     s <= tau: epsilon + (tau - epsilon) * (s / tau) ** beta (rapidly decaying weight, continuous at tau)
     """
     return torch.where(s > tau, s, epsilon + (tau - epsilon) * (s / tau) ** beta)
+
+
+def ste_hard_mask(s, tau=0.3):
+    """STE quality mask: s > tau → 1, s <= tau → 0.
+    Forward: binary gate. Backward: gradient passes through unchanged.
+    """
+    return (s > tau).float().detach()
 
 
 def f_hard_mask(s, tau_hard=0.2):

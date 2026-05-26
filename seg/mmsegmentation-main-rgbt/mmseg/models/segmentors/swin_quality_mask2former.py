@@ -32,6 +32,7 @@ from mmseg.models.segmentors.v9_utils import (
     QualityPredictor,
     f_attn,
     f_fuse,
+    ste_hard_mask,
     cascade_quality_suppress,
     downsample_mask,
     get_missing_schedule,
@@ -317,8 +318,7 @@ def _quality_score_to_swin_bias(s_2d, window_size, shift_size,
 def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
                                       predictors_rgb, predictors_t,
                                       training=True,
-                                      tau=0.3, alpha=10.0,
-                                      clamp_min=0.0):
+                                      tau=0.3, alpha=10.0):
     """Quality-aware forward through a single Swin backbone for both modalities.
 
     Uses continuous quality score with piecewise modulation.
@@ -328,8 +328,6 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
     """
     window_size = swin_branch.stages[0].blocks[0].attn.window_size
     outs, all_s_rgb, all_s_t = [], [], []
-    cum_rgb, cum_t = None, None
-
     stages = swin_branch.stages
     x, (H, W) = swin_branch.patch_embed(input_rgbt)
     if swin_branch.use_abs_pos_embed:
@@ -351,9 +349,6 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
             s_rgb = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
         if s_t is None:
             s_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
-
-        s_rgb, cum_rgb = cascade_quality_suppress(s_rgb, cum_rgb, H, W, clamp_min=clamp_min)
-        s_t, cum_t = cascade_quality_suppress(s_t, cum_t, H, W, clamp_min=clamp_min)
 
         all_s_rgb.append(s_rgb)
         all_s_t.append(s_t)
@@ -387,8 +382,7 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
 
 def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
                                  training=True,
-                                 tau=0.3, alpha=10.0,
-                                 clamp_min=0.0):
+                                 tau=0.3, alpha=10.0):
     """Quality-aware forward through a single Swin branch.
 
     Uses continuous quality score with piecewise modulation.
@@ -401,8 +395,6 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
     """
     window_size = swin_branch.stages[0].blocks[0].attn.window_size
     outs, all_s = [], []
-    cum_s = None
-
     stages = swin_branch.stages
     x, (H, W) = swin_branch.patch_embed(img)
     if swin_branch.use_abs_pos_embed:
@@ -421,8 +413,6 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
 
         if s is None:
             s = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
-
-        s, cum_s = cascade_quality_suppress(s, cum_s, H, W, clamp_min=clamp_min)
 
         all_s.append(s)
 
@@ -520,8 +510,6 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         self.fuse_epsilon = fuse_epsilon
         self.fuse_beta = fuse_beta
         self._build_predictors()
-        self._build_fusion_convs()
-
         self.phase1_epochs, self.phase2_epochs = phase1_epochs, phase2_epochs
         self.total_epochs = total_epochs
         self.phase_mode = phase_mode
@@ -543,13 +531,6 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             [QualityPredictor(ch) for ch in self.embed_dims_list])
         self.predictors_priv_t = nn.ModuleList(
             [QualityPredictor(ch) for ch in self.embed_dims_list])
-
-    def _build_fusion_convs(self):
-        self.fusion_convs = nn.ModuleList(
-            [nn.Sequential(
-                nn.Conv2d(ch * 3, ch, 1, bias=False),
-                nn.GELU(),
-            ) for ch in self.embed_dims_list])
 
     # ---- BaseSegmentor overrides ----
 
@@ -621,66 +602,74 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
 
     def _extract_feat_single(self, rgb, t):
         B = rgb.shape[0]
-        epoch = getattr(self, 'current_epoch', 0)
-        clamp_min = 0.1 if epoch < 5 else 0.0
 
         zc_outs, s_r, s_t = _forward_swin_common_dual_pruned(
             self.backbone, torch.cat([rgb, t], dim=0), orig_B=B,
             predictors_rgb=self.predictors_common_rgb,
             predictors_t=self.predictors_common_t,
             training=self.training,
-            tau=self.tau, alpha=self.alpha,
-            clamp_min=clamp_min)
+            tau=self.tau, alpha=self.alpha)
         zc_r = [f[:B] for f in zc_outs]; zc_t = [f[B:] for f in zc_outs]
 
         zp_r, spr = _forward_swin_branch_pruned(
             self.private_branch_rgb, rgb, self.predictors_priv_rgb,
             training=self.training,
-            tau=self.tau, alpha=self.alpha,
-            clamp_min=clamp_min)
+            tau=self.tau, alpha=self.alpha)
 
         zp_t, spt = _forward_swin_branch_pruned(
             self.private_branch_t, t, self.predictors_priv_t,
             training=self.training,
-            tau=self.tau, alpha=self.alpha,
-            clamp_min=clamp_min)
+            tau=self.tau, alpha=self.alpha)
 
         zf, re, te, ff = [], [], [], []
         for i in range(len(self.embed_dims_list)):
-            sri = s_r[i] if s_r[i] is not None else torch.ones(B,1,zc_r[i].shape[2],zc_r[i].shape[3],device=zc_r[i].device)
-            sti = s_t[i] if s_t[i] is not None else torch.ones(B,1,zc_t[i].shape[2],zc_t[i].shape[3],device=zc_t[i].device)
-            spr_i = spr[i] if spr[i] is not None else torch.ones(B,1,zc_r[i].shape[2],zc_r[i].shape[3],device=zc_r[i].device)
-            spt_i = spt[i] if spt[i] is not None else torch.ones(B,1,zc_t[i].shape[2],zc_t[i].shape[3],device=zc_t[i].device)
+            zc_ri = zc_r[i]; zc_ti = zc_t[i]; zp_ri = zp_r[i]; zp_ti = zp_t[i]
+            dev = zc_ri.device
+            B1 = B
+            sri = s_r[i] if s_r[i] is not None else torch.ones(B1,1,zc_ri.shape[2],zc_ri.shape[3],device=dev)
+            sti = s_t[i] if s_t[i] is not None else torch.ones(B1,1,zc_ti.shape[2],zc_ti.shape[3],device=dev)
+            spr_i = spr[i] if spr[i] is not None else torch.ones(B1,1,zc_ri.shape[2],zc_ri.shape[3],device=dev)
+            spt_i = spt[i] if spt[i] is not None else torch.ones(B1,1,zc_ti.shape[2],zc_ti.shape[3],device=dev)
 
-            # 通用底版融合（不归一化）
-            w_r = f_fuse(sri, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
-            w_t = f_fuse(sti, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
-            zf_i = w_r * zc_r[i] + w_t * zc_t[i]
+            # STE quality masks
+            mask_r  = ste_hard_mask(sri,  tau=self.tau)
+            mask_t  = ste_hard_mask(sti,  tau=self.tau)
+            mask_pr = ste_hard_mask(spr_i, tau=self.tau)
+            mask_pt = ste_hard_mask(spt_i, tau=self.tau)
+
+            # Safeguard: both common modalities bad → keep the one with higher s
+            both_bad = (mask_r + mask_t) < 0.5
+            mask_r = torch.where(both_bad & (sri >= sti), torch.ones_like(mask_r), mask_r)
+            mask_t = torch.where(both_bad & (sti > sri),  torch.ones_like(mask_t), mask_t)
+
+            # Common base: equal-weight average
+            zf_i = (zc_ri * mask_r + zc_ti * mask_t) / (mask_r + mask_t + 1e-6)
             zf_i = zf_i.permute(0,2,3,1).contiguous()
             zf_i = F.layer_norm(zf_i, [zf_i.size(-1)])
             zf_i = zf_i.permute(0,3,1,2).contiguous()
             zf.append(zf_i)
 
-            # 私有特征调制（纯质量门控 f_fuse，无 learned gates）
-            priv_r_mod = zp_r[i] * f_fuse(spr_i, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
-            priv_t_mod = zp_t[i] * f_fuse(spt_i, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
+            # Private: STE hard-zero (no safeguard needed — zf always survives)
+            priv_r_i = zp_ri * mask_pr
+            priv_t_i = zp_ti * mask_pt
 
-            # 辅助头: 通用底版 + 私有增强
-            re_i = zf_i + priv_r_mod
+            # Aux head: zf + private, equal-weight by active count
+            re_i = (zc_ri * mask_r + zc_ti * mask_t + zp_ri * mask_pr) / (mask_r + mask_t + mask_pr + 1e-6)
             re_i = re_i.permute(0,2,3,1).contiguous()
             re_i = F.layer_norm(re_i, [re_i.size(-1)])
             re_i = re_i.permute(0,3,1,2).contiguous()
             re.append(re_i)
 
-            te_i = zf_i + priv_t_mod
+            te_i = (zc_ri * mask_r + zc_ti * mask_t + zp_ti * mask_pt) / (mask_r + mask_t + mask_pt + 1e-6)
             te_i = te_i.permute(0,2,3,1).contiguous()
             te_i = F.layer_norm(te_i, [te_i.size(-1)])
             te_i = te_i.permute(0,3,1,2).contiguous()
             te.append(te_i)
 
-            # 最终融合: 质量调制后的特征 concat + Conv1x1 通道混合
-            fused = self.fusion_convs[i](torch.cat([zf_i, priv_r_mod, priv_t_mod], dim=1))
-            ff_i = fused.permute(0,2,3,1).contiguous()
+            # Final fusion: all four sources equal-weight by active count
+            n_total = mask_r + mask_t + mask_pr + mask_pt
+            ff_i = (zc_ri * mask_r + zc_ti * mask_t + zp_ri * mask_pr + zp_ti * mask_pt) / (n_total + 1e-6)
+            ff_i = ff_i.permute(0,2,3,1).contiguous()
             ff_i = F.layer_norm(ff_i, [ff_i.size(-1)])
             ff_i = ff_i.permute(0,3,1,2).contiguous()
             ff.append(ff_i)

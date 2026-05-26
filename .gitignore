@@ -102,3 +102,4 @@ projects/
 # Notebooks (often with embedded images)
 *.ipynb
 *.md
+seg/mmsegmentation-main-rgbt/tools/vis_architecture.py

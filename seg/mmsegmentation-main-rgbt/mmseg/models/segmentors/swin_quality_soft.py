@@ -439,7 +439,14 @@ class SwinQualitySoft(BaseSegmentor):
         self.loss_invariant_weight = loss_invariant_weight
         self.loss_q_guide_weight = loss_q_guide_weight
         self.skip_phases = skip_phases
+        self._quality_frozen = False
         self._build_predictors(init_high_score)
+        if self.warmup_epochs > 0:
+            self._quality_frozen = True
+            for pred_list in [self.predictors_common_rgb, self.predictors_common_t,
+                              self.predictors_priv_rgb, self.predictors_priv_t]:
+                for p in pred_list.parameters():
+                    p.requires_grad = False
 
         final_dim = self.embed_dims_list[-1]
         self.final_conv = nn.Conv2d(final_dim, final_dim, 1, bias=False)
@@ -488,6 +495,30 @@ class SwinQualitySoft(BaseSegmentor):
     def force_all_keep(self):
         ep = getattr(self, 'current_epoch', 0)
         return ep < self.warmup_epochs
+
+    def _update_quality_freeze_status(self, epoch=None):
+        from mmengine.logging import print_log
+        if epoch is not None:
+            should_freeze = epoch < self.warmup_epochs
+        else:
+            should_freeze = self.warmup_epochs > 0
+        if should_freeze and not self._quality_frozen:
+            self._quality_frozen = True
+            for pred_list in [self.predictors_common_rgb, self.predictors_common_t,
+                              self.predictors_priv_rgb, self.predictors_priv_t]:
+                for p in pred_list.parameters():
+                    p.requires_grad = False
+                pred_list.eval()
+            print_log(f'Quality predictors FROZEN (epoch {epoch}, '
+                      f'warmup_epochs={self.warmup_epochs})', logger='current')
+        elif not should_freeze and self._quality_frozen:
+            self._quality_frozen = False
+            for pred_list in [self.predictors_common_rgb, self.predictors_common_t,
+                              self.predictors_priv_rgb, self.predictors_priv_t]:
+                for p in pred_list.parameters():
+                    p.requires_grad = True
+                pred_list.train()
+            print_log(f'Quality predictors UNFROZEN (epoch {epoch})', logger='current')
 
     def _get_seg_logits(self, features, data_samples=None):
         if data_samples is not None:
@@ -590,6 +621,13 @@ class SwinQualitySoft(BaseSegmentor):
             ff.append(ff_i)
 
         all_s = [s for sl in [s_r, s_t, spr, spt] for s in sl]
+
+        if force:
+            s_r = [torch.ones(B, 1, zc_r[i].shape[2], zc_r[i].shape[3], device=zc_r[i].device) for i in range(len(zc_r))]
+            s_t = [torch.ones(B, 1, zc_t[i].shape[2], zc_t[i].shape[3], device=zc_t[i].device) for i in range(len(zc_t))]
+            spr = [torch.ones(B, 1, zp_r_outs[i].shape[2], zp_r_outs[i].shape[3], device=zp_r_outs[i].device) for i in range(len(zp_r_outs))]
+            spt = [torch.ones(B, 1, zp_t_outs[i].shape[2], zp_t_outs[i].shape[3], device=zp_t_outs[i].device) for i in range(len(zp_t_outs))]
+
         return zc_r, zc_t, zp_r_outs, zp_t_outs, zf, re, te, ff, s_r, s_t, all_s, spr, spt
 
     def _train_with_degradation(self, rgb, ir):

@@ -830,6 +830,82 @@ class SwinQualityHard(BaseSegmentor):
         ff = self._extract_feat_single(rgb, t)[7]
         return self.neck(ff) if self.with_neck else ff
 
+    def extract_feat_vis(self, inputs):
+        if inputs.shape[1] == 6:
+            rgb, t = inputs[:, :3], inputs[:, 3:]
+        else:
+            B = inputs.shape[0] // 2
+            rgb, t = inputs[:B], inputs[B:]
+        with torch.no_grad():
+            (zc_r, zc_t, zp_r, zp_t, zf, re, te, ff,
+             s_r, s_t, all_s, spr, spt) = self._extract_feat_single(rgb, t)
+            fused = self.neck(ff) if self.with_neck else ff
+
+            B_c = rgb.shape[0]
+            zc_outs, D_r, D_t, y_r, y_t = _forward_swin_common_hard(
+                self.backbone, torch.cat([rgb, t], dim=0), orig_B=B_c,
+                predictors_rgb=self.predictors_common_rgb,
+                predictors_t=self.predictors_common_t,
+                training=False,
+                gumbel_tau=self.gumbel_tau,
+                attn_neg_bias=self.attn_neg_bias)
+            zp_r_outs, D_pr, y_pr = _forward_swin_branch_hard(
+                self.private_branch_rgb, rgb, self.predictors_priv_rgb,
+                training=False,
+                gumbel_tau=self.gumbel_tau,
+                attn_neg_bias=self.attn_neg_bias)
+            zp_t_outs, D_pt, y_pt = _forward_swin_branch_hard(
+                self.private_branch_t, t, self.predictors_priv_t,
+                training=False,
+                gumbel_tau=self.gumbel_tau,
+                attn_neg_bias=self.attn_neg_bias)
+
+            deg_rgb, deg_t, deg_level_rgb, deg_level_t = self._generate_degraded_inputs(rgb, t)
+            (zc_r_d, zc_t_d, zp_r_d, zp_t_d, zf_d, re_d, te_d, ff_d,
+             ds_r_d, ds_t_d, dall_s_d, dspr_d, dspt_d) = self._extract_feat_single(deg_rgb, deg_t)
+            fused_d = self.neck(ff_d) if self.with_neck else ff_d
+
+        for i in range(len(zf)):
+            if zc_r_d[i].shape[-2:] != zc_r[i].shape[-2:]:
+                zc_r_d[i] = F.interpolate(zc_r_d[i], size=zc_r[i].shape[-2:], mode='bilinear')
+                zc_t_d[i] = F.interpolate(zc_t_d[i], size=zc_t[i].shape[-2:], mode='bilinear')
+                zf_d[i] = F.interpolate(zf_d[i], size=zf[i].shape[-2:], mode='bilinear')
+                zp_r_d[i] = F.interpolate(zp_r_d[i], size=zp_r[i].shape[-2:], mode='bilinear')
+                zp_t_d[i] = F.interpolate(zp_t_d[i], size=zp_t[i].shape[-2:], mode='bilinear')
+                re_d[i] = F.interpolate(re_d[i], size=re[i].shape[-2:], mode='bilinear')
+                te_d[i] = F.interpolate(te_d[i], size=te[i].shape[-2:], mode='bilinear')
+                ff_d[i] = F.interpolate(ff_d[i], size=ff[i].shape[-2:], mode='bilinear')
+
+        deg_type_rgb = 'missing' if (deg_level_rgb == 5).any() else 'none'
+        deg_type_t = 'missing' if (deg_level_t == 5).any() else 'none'
+
+        return dict(
+            zc_rgb=zc_r, zc_t=zc_t,
+            zc_fused=zf,
+            zp_rgb=zp_r, zp_t=zp_t,
+            rgb_pf=re, t_pf=te,
+            final_fused=fused,
+            s_rgb=s_r, s_t=s_t,
+            s_rgb_priv=spr, s_t_priv=spt,
+            q_rgb_maps=y_r, q_t_maps=y_t,
+            q_rgb_priv=y_pr, q_t_priv=y_pt,
+            D_rgb=D_r, D_t=D_t,
+            D_rgb_priv=D_pr, D_t_priv=D_pt,
+            clean_rgb_img=rgb, clean_t_img=t,
+            deg_rgb_img=deg_rgb, deg_t_img=deg_t,
+            deg_type_rgb=deg_type_rgb,
+            deg_type_t=deg_type_t,
+            zc_rgb_deg=zc_r_d, zc_t_deg=zc_t_d,
+            zc_fused_deg=zf_d,
+            zp_rgb_deg=zp_r_d, zp_t_deg=zp_t_d,
+            rgb_pf_deg=re_d, t_pf_deg=te_d,
+            final_fused_deg=fused_d,
+            s_rgb_deg=ds_r_d, s_t_deg=ds_t_d,
+            s_rgb_priv_deg=dspr_d, s_t_priv_deg=dspt_d,
+            q_rgb_deg=ds_r_d, q_t_deg=ds_t_d,
+            q_rgb_priv_deg=dspr_d, q_t_priv_deg=dspt_d,
+        )
+
     def _forward(self, inputs, data_samples=None):
         rgb, t = inputs[:, :3], inputs[:, 3:]
         ff = self._extract_feat_single(rgb, t)[7]

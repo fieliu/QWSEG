@@ -734,7 +734,8 @@ class TrainVisHook(Hook):
                             q_rgb_maps=q_rgb_maps, q_t_maps=q_t_maps)
             elif model_type in ('mit_quality_mamba', 'swin_quality_mask2former',
                                 'swin_baseline_mask2former',
-                                'mit_baseline_mamba'):
+                                'mit_baseline_mamba',
+                                'swin_quality_hard', 'swin_quality_soft'):
                 input_rgb = proc_inputs[:, :3, :, :]
                 input_ir = proc_inputs[:, 3:, :, :]
                 input_rgbt = torch.cat([input_rgb, input_ir], dim=0)
@@ -1337,6 +1338,46 @@ class TrainVisHook(Hook):
                 q_info, rgb_vis=clean_rgb_cell, t_vis=clean_t_cell, aspect_ratio=aspect_ratio,
                 deg_q_info=deg_q_info, deg_rgb_vis=deg_rgb_vis, deg_t_vis=deg_t_vis)
             return feat_rows, q_grid, deg_feat_rows
+        elif model_type == 'swin_quality_hard':
+            q_info = self._create_hard_quality_vis(feats, img_h=img_h, img_w=img_w)
+            deg_q_info = self._create_hard_deg_quality_vis(feats, img_h=img_h, img_w=img_w)
+            feat_rows = _build_feat_rows(
+                [feats['zc_rgb'], feats['zc_t'], feats['zc_fused'],
+                 feats['zp_rgb'], feats['zp_t'],
+                 feats['rgb_pf'], feats['t_pf'], feats['final_fused']])
+            deg_feat_rows = _build_feat_rows(
+                [feats['zc_rgb_deg'], feats['zc_t_deg'], feats['zc_fused_deg'],
+                 feats['zp_rgb_deg'], feats['zp_t_deg'],
+                 feats['rgb_pf_deg'], feats['t_pf_deg'], feats['final_fused_deg']])
+            aspect_ratio = (img_w / max(img_h, 1)) if (img_h and img_w) else 1.0
+            clean_rgb_vis = self._render_clean_images(feats, runner.model)
+            deg_rgb_vis, deg_t_vis = self._render_degraded_images(
+                feats, runner.model, raw_rgb=clean_rgb_vis[0], raw_t=clean_rgb_vis[1])
+            clean_rgb_cell, clean_t_cell = clean_rgb_vis
+            q_grid = self._compose_v9_quality_vis(
+                q_info, rgb_vis=clean_rgb_cell, t_vis=clean_t_cell, aspect_ratio=aspect_ratio,
+                deg_q_info=deg_q_info, deg_rgb_vis=deg_rgb_vis, deg_t_vis=deg_t_vis)
+            return feat_rows, q_grid, deg_feat_rows
+        elif model_type == 'swin_quality_soft':
+            q_info = self._create_soft_quality_vis(feats, img_h=img_h, img_w=img_w)
+            deg_q_info = self._create_soft_deg_quality_vis(feats, img_h=img_h, img_w=img_w)
+            feat_rows = _build_feat_rows(
+                [feats['zc_rgb'], feats['zc_t'], feats['zc_fused'],
+                 feats['zp_rgb'], feats['zp_t'],
+                 feats['rgb_pf'], feats['t_pf'], feats['final_fused']])
+            deg_feat_rows = _build_feat_rows(
+                [feats['zc_rgb_deg'], feats['zc_t_deg'], feats['zc_fused_deg'],
+                 feats['zp_rgb_deg'], feats['zp_t_deg'],
+                 feats['rgb_pf_deg'], feats['t_pf_deg'], feats['final_fused_deg']])
+            aspect_ratio = (img_w / max(img_h, 1)) if (img_h and img_w) else 1.0
+            clean_rgb_vis = self._render_clean_images(feats, runner.model)
+            deg_rgb_vis, deg_t_vis = self._render_degraded_images(
+                feats, runner.model, raw_rgb=clean_rgb_vis[0], raw_t=clean_rgb_vis[1])
+            clean_rgb_cell, clean_t_cell = clean_rgb_vis
+            q_grid = self._compose_v9_quality_vis(
+                q_info, rgb_vis=clean_rgb_cell, t_vis=clean_t_cell, aspect_ratio=aspect_ratio,
+                deg_q_info=deg_q_info, deg_rgb_vis=deg_rgb_vis, deg_t_vis=deg_t_vis)
+            return feat_rows, q_grid, deg_feat_rows
         elif model_type in ('swin_baseline_mask2former', 'mit_baseline_mamba'):
             feat_rows = _build_feat_rows(
                 [feats['zc_rgb'], feats['zc_t'], feats['zc_fused'],
@@ -1690,6 +1731,134 @@ class TrainVisHook(Hook):
                 t_mask=(_to_np(q_t, i) >= self.mask_threshold).astype(np.float32),
                 rgb_priv_mask=(_to_np(q_rgb_priv, i) >= self.mask_threshold).astype(np.float32),
                 t_priv_mask=(_to_np(q_t_priv, i) >= self.mask_threshold).astype(np.float32),
+            ))
+        return dict(stages=stages)
+
+    def _create_hard_quality_vis(self, feats, img_h=None, img_w=None):
+        q_rgb = feats['q_rgb_maps']
+        q_t = feats['q_t_maps']
+        q_rgb_priv = feats.get('q_rgb_priv', q_rgb)
+        q_t_priv = feats.get('q_t_priv', q_t)
+        D_rgb = feats.get('D_rgb')
+        D_t = feats.get('D_t')
+        D_rgb_priv = feats.get('D_rgb_priv')
+        D_t_priv = feats.get('D_t_priv')
+        if img_h is not None and img_w is not None:
+            h, w = img_h, img_w
+        else:
+            h, w = feats['zc_rgb'][0].shape[-2:]
+
+        def _to_np(t, i):
+            return t[i][0, 0].detach().cpu().numpy() if t[i] is not None else np.ones((h, w), dtype=np.float32)
+
+        def _mask_np(D_list, i):
+            if D_list is None or i >= len(D_list) or D_list[i] is None:
+                return np.ones((h, w), dtype=np.float32)
+            m = D_list[i][0, 0].detach().cpu().numpy()
+            if m.shape != (h, w):
+                m = cv2.resize(m.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
+            return m
+
+        stages = []
+        for i in range(len(q_rgb)):
+            stages.append(dict(
+                rgb_hm=_quality_to_rgb_heatmap(_to_np(q_rgb, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                t_hm=_quality_to_rgb_heatmap(_to_np(q_t, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                rgb_priv_hm=_quality_to_rgb_heatmap(_to_np(q_rgb_priv, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                t_priv_hm=_quality_to_rgb_heatmap(_to_np(q_t_priv, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                rgb_mask=_mask_np(D_rgb, i),
+                t_mask=_mask_np(D_t, i),
+                rgb_priv_mask=_mask_np(D_rgb_priv, i),
+                t_priv_mask=_mask_np(D_t_priv, i),
+            ))
+        return dict(stages=stages)
+
+    def _create_hard_deg_quality_vis(self, feats, img_h=None, img_w=None):
+        q_rgb_deg = feats.get('q_rgb_deg')
+        q_t_deg = feats.get('q_t_deg')
+        if q_rgb_deg is None or q_t_deg is None:
+            return None
+        q_rgb_priv_deg = feats.get('q_rgb_priv_deg', q_rgb_deg)
+        q_t_priv_deg = feats.get('q_t_priv_deg', q_t_deg)
+        if img_h is not None and img_w is not None:
+            h, w = img_h, img_w
+        else:
+            h, w = feats['zc_rgb'][0].shape[-2:]
+
+        def _to_np(t, i):
+            if t is None or i >= len(t) or t[i] is None:
+                return np.ones((h, w), dtype=np.float32)
+            return t[i][0, 0].detach().cpu().numpy()
+
+        stages = []
+        for i in range(len(q_rgb_deg)):
+            stages.append(dict(
+                rgb_hm=_quality_to_rgb_heatmap(_to_np(q_rgb_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                t_hm=_quality_to_rgb_heatmap(_to_np(q_t_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                rgb_priv_hm=_quality_to_rgb_heatmap(_to_np(q_rgb_priv_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                t_priv_hm=_quality_to_rgb_heatmap(_to_np(q_t_priv_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                rgb_mask=(_to_np(q_rgb_deg, i) >= self.mask_threshold).astype(np.float32),
+                t_mask=(_to_np(q_t_deg, i) >= self.mask_threshold).astype(np.float32),
+                rgb_priv_mask=(_to_np(q_rgb_priv_deg, i) >= self.mask_threshold).astype(np.float32),
+                t_priv_mask=(_to_np(q_t_priv_deg, i) >= self.mask_threshold).astype(np.float32),
+            ))
+        return dict(stages=stages)
+
+    def _create_soft_quality_vis(self, feats, img_h=None, img_w=None):
+        q_rgb = feats['q_rgb_maps']
+        q_t = feats['q_t_maps']
+        q_rgb_priv = feats.get('q_rgb_priv', q_rgb)
+        q_t_priv = feats.get('q_t_priv', q_t)
+        if img_h is not None and img_w is not None:
+            h, w = img_h, img_w
+        else:
+            h, w = feats['zc_rgb'][0].shape[-2:]
+
+        def _to_np(t, i):
+            return t[i][0, 0].detach().cpu().numpy() if t[i] is not None else np.ones((h, w), dtype=np.float32)
+
+        stages = []
+        for i in range(len(q_rgb)):
+            stages.append(dict(
+                rgb_hm=_quality_to_rgb_heatmap(_to_np(q_rgb, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                t_hm=_quality_to_rgb_heatmap(_to_np(q_t, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                rgb_priv_hm=_quality_to_rgb_heatmap(_to_np(q_rgb_priv, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                t_priv_hm=_quality_to_rgb_heatmap(_to_np(q_t_priv, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                rgb_mask=(_to_np(q_rgb, i) >= self.mask_threshold).astype(np.float32),
+                t_mask=(_to_np(q_t, i) >= self.mask_threshold).astype(np.float32),
+                rgb_priv_mask=(_to_np(q_rgb_priv, i) >= self.mask_threshold).astype(np.float32),
+                t_priv_mask=(_to_np(q_t_priv, i) >= self.mask_threshold).astype(np.float32),
+            ))
+        return dict(stages=stages)
+
+    def _create_soft_deg_quality_vis(self, feats, img_h=None, img_w=None):
+        q_rgb_deg = feats.get('q_rgb_deg')
+        q_t_deg = feats.get('q_t_deg')
+        if q_rgb_deg is None or q_t_deg is None:
+            return None
+        q_rgb_priv_deg = feats.get('q_rgb_priv_deg', q_rgb_deg)
+        q_t_priv_deg = feats.get('q_t_priv_deg', q_t_deg)
+        if img_h is not None and img_w is not None:
+            h, w = img_h, img_w
+        else:
+            h, w = feats['zc_rgb'][0].shape[-2:]
+
+        def _to_np(t, i):
+            if t is None or i >= len(t) or t[i] is None:
+                return np.ones((h, w), dtype=np.float32)
+            return t[i][0, 0].detach().cpu().numpy()
+
+        stages = []
+        for i in range(len(q_rgb_deg)):
+            stages.append(dict(
+                rgb_hm=_quality_to_rgb_heatmap(_to_np(q_rgb_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                t_hm=_quality_to_rgb_heatmap(_to_np(q_t_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                rgb_priv_hm=_quality_to_rgb_heatmap(_to_np(q_rgb_priv_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                t_priv_hm=_quality_to_rgb_heatmap(_to_np(q_t_priv_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                rgb_mask=(_to_np(q_rgb_deg, i) >= self.mask_threshold).astype(np.float32),
+                t_mask=(_to_np(q_t_deg, i) >= self.mask_threshold).astype(np.float32),
+                rgb_priv_mask=(_to_np(q_rgb_priv_deg, i) >= self.mask_threshold).astype(np.float32),
+                t_priv_mask=(_to_np(q_t_priv_deg, i) >= self.mask_threshold).astype(np.float32),
             ))
         return dict(stages=stages)
 
@@ -2108,7 +2277,8 @@ class TrainVisHook(Hook):
             aspect_ratio = proc_inputs.shape[-1] / max(proc_inputs.shape[-2], 1)
 
         if model_type in ('mit_quality_mamba', 'swin_quality_mask2former',
-                          'swin_baseline_mask2former', 'mit_baseline_mamba'):
+                          'swin_baseline_mask2former', 'mit_baseline_mamba',
+                          'swin_quality_hard', 'swin_quality_soft'):
             col_headers = ['zc_rgb', 'zc_t', 'zc_fused',
                            'zp_rgb', 'zp_t',
                            'rgb_pf', 't_pf', 'final']
@@ -2163,10 +2333,12 @@ class TrainVisHook(Hook):
                           'ab_v9',
                           'mit_quality_mamba', 'swin_quality_mask2former',
                           'swin_baseline_mask2former',
-                          'mit_baseline_mamba') and 'deg_rgb_img' in feats:
+                          'mit_baseline_mamba',
+                          'swin_quality_hard', 'swin_quality_soft') and 'deg_rgb_img' in feats:
             if model_type in ('mit_quality_mamba', 'swin_quality_mask2former',
                               'swin_baseline_mask2former',
-                              'mit_baseline_mamba'):
+                              'mit_baseline_mamba',
+                              'swin_quality_hard', 'swin_quality_soft'):
                 clean_rgb_vis, clean_t_vis = self._render_clean_images(feats, model)
             else:
                 clean_rgb_vis, clean_t_vis = rgb_vis, t_vis
@@ -2218,7 +2390,8 @@ class TrainVisHook(Hook):
                     deg_pred_vis=deg_pred_vis)
             elif model_type in ('mit_quality_mamba', 'swin_quality_mask2former',
                                 'swin_baseline_mask2former',
-                                'mit_baseline_mamba'):
+                                'mit_baseline_mamba',
+                                'swin_quality_hard', 'swin_quality_soft'):
                 grid = _compose_v9_ablation_vis(
                     clean_rgb_vis, clean_t_vis, feat_rows, label_vis, pred_vis,
                     self.short_side, title=title,
@@ -2520,7 +2693,8 @@ class TrainVisHook(Hook):
                 title += f' | {loss_str}'
             if model_type in ('mit_quality_mamba', 'swin_quality_mask2former',
                               'swin_baseline_mask2former',
-                              'mit_baseline_mamba'):
+                              'mit_baseline_mamba',
+                              'swin_quality_hard', 'swin_quality_soft'):
                 clean_rgb_vis2, clean_t_vis2 = self._render_clean_images(feats, model)
                 if clean_rgb_vis2 is None:
                     clean_rgb_vis2, clean_t_vis2 = rgb_vis, t_vis

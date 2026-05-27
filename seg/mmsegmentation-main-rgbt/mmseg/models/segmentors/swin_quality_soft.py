@@ -882,6 +882,103 @@ class SwinQualitySoft(BaseSegmentor):
                 'pred_sem_seg': PixelData(data=pred)})
         return data_samples
 
+    @torch.no_grad()
+    def val_step(self, data):
+        data = self.data_preprocessor(data, False)
+        inputs = data['inputs']
+        data_samples = data.get('data_samples', None)
+        results = self._run_forward(data, mode='predict')
+
+        if not hasattr(self, '_val_deg_accum'):
+            self._val_deg_accum = {}
+        if data_samples is None:
+            return results
+
+        if not hasattr(self, '_class_names') and data_samples:
+            metainfo = data_samples[0].metainfo
+            if 'classes' in metainfo:
+                self._class_names = list(metainfo['classes'])
+
+        dev = inputs.device
+        rm = self.data_preprocessor.mean[:3].to(dev)
+        rs = self.data_preprocessor.std[:3].to(dev)
+        im = self.data_preprocessor.mean[3:].to(dev)
+        iss = self.data_preprocessor.std[3:].to(dev)
+        rgb, ir = inputs[:, :3], inputs[:, 3:]
+        num_classes = self.num_classes
+        ignore_index = 255
+
+        for deg_name, deg_rgb, deg_ir in [
+            ('rgb_missing',
+             _apply_missing_degradation(rgb, rm, rs), ir),
+            ('thermal_missing',
+             rgb, _apply_missing_degradation(ir, im, iss)),
+        ]:
+            deg_inputs = torch.cat([deg_rgb, deg_ir], dim=1)
+            bm = [ds.metainfo for ds in data_samples]
+            seg_logits = self.encode_decode(deg_inputs, bm)
+            B, C, H, W = seg_logits.shape
+            preds = seg_logits.argmax(dim=1)
+
+            acc = self._val_deg_accum.setdefault(
+                deg_name,
+                dict(area_intersect=torch.zeros(num_classes, device=dev, dtype=torch.long),
+                     area_union=torch.zeros(num_classes, device=dev, dtype=torch.long),
+                     area_pred=torch.zeros(num_classes, device=dev, dtype=torch.long),
+                     area_label=torch.zeros(num_classes, device=dev, dtype=torch.long)))
+
+            for b in range(B):
+                pred = preds[b]
+                label = data_samples[b].gt_sem_seg.data.squeeze().to(dev)
+                if pred.shape != label.shape:
+                    pred = F.interpolate(
+                        pred.unsqueeze(0).unsqueeze(0).float(),
+                        size=label.shape, mode='nearest').squeeze()
+                mask = (label != ignore_index)
+                pred_m = pred[mask]
+                label_m = label[mask]
+                for c in range(num_classes):
+                    pc = (pred_m == c)
+                    lc = (label_m == c)
+                    acc['area_intersect'][c] += (pc & lc).sum()
+                    acc['area_union'][c] += (pc | lc).sum()
+                    acc['area_pred'][c] += pc.sum()
+                    acc['area_label'][c] += lc.sum()
+
+        return results
+
+    def reset_val_deg_accum(self):
+        self._val_deg_accum = {}
+
+    def compute_val_deg_metrics(self):
+        from mmengine.logging import MMLogger
+        logger = MMLogger.get_current_instance()
+        if not hasattr(self, '_val_deg_accum') or not self._val_deg_accum:
+            return
+        class_names = getattr(self, '_class_names', None)
+        if class_names is None:
+            class_names = [f'class_{i}' for i in range(self.num_classes)]
+        for deg_name, acc in self._val_deg_accum.items():
+            iou_per_class = acc['area_intersect'].float() / (
+                acc['area_union'].float() + 1e-10) * 100
+            valid = acc['area_union'] > 0
+            miou = iou_per_class[valid].mean().item() if valid.any() else 0.0
+            acc_per_class = acc['area_intersect'].float() / (
+                acc['area_label'].float() + 1e-10) * 100
+            macc = acc_per_class[valid].mean().item() if valid.any() else 0.0
+            all_acc = acc['area_intersect'].sum().float() / (
+                acc['area_label'].sum().float() + 1e-10) * 100
+            cw = [max(len(str(class_names[i])), 8) for i in range(self.num_classes)]
+            header = f'+{"-"*14}+' + '+'.join([f'{"-"*(cw[i]+2)}' for i in range(self.num_classes)]) + f'+{"-"*8}+{"-"*8}+{"-"*8}+'
+            sep = '|' + f'{deg_name:^14}|' + '|'.join(
+                [f'{class_names[i]:^{cw[i]+2}}' for i in range(self.num_classes)]
+            ) + f'|{"mIoU":^8}|{"mAcc":^8}|{"aAcc":^8}|'
+            vals = '|' + f'{"IoU(%)":^14}|' + '|'.join(
+                [f'{iou_per_class[i].item():^{cw[i]+2}.2f}' if valid[i] else f'{"N/A":^{cw[i]+2}}' for i in range(self.num_classes)]
+            ) + f'|{miou:^8.2f}|{macc:^8.2f}|{all_acc:^8.2f}|'
+            logger.info('\n' + header + '\n' + sep + '\n' + header + '\n' + vals + '\n' + header)
+        self._val_deg_accum = {}
+
     def inference(self, inputs, bm):
         assert self.test_cfg.mode in ['slide', 'whole']
         if self.test_cfg.mode == 'slide':

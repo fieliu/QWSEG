@@ -68,14 +68,8 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
                                  predictors_rgb, predictors_t,
                                  training=True,
                                  tau=0.3, alpha=10.0):
-    """Quality-aware forward through a single MiT backbone for both modalities.
-
-    Uses continuous quality score with piecewise modulation instead of
-    hard gating. No Gumbel-Softmax, no complementary fix, no cumulative masks.
-    Cross-stage cascading suppression ensures low-quality regions detected
-    in shallow stages are never "recovered" by deeper stages.
-    """
     outs, all_s_rgb, all_s_t = [], [], []
+    cum_rgb, cum_t = None, None
 
     for i, layer in enumerate(backbone.layers):
         patch_embed, blocks, norm = layer[0], layer[1], layer[2]
@@ -95,11 +89,25 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
         if s_t is None:
             s_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
 
+        s_rgb, cum_rgb = cascade_quality_suppress(s_rgb, cum_rgb, H, W, clamp_min=0.1)
+        s_t, cum_t = cascade_quality_suppress(s_t, cum_t, H, W, clamp_min=0.1)
+
         all_s_rgb.append(s_rgb)
         all_s_t.append(s_t)
 
-        bias_rgb = f_attn(s_rgb, tau=tau, alpha=alpha)
-        bias_t = f_attn(s_t, tau=tau, alpha=alpha)
+        both_bad = (s_rgb < tau) & (s_t < tau)
+        if both_bad.any():
+            winner_r = s_rgb >= s_t
+            hard_r = torch.where(both_bad & winner_r, torch.ones_like(s_rgb), s_rgb)
+            hard_t = torch.where(both_bad & ~winner_r, torch.ones_like(s_t), s_t)
+            s_rgb_attn = hard_r + s_rgb - s_rgb.detach()
+            s_t_attn = hard_t + s_t - s_t.detach()
+        else:
+            s_rgb_attn = s_rgb
+            s_t_attn = s_t
+
+        bias_rgb = f_attn(s_rgb_attn, tau=tau, alpha=alpha)
+        bias_t = f_attn(s_t_attn, tau=tau, alpha=alpha)
         bias_combined = torch.cat([bias_rgb, bias_t], dim=0)
 
         for j, block in enumerate(blocks):
@@ -176,17 +184,8 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
 def _forward_branch_pruned(backbone, img, predictor_list,
                             training=True,
                             tau=0.3, alpha=10.0):
-    """Quality-aware forward through a single-branch MiT backbone.
-
-    Uses continuous quality score with piecewise modulation instead of
-    hard gating. Cross-stage cascading suppression ensures low-quality
-    regions detected in shallow stages are never "recovered" by deeper stages.
-
-    Returns:
-        outs:      list of feature maps [B, C_i, H_i, W_i]
-        all_s:     list of per-stage quality scores
-    """
     outs, all_s = [], []
+    cum_s = None
 
     for i, layer in enumerate(backbone.layers):
         patch_embed, blocks, norm = layer[0], layer[1], layer[2]
@@ -201,6 +200,8 @@ def _forward_branch_pruned(backbone, img, predictor_list,
                                    torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype))
         if s is None:
             s = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
+
+        s, cum_s = cascade_quality_suppress(s, cum_s, H, W, clamp_min=0.1)
 
         all_s.append(s)
 

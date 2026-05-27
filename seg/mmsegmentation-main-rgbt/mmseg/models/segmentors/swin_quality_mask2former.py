@@ -319,13 +319,6 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
                                       predictors_rgb, predictors_t,
                                       training=True,
                                       tau=0.3, alpha=10.0):
-    """Quality-aware forward through a single Swin backbone for both modalities.
-
-    Uses continuous quality score with piecewise modulation.
-    Independent attention bias per modality (not competitive).
-    Cross-stage cascading suppression ensures low-quality regions detected
-    in shallow stages are never "recovered" by deeper stages.
-    """
     window_size = swin_branch.stages[0].blocks[0].attn.window_size
     outs, all_s_rgb, all_s_t = [], [], []
     stages = swin_branch.stages
@@ -334,6 +327,7 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
         x = x + swin_branch.absolute_pos_embed
     x = swin_branch.drop_after_pos(x)
     B_tok = x.shape[0]
+    cum_rgb, cum_t = None, None
 
     for i, stage in enumerate(stages):
         blocks, downsample = stage.blocks, stage.downsample
@@ -350,11 +344,25 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
         if s_t is None:
             s_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
 
+        s_rgb, cum_rgb = cascade_quality_suppress(s_rgb, cum_rgb, H, W, clamp_min=0.1)
+        s_t, cum_t = cascade_quality_suppress(s_t, cum_t, H, W, clamp_min=0.1)
+
         all_s_rgb.append(s_rgb)
         all_s_t.append(s_t)
 
-        bias_rgb = f_attn(s_rgb, tau=tau, alpha=alpha)
-        bias_t = f_attn(s_t, tau=tau, alpha=alpha)
+        both_bad = (s_rgb < tau) & (s_t < tau)
+        if both_bad.any():
+            winner_r = s_rgb >= s_t
+            hard_r = torch.where(both_bad & winner_r, torch.ones_like(s_rgb), s_rgb)
+            hard_t = torch.where(both_bad & ~winner_r, torch.ones_like(s_t), s_t)
+            s_rgb_attn = hard_r + s_rgb - s_rgb.detach()
+            s_t_attn = hard_t + s_t - s_t.detach()
+        else:
+            s_rgb_attn = s_rgb
+            s_t_attn = s_t
+
+        bias_rgb = f_attn(s_rgb_attn, tau=tau, alpha=alpha)
+        bias_t = f_attn(s_t_attn, tau=tau, alpha=alpha)
         bias_combined = torch.cat([bias_rgb, bias_t], dim=0)
 
         for j, block in enumerate(blocks):
@@ -401,6 +409,7 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
         x = x + swin_branch.absolute_pos_embed
     x = swin_branch.drop_after_pos(x)
     B_tok = x.shape[0]
+    cum_s = None
 
     for i, stage in enumerate(stages):
         blocks, downsample = stage.blocks, stage.downsample
@@ -413,6 +422,8 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
 
         if s is None:
             s = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
+
+        s, cum_s = cascade_quality_suppress(s, cum_s, H, W, clamp_min=0.1)
 
         all_s.append(s)
 

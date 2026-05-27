@@ -50,6 +50,8 @@ from .swin_baseline_mask2former import SwinBaselineMask2Former
 from .mit_baseline_mamba import MiTBaselineMamba
 from .single_modality_segformer import SingleModalitySegFormer
 from .single_modality_swin_mask2former import SingleModalitySwinMask2Former
+from .swin_quality_hard import SwinQualityHard
+from .swin_quality_soft import SwinQualitySoft
 
 __all__ = [
     'BaseSegmentor', 'EncoderDecoder', 'CascadeEncoderDecoder', 'SegTTAModel',
@@ -87,4 +89,6 @@ __all__ = [
     'MiTBaselineMamba',
     'SingleModalitySegFormer',
     'SingleModalitySwinMask2Former',
+    'SwinQualityHard',
+    'SwinQualitySoft',
 ]

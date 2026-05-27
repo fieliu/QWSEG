@@ -449,6 +449,10 @@ class QualityGatedMiTMamba(BaseSegmentor):
                 mask_t = torch.ones(B1, 1, zc_ti.shape[2], zc_ti.shape[3], device=dev)
                 mask_pr = torch.ones(B1, 1, zc_ri.shape[2], zc_ri.shape[3], device=dev)
                 mask_pt = torch.ones(B1, 1, zc_ti.shape[2], zc_ti.shape[3], device=dev)
+                w_r = torch.ones_like(sri)
+                w_t = torch.ones_like(sti)
+                w_pr = torch.ones_like(spr_i)
+                w_pt = torch.ones_like(spt_i)
             else:
                 mask_r  = ste_hard_mask(sri,  tau=self.tau)
                 mask_t  = ste_hard_mask(sti,  tau=self.tau)
@@ -463,8 +467,13 @@ class QualityGatedMiTMamba(BaseSegmentor):
                 mask_r = fix_r + sri - sri.detach()
                 mask_t = fix_t + sti - sti.detach()
 
-            # Common base: equal-weight average
-            zf_i = (zc_ri * mask_r + zc_ti * mask_t) / (mask_r + mask_t + 1e-6)
+                w_r = sri * mask_r
+                w_t = sti * mask_t
+                w_pr = spr_i * mask_pr
+                w_pt = spt_i * mask_pt
+
+            # Common base: quality-weighted average
+            zf_i = (zc_ri * w_r + zc_ti * w_t) / (w_r + w_t + 1e-6)
             zf_i = zf_i.permute(0,2,3,1).contiguous()
             zf_i = F.layer_norm(zf_i, [zf_i.size(-1)])
             zf_i = zf_i.permute(0,3,1,2).contiguous()
@@ -474,22 +483,22 @@ class QualityGatedMiTMamba(BaseSegmentor):
             priv_r_i = zp_ri * mask_pr
             priv_t_i = zp_ti * mask_pt
 
-            # Aux head: zf + private, equal-weight by active count
-            re_i = (zc_ri * mask_r + zc_ti * mask_t + zp_ri * mask_pr) / (mask_r + mask_t + mask_pr + 1e-6)
+            # Aux head: quality-weighted
+            re_i = (zc_ri * w_r + zc_ti * w_t + zp_ri * w_pr) / (w_r + w_t + w_pr + 1e-6)
             re_i = re_i.permute(0,2,3,1).contiguous()
             re_i = F.layer_norm(re_i, [re_i.size(-1)])
             re_i = re_i.permute(0,3,1,2).contiguous()
             re.append(re_i)
 
-            te_i = (zc_ri * mask_r + zc_ti * mask_t + zp_ti * mask_pt) / (mask_r + mask_t + mask_pt + 1e-6)
+            te_i = (zc_ri * w_r + zc_ti * w_t + zp_ti * w_pt) / (w_r + w_t + w_pt + 1e-6)
             te_i = te_i.permute(0,2,3,1).contiguous()
             te_i = F.layer_norm(te_i, [te_i.size(-1)])
             te_i = te_i.permute(0,3,1,2).contiguous()
             te.append(te_i)
 
-            # Final fusion: all four sources equal-weight by active count
-            n_total = mask_r + mask_t + mask_pr + mask_pt
-            ff_i = (zc_ri * mask_r + zc_ti * mask_t + zp_ri * mask_pr + zp_ti * mask_pt) / (n_total + 1e-6)
+            # Final fusion: quality-weighted
+            w_total = w_r + w_t + w_pr + w_pt
+            ff_i = (zc_ri * w_r + zc_ti * w_t + zp_ri * w_pr + zp_ti * w_pt) / (w_total + 1e-6)
             ff_i = ff_i.permute(0,2,3,1).contiguous()
             ff_i = F.layer_norm(ff_i, [ff_i.size(-1)])
             ff_i = ff_i.permute(0,3,1,2).contiguous()

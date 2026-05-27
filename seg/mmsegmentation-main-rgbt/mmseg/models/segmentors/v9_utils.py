@@ -213,28 +213,9 @@ def downsample_mask(D, H_k, W_k):
 
 
 def quality_guided_loss(s_clean_list, s_deg_list, deg_level,
-                        num_stages=4, max_rank_samples=512,
-                        margin=0.2, extreme_thresh=0.1,
-                        clean_thresh=0.7):
-    """Degradation-region quality-guided loss.
-
-    Sub-losses per (predictor, stage):
-      1. Extreme:   degraded regions → s_deg should be low (weighted by degradation proportion)
-      2. Ranking:   same-position comparison → s_deg[pos] + margin < s_clean[pos]
-                    for moderately degraded regions (level 2-4, reserved for future)
-      3. Consistency: fully clean regions → s_deg ≈ s_clean
-      4. Clean floor: fully clean regions → s_clean >= clean_thresh
-
-    Uses adaptive_avg_pool2d (not max_pool) to avoid over-expanding the
-    degradation mask when downsampling to stage resolution.
-    Degradation proportion weighting handles boundary regions smoothly.
-
-    Args:
-        s_clean_list: per-stage clean quality scores [B,1,H_i,W_i]
-        s_deg_list:   per-stage degraded quality scores [B,1,H_i,W_i]
-        deg_level:    [B,1,H_orig,W_orig] long tensor, 0=clean, 5=missing
-                      (2-4 reserved for future non-missing degradation types)
-    """
+                        num_stages=4,
+                        w_low=1.0, w_high=1.0, w_rank=1.0,
+                        low_thresh=0.1, high_thresh=0.7, rank_margin=0.1):
     total_loss = torch.tensor(0.0, device=deg_level.device)
     count = 0
 
@@ -246,48 +227,31 @@ def quality_guided_loss(s_clean_list, s_deg_list, deg_level,
         if s_c.shape[2:] != s_d.shape[2:]:
             s_c = F.interpolate(s_c, size=(H_s, W_s), mode='bilinear', align_corners=False)
 
-        # avg_pool → [0,5] continuous degradation proportion
         lvl = F.adaptive_avg_pool2d(deg_level.float(), (H_s, W_s))
-        deg_w = lvl / 5.0          # [0, 1] degradation proportion
-        clean_w = 1.0 - deg_w      # [0, 1] clean proportion
+        lvl = lvl.round().clamp(0, 5).long()
 
-        # 1. Extreme: degraded regions → s_deg should be low
-        #    Weighted by degradation proportion (partial missing → partial penalty)
-        if (deg_w > 0).any():
-            loss1 = (deg_w * F.relu(s_d - extreme_thresh).pow(2)).sum() / (deg_w.sum() + 1e-6)
-            total_loss = total_loss + loss1
+        is_missing = (lvl == 5).float()
+        is_clean = (lvl == 0).float()
+
+        # 1. Missing regions (level 5): s_deg should be < low_thresh
+        if is_missing.sum() > 0:
+            loss_low = (is_missing * F.relu(s_d - low_thresh).pow(2)).sum() / (is_missing.sum() + 1e-6)
+            total_loss = total_loss + w_low * loss_low
             count += 1
 
-        # 2. Clean floor: clean regions → both s_c and s_d should be high
-        #    Weighted by clean proportion
-        if (clean_w > 0).any():
-            loss2a = (clean_w * F.relu(clean_thresh - s_c).pow(2)).sum() / (clean_w.sum() + 1e-6)
-            total_loss = total_loss + loss2a
+        # 2. Clean regions (level 0): both s_clean and s_deg should be > high_thresh
+        if is_clean.sum() > 0:
+            loss_high_c = (is_clean * F.relu(high_thresh - s_c).pow(2)).sum() / (is_clean.sum() + 1e-6)
+            total_loss = total_loss + w_high * loss_high_c
             count += 1
-            loss2b = (clean_w * F.relu(clean_thresh - s_d).pow(2)).sum() / (clean_w.sum() + 1e-6)
-            total_loss = total_loss + loss2b
+            loss_high_d = (is_clean * F.relu(high_thresh - s_d).pow(2)).sum() / (is_clean.sum() + 1e-6)
+            total_loss = total_loss + w_high * loss_high_d
             count += 1
 
-        # 3. Ranking (level 2-4): at the SAME spatial position,
-        #    degraded quality < clean quality (with margin)
-        #    Reserved for future non-missing degradation types (noise, blur, etc.)
-        mask_rank = (lvl > 1.0) & (lvl < 5.0)  # moderate but not full missing
-        if mask_rank.any():
-            n = int(mask_rank.sum().item())
-            n_sample = min(max_rank_samples, n)
-            if n_sample > 0:
-                idx = mask_rank.nonzero(as_tuple=False)
-                perm = torch.randperm(n, device=idx.device)[:n_sample]
-                si = idx[perm]  # [n_sample, 4] indices into [B, 1, H, W]
-                s_d_vals = s_d[si[:, 0], si[:, 1], si[:, 2], si[:, 3]]
-                s_c_vals = s_c[si[:, 0], si[:, 1], si[:, 2], si[:, 3]]
-                total_loss = total_loss + F.relu(s_d_vals - s_c_vals.detach() + margin).mean()
-                count += 1
-
-        # 4. Consistency: fully clean regions → s_deg ≈ s_clean
-        mask_clean = (lvl < 1.0)
-        if mask_clean.any():
-            total_loss = total_loss + F.l1_loss(s_d[mask_clean], s_c[mask_clean].detach())
+        # 3. Ranking: at clean positions, s_clean > s_deg + margin
+        if is_clean.sum() > 0:
+            loss_rank = (is_clean * F.relu(s_d - s_c.detach() + rank_margin).pow(2)).sum() / (is_clean.sum() + 1e-6)
+            total_loss = total_loss + w_rank * loss_rank
             count += 1
 
     if count > 0:

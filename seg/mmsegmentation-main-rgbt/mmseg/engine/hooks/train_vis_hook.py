@@ -1137,34 +1137,66 @@ class TrainVisHook(Hook):
         return label_vis, pred_vis
 
     def _get_decoder_predictions(self, model, feats, palette, runner,
-                                 prefix=''):
+                                 prefix='', model_type=None):
         decoder_preds = {}
         if prefix:
             zc_fused_key = f'zc_fused_{prefix}'
+            zc_rgb_key = f'zc_rgb_{prefix}'
+            zc_t_key = f'zc_t_{prefix}'
             rgb_pf_key = f'rgb_pf_{prefix}'
             t_pf_key = f't_pf_{prefix}'
             final_fused_key = f'final_fused_{prefix}'
         else:
             zc_fused_key = 'zc_fused'
+            zc_rgb_key = 'zc_rgb'
+            zc_t_key = 'zc_t'
             rgb_pf_key = 'rgb_pf'
             t_pf_key = 't_pf'
             final_fused_key = 'final_fused'
         try:
             with torch.no_grad():
-                if hasattr(model, 'common_decode_head') and \
-                        model.common_decode_head is not None and \
-                        zc_fused_key in feats:
-                    common_feats = feats[zc_fused_key]
-                    if model.with_neck:
-                        common_feats = model.neck(common_feats)
-                    logits = model._decode_head_predict_logits(
-                        common_feats, model.common_decode_head)
-                    if isinstance(logits, torch.Tensor):
-                        pred = logits.argmax(dim=1).squeeze().cpu().numpy()
-                        pred_vis = _apply_palette(pred, palette) if palette else \
-                            cv2.cvtColor(cv2.applyColorMap(pred, cv2.COLORMAP_VIRIDIS),
-                                         cv2.COLOR_BGR2RGB)
-                        decoder_preds[2] = pred_vis   # under zc_fused
+                if model_type == 'swin_quality_mask2former':
+                    # Per-modality common predictions
+                    if hasattr(model, 'common_decode_head') and \
+                            model.common_decode_head is not None:
+                        # RGB common prediction -> col 0
+                        if zc_rgb_key in feats:
+                            rgb_feats = feats[zc_rgb_key]
+                            logits = model._decode_head_predict_logits(
+                                rgb_feats, model.common_decode_head)
+                            if isinstance(logits, torch.Tensor):
+                                pred = logits.argmax(dim=1).squeeze().cpu().numpy()
+                                pred_vis = _apply_palette(pred, palette) if palette else \
+                                    cv2.cvtColor(cv2.applyColorMap(pred, cv2.COLORMAP_VIRIDIS),
+                                                 cv2.COLOR_BGR2RGB)
+                                decoder_preds[0] = pred_vis
+
+                        # T common prediction -> col 1
+                        if zc_t_key in feats:
+                            t_feats = feats[zc_t_key]
+                            logits = model._decode_head_predict_logits(
+                                t_feats, model.common_decode_head)
+                            if isinstance(logits, torch.Tensor):
+                                pred = logits.argmax(dim=1).squeeze().cpu().numpy()
+                                pred_vis = _apply_palette(pred, palette) if palette else \
+                                    cv2.cvtColor(cv2.applyColorMap(pred, cv2.COLORMAP_VIRIDIS),
+                                                 cv2.COLOR_BGR2RGB)
+                                decoder_preds[1] = pred_vis
+                else:
+                    if hasattr(model, 'common_decode_head') and \
+                            model.common_decode_head is not None and \
+                            zc_fused_key in feats:
+                        common_feats = feats[zc_fused_key]
+                        if model.with_neck:
+                            common_feats = model.neck(common_feats)
+                        logits = model._decode_head_predict_logits(
+                            common_feats, model.common_decode_head)
+                        if isinstance(logits, torch.Tensor):
+                            pred = logits.argmax(dim=1).squeeze().cpu().numpy()
+                            pred_vis = _apply_palette(pred, palette) if palette else \
+                                cv2.cvtColor(cv2.applyColorMap(pred, cv2.COLORMAP_VIRIDIS),
+                                             cv2.COLOR_BGR2RGB)
+                            decoder_preds[2] = pred_vis   # under zc_fused
 
                 if hasattr(model, 'rgb_private_decode_head') and \
                         model.rgb_private_decode_head is not None and \
@@ -2082,7 +2114,7 @@ class TrainVisHook(Hook):
             ir_mean = model.data_preprocessor.mean[3:].flatten().cpu()
             ir_std = model.data_preprocessor.std[3:].flatten().cpu()
 
-            if deg_type_rgb == 'missing':
+            if deg_type_rgb in ('missing', 'global_missing'):
                 if raw_rgb is not None:
                     rgb_vis = _add_missing_overlay(raw_rgb)
                 else:
@@ -2096,7 +2128,7 @@ class TrainVisHook(Hook):
                 if deg_type_rgb != 'none':
                     rgb_vis = _add_text_overlay(rgb_vis, deg_type_rgb)
 
-            if deg_type_t == 'missing':
+            if deg_type_t in ('missing', 'global_missing'):
                 if raw_t is not None:
                     t_vis = _add_missing_overlay(raw_t)
                 else:
@@ -2268,7 +2300,7 @@ class TrainVisHook(Hook):
                     row_labels.append(f'Stage {s} (degraded)')
 
             decoder_preds = self._get_decoder_predictions(
-                model, feats, palette, runner)
+                model, feats, palette, runner, model_type=model_type)
 
             img_h, img_w = proc_inputs.shape[-2], proc_inputs.shape[-1]
             aspect_ratio = img_w / max(img_h, 1)
@@ -2299,7 +2331,7 @@ class TrainVisHook(Hook):
             row_labels += [f'Stage {s} (degraded)' for s in range(num_stages)]
 
             decoder_preds = self._get_decoder_predictions(
-                model, feats, palette, runner)
+                model, feats, palette, runner, model_type=model_type)
 
             img_h, img_w = proc_inputs.shape[-2], proc_inputs.shape[-1]
             aspect_ratio = img_w / max(img_h, 1)
@@ -2319,7 +2351,7 @@ class TrainVisHook(Hook):
             row_labels += [f'Stage {s} (degraded)' for s in range(num_stages)]
 
             decoder_preds = self._get_decoder_predictions(
-                model, feats, palette, runner)
+                model, feats, palette, runner, model_type=model_type)
 
             img_h, img_w = proc_inputs.shape[-2], proc_inputs.shape[-1]
             aspect_ratio = img_w / max(img_h, 1)
@@ -2334,7 +2366,7 @@ class TrainVisHook(Hook):
                 row_labels += [f'Stage {s}(deg)' for s in range(num_stages)]
 
             decoder_preds = self._get_decoder_predictions(
-                model, feats, palette, runner)
+                model, feats, palette, runner, model_type=model_type)
 
             img_h, img_w = proc_inputs.shape[-2], proc_inputs.shape[-1]
             aspect_ratio = img_w / max(img_h, 1)
@@ -2376,7 +2408,7 @@ class TrainVisHook(Hook):
             _, deg_pred_vis = self._render_seg(label_seg, deg_pred_seg, palette)
 
             deg_decoder_preds = self._get_decoder_predictions(
-                model, feats, palette, runner, prefix='deg')
+                model, feats, palette, runner, prefix='deg', model_type=model_type)
 
             deg_type_rgb = feats.get('deg_type_rgb', 'none')
             deg_type_t = feats.get('deg_type_t', 'none')
@@ -2468,7 +2500,7 @@ class TrainVisHook(Hook):
             _, deg_pred_vis = self._render_seg(label_seg, deg_pred_seg, palette)
 
             deg_decoder_preds = self._get_decoder_predictions(
-                model, feats, palette, runner, prefix='deg')
+                model, feats, palette, runner, prefix='deg', model_type=model_type)
 
             ab_decoder_preds = {}
             if decoder_preds is not None:
@@ -2524,7 +2556,7 @@ class TrainVisHook(Hook):
             _, deg_pred_vis = self._render_seg(label_seg, deg_pred_seg, palette)
 
             deg_decoder_preds = self._get_decoder_predictions(
-                model, feats, palette, runner, prefix='deg')
+                model, feats, palette, runner, prefix='deg', model_type=model_type)
 
             ab_decoder_preds = {}
             if decoder_preds is not None:
@@ -2580,7 +2612,7 @@ class TrainVisHook(Hook):
             _, deg_pred_vis = self._render_seg(label_seg, deg_pred_seg, palette)
 
             deg_decoder_preds = self._get_decoder_predictions(
-                model, feats, palette, runner, prefix='deg')
+                model, feats, palette, runner, prefix='deg', model_type=model_type)
 
             ab_decoder_preds = {}
             if decoder_preds is not None:
@@ -2633,7 +2665,7 @@ class TrainVisHook(Hook):
             _, deg_pred_vis = self._render_seg(label_seg, deg_pred_seg, palette)
 
             deg_decoder_preds = self._get_decoder_predictions(
-                model, feats, palette, runner, prefix='deg')
+                model, feats, palette, runner, prefix='deg', model_type=model_type)
 
             ab_decoder_preds = {}
             if decoder_preds is not None:

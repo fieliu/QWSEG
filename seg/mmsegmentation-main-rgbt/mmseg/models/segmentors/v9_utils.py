@@ -243,7 +243,7 @@ def apply_mask_to_gt(data_samples, mask_2d):
             gt_squeezed = gt
         if m.shape != gt_squeezed.shape:
             m = F.interpolate(
-                m.unsqueeze(0).unsqueeze(0).float(),
+                m.unsqueeze(0).float(),
                 size=gt_squeezed.shape, mode='nearest').squeeze(0).squeeze(0)
         gt_squeezed = torch.where(m < 0.5, torch.full_like(gt_squeezed, 255), gt_squeezed)
         if old_gt.dim() == 3 and old_gt.shape[0] == 1:

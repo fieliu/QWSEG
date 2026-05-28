@@ -1155,7 +1155,7 @@ class TrainVisHook(Hook):
             final_fused_key = 'final_fused'
         try:
             with torch.no_grad():
-                if model_type == 'swin_quality_mask2former':
+                if model_type in ('swin_quality_mask2former', 'mit_quality_mamba'):
                     # Per-modality common predictions
                     if hasattr(model, 'common_decode_head') and \
                             model.common_decode_head is not None:

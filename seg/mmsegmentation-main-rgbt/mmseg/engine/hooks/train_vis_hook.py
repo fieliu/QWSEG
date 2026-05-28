@@ -1780,6 +1780,10 @@ class TrainVisHook(Hook):
             return None
         q_rgb_priv_deg = feats.get('q_rgb_priv_deg', q_rgb_deg)
         q_t_priv_deg = feats.get('q_t_priv_deg', q_t_deg)
+        D_rgb_deg = feats.get('D_rgb_deg')
+        D_t_deg = feats.get('D_t_deg')
+        D_rgb_priv_deg = feats.get('D_rgb_priv_deg')
+        D_t_priv_deg = feats.get('D_t_priv_deg')
         if img_h is not None and img_w is not None:
             h, w = img_h, img_w
         else:
@@ -1790,6 +1794,14 @@ class TrainVisHook(Hook):
                 return np.ones((h, w), dtype=np.float32)
             return t[i][0, 0].detach().cpu().numpy()
 
+        def _mask_np(D_list, i):
+            if D_list is None or i >= len(D_list) or D_list[i] is None:
+                return np.ones((h, w), dtype=np.float32)
+            m = D_list[i][0, 0].detach().cpu().numpy()
+            if m.shape != (h, w):
+                m = cv2.resize(m.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
+            return m
+
         stages = []
         for i in range(len(q_rgb_deg)):
             stages.append(dict(
@@ -1797,10 +1809,10 @@ class TrainVisHook(Hook):
                 t_hm=_quality_to_rgb_heatmap(_to_np(q_t_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
                 rgb_priv_hm=_quality_to_rgb_heatmap(_to_np(q_rgb_priv_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
                 t_priv_hm=_quality_to_rgb_heatmap(_to_np(q_t_priv_deg, i), h, w, vmin=0.0, vmax=1.0, cmap='rdBu_r'),
-                rgb_mask=(_to_np(q_rgb_deg, i) >= self.mask_threshold).astype(np.float32),
-                t_mask=(_to_np(q_t_deg, i) >= self.mask_threshold).astype(np.float32),
-                rgb_priv_mask=(_to_np(q_rgb_priv_deg, i) >= self.mask_threshold).astype(np.float32),
-                t_priv_mask=(_to_np(q_t_priv_deg, i) >= self.mask_threshold).astype(np.float32),
+                rgb_mask=_mask_np(D_rgb_deg, i),
+                t_mask=_mask_np(D_t_deg, i),
+                rgb_priv_mask=_mask_np(D_rgb_priv_deg, i),
+                t_priv_mask=_mask_np(D_t_priv_deg, i),
             ))
         return dict(stages=stages)
 

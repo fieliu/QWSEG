@@ -36,7 +36,7 @@ class QualityPredictor(nn.Module):
         self.norm2 = nn.LayerNorm(hidden)
         self.conv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
         self.score_head = nn.Conv2d(hidden, 1, 1, bias=True)
-        nn.init.constant_(self.score_head.bias, 0.5)
+        nn.init.constant_(self.score_head.bias, 4.0)
         self._init_weights()
 
     def _init_weights(self):
@@ -45,7 +45,7 @@ class QualityPredictor(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        nn.init.constant_(self.score_head.bias, 0.5)
+        nn.init.constant_(self.score_head.bias, 4.0)
 
     def forward(self, x, mask):
         B, C, H, W = x.shape
@@ -212,53 +212,91 @@ def downsample_mask(D, H_k, W_k):
     return F.adaptive_avg_pool2d(D.float(), (H_k, W_k))
 
 
-def quality_guided_loss(s_clean_list, s_deg_list, deg_level,
-                        num_stages=4,
-                        w_low=1.0, w_high=1.0, w_rank=1.0,
-                        low_thresh=0.1, high_thresh=0.7, rank_margin=0.1):
-    total_loss = torch.tensor(0.0, device=deg_level.device)
+def apply_mask_to_gt(data_samples, mask_2d):
+    """Apply a spatial mask to GT labels, setting masked-out pixels to ignore_label.
+
+    Args:
+        data_samples: list of SegDataSample with gt_sem_seg.data of shape
+                      [1, H, W] or [H, W]
+        mask_2d: [B, H_gt, W_gt] float tensor, values 0/1.
+                 mask_2d < 0.5 → set label to 255 (ignore).
+
+    Returns:
+        list of new SegDataSample with masked GT. Original samples are not
+        modified in-place.
+    """
+    import copy
+    from mmseg.structures import SegDataSample
+    from mmengine.structures import PixelData
+
+    new_samples = []
+    for i, ds in enumerate(data_samples):
+        new_ds = SegDataSample(metainfo=copy.deepcopy(ds.metainfo))
+        old_gt = ds.gt_sem_seg.data
+        gt = old_gt.clone()
+        m = mask_2d[i]
+        if m.dim() == 2:
+            m = m.unsqueeze(0)
+        if gt.dim() == 3 and gt.shape[0] == 1:
+            gt_squeezed = gt.squeeze(0)
+        else:
+            gt_squeezed = gt
+        if m.shape != gt_squeezed.shape:
+            m = F.interpolate(
+                m.unsqueeze(0).unsqueeze(0).float(),
+                size=gt_squeezed.shape, mode='nearest').squeeze(0).squeeze(0)
+        gt_squeezed = torch.where(m < 0.5, torch.full_like(gt_squeezed, 255), gt_squeezed)
+        if old_gt.dim() == 3 and old_gt.shape[0] == 1:
+            new_ds.gt_sem_seg = PixelData(data=gt_squeezed.unsqueeze(0))
+        else:
+            new_ds.gt_sem_seg = PixelData(data=gt_squeezed)
+        new_samples.append(new_ds)
+    return new_samples
+
+
+def compute_missing_loss(ds_r, ds_t, dspr, dspt, miss_rgb, miss_t, num_stages=4):
+    """MSE loss pushing quality scores toward 0 on known-missing regions.
+
+    Args:
+        ds_r, ds_t: lists of per-stage quality scores for common branch
+                    [B, 1, H_i, W_i]
+        dspr, dspt: lists of per-stage quality scores for private branches
+        miss_rgb: [B, 1, H, W] mask for RGB missing (1 = missing)
+        miss_t:  [B, 1, H, W] mask for thermal missing
+        num_stages: number of stages to consider
+
+    Returns:
+        scalar loss
+    """
+    device = miss_rgb.device
+    total_loss = torch.tensor(0.0, device=device)
     count = 0
 
-    for i in range(min(num_stages, len(s_clean_list), len(s_deg_list))):
-        s_c = s_clean_list[i].float()
-        s_d = s_deg_list[i].float()
-        H_s, W_s = s_d.shape[2], s_d.shape[3]
-
-        if s_c.shape[2:] != s_d.shape[2:]:
-            s_c = F.interpolate(s_c, size=(H_s, W_s), mode='bilinear', align_corners=False)
-
-        lvl = F.adaptive_avg_pool2d(deg_level.float(), (H_s, W_s))
-        lvl = lvl.round().clamp(0, 5).long()
-
-        is_missing = (lvl == 5).float()
-        is_clean = (lvl == 0).float()
-
-        # 1. Missing regions (level 5): s_deg should be < low_thresh
-        if is_missing.sum() > 0:
-            loss_low = (is_missing * F.relu(s_d - low_thresh).pow(2)).sum() / (is_missing.sum() + 1e-6)
-            total_loss = total_loss + w_low * loss_low
-            count += 1
-
-        # 2. Clean regions (level 0): both s_clean and s_deg should be > high_thresh
-        if is_clean.sum() > 0:
-            loss_high_c = (is_clean * F.relu(high_thresh - s_c).pow(2)).sum() / (is_clean.sum() + 1e-6)
-            total_loss = total_loss + w_high * loss_high_c
-            count += 1
-            loss_high_d = (is_clean * F.relu(high_thresh - s_d).pow(2)).sum() / (is_clean.sum() + 1e-6)
-            total_loss = total_loss + w_high * loss_high_d
-            count += 1
-
-        # 3. Ranking: at clean positions, s_clean > s_deg + margin
-        if is_clean.sum() > 0:
-            loss_rank = (is_clean * F.relu(s_d - s_c.detach() + rank_margin).pow(2)).sum() / (is_clean.sum() + 1e-6)
-            total_loss = total_loss + w_rank * loss_rank
-            count += 1
+    for score_list, miss_mask in [
+        (ds_r, miss_rgb),
+        (ds_t, miss_t),
+        (dspr, miss_rgb),
+        (dspt, miss_t),
+    ]:
+        for i in range(min(num_stages, len(score_list))):
+            s = score_list[i]
+            if s is None:
+                continue
+            H_s, W_s = s.shape[2], s.shape[3]
+            if miss_mask.shape[2:] != (H_s, W_s):
+                m = F.adaptive_avg_pool2d(miss_mask.float(), (H_s, W_s))
+            else:
+                m = miss_mask.float()
+            m_binary = (m > 0.5).float()
+            if m_binary.sum() > 0:
+                total_loss += ((s * m_binary).pow(2)).sum() / (m_binary.sum() + 1e-6)
+                count += 1
 
     if count > 0:
         total_loss = total_loss / count
 
     if torch.isnan(total_loss) or torch.isinf(total_loss):
-        return torch.tensor(0.0, device=deg_level.device, requires_grad=True)
+        return torch.tensor(0.0, device=device, requires_grad=True)
 
     return total_loss
 

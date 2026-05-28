@@ -630,8 +630,81 @@ class SwinQualitySoft(BaseSegmentor):
 
         return zc_r, zc_t, zp_r_outs, zp_t_outs, zf, re, te, ff, s_r, s_t, all_s, spr, spt
 
+    def _extract_feat_forced_missing(self, rgb, t, mask_rgb=False, mask_t=False):
+        B = rgb.shape[0]
+        zc_outs, s_r, s_t = _forward_swin_common_soft(
+            self.backbone, torch.cat([rgb, t], dim=0), orig_B=B,
+            predictors_rgb=self.predictors_common_rgb,
+            predictors_t=self.predictors_common_t,
+            training=False,
+            tau=self.tau, alpha=self.alpha)
+        zc_r = [f[:B] for f in zc_outs]
+        zc_t = [f[B:] for f in zc_outs]
+
+        zp_r_outs, spr = _forward_swin_branch_soft(
+            self.private_branch_rgb, rgb, self.predictors_priv_rgb,
+            training=False,
+            tau=self.tau, alpha=self.alpha)
+
+        zp_t_outs, spt = _forward_swin_branch_soft(
+            self.private_branch_t, t, self.predictors_priv_t,
+            training=False,
+            tau=self.tau, alpha=self.alpha)
+
+        zf, re, te, ff = [], [], [], []
+        for i in range(len(self.embed_dims_list)):
+            zc_ri = zc_r[i]
+            zc_ti = zc_t[i]
+            zp_ri = zp_r_outs[i]
+            zp_ti = zp_t_outs[i]
+            dev = zc_ri.device
+
+            if mask_rgb:
+                w_r = torch.zeros(B, 1, zc_ri.shape[2], zc_ri.shape[3], device=dev)
+                w_pr = torch.zeros(B, 1, zp_ri.shape[2], zp_ri.shape[3], device=dev)
+            else:
+                sri = s_r[i] if s_r[i] is not None else torch.ones(B, 1, zc_ri.shape[2], zc_ri.shape[3], device=dev)
+                w_r = sri
+                spr_i = spr[i] if spr[i] is not None else torch.ones(B, 1, zp_ri.shape[2], zp_ri.shape[3], device=dev)
+                w_pr = spr_i
+
+            if mask_t:
+                w_t = torch.zeros(B, 1, zc_ti.shape[2], zc_ti.shape[3], device=dev)
+                w_pt = torch.zeros(B, 1, zp_ti.shape[2], zp_ti.shape[3], device=dev)
+            else:
+                sti = s_t[i] if s_t[i] is not None else torch.ones(B, 1, zc_ti.shape[2], zc_ti.shape[3], device=dev)
+                w_t = sti
+                spt_i = spt[i] if spt[i] is not None else torch.ones(B, 1, zp_ti.shape[2], zp_ti.shape[3], device=dev)
+                w_pt = spt_i
+
+            zc_r_weighted = zc_ri * w_r
+            zc_t_weighted = zc_ti * w_t
+            zp_r_weighted = zp_ri * w_pr
+            zp_t_weighted = zp_ti * w_pt
+
+            zf_i = zc_r_weighted + zc_t_weighted
+            zf.append(zf_i)
+
+            re_i = zf_i + zp_r_weighted
+            re.append(re_i)
+
+            te_i = zf_i + zp_t_weighted
+            te.append(te_i)
+
+            if i == len(self.embed_dims_list) - 1:
+                sum_feat = zf_i + zp_r_weighted + zp_t_weighted
+                ff_i = self.final_conv(sum_feat)
+                ff_i = ff_i.permute(0, 2, 3, 1).contiguous()
+                ff_i = self.final_norm(ff_i)
+                ff_i = ff_i.permute(0, 3, 1, 2).contiguous()
+            else:
+                ff_i = zf_i
+            ff.append(ff_i)
+
+        return ff
+
     def _train_with_degradation(self, rgb, ir):
-        dr, di, deg_level_rgb, deg_level_t = self._generate_degraded_inputs(rgb, ir)
+        dr, di, dtr, dtt, deg_level_rgb, deg_level_t = self._generate_degraded_inputs(rgb, ir)
         feats = self._extract_feat_single(dr, di)
         return feats + (deg_level_rgb, deg_level_t)
 
@@ -643,6 +716,7 @@ class SwinQualitySoft(BaseSegmentor):
         im = self.data_preprocessor.mean[3:].to(dev)
         iss = self.data_preprocessor.std[3:].to(dev)
         dr, di = rgb.clone(), ir.clone()
+        dtr, dtt = ['none'] * B, ['none'] * B
         deg_level_rgb = torch.zeros(B, 1, H, W, device=dev, dtype=torch.long)
         deg_level_t = torch.zeros(B, 1, H, W, device=dev, dtype=torch.long)
         ep = getattr(self, 'current_epoch', 0)
@@ -653,9 +727,11 @@ class SwinQualitySoft(BaseSegmentor):
             if r < sched['p_global']:
                 if modality == 'rgb':
                     dr[b:b+1] = _apply_missing_degradation(rgb[b:b+1], rm, rs)
+                    dtr[b] = 'global_missing'
                     deg_level_rgb[b:b+1] = 5
                 else:
                     di[b:b+1] = _apply_missing_degradation(ir[b:b+1], im, iss)
+                    dtt[b] = 'global_missing'
                     deg_level_t[b:b+1] = 5
             elif r < sched['p_global'] + sched['p_local']:
                 area = sched['local_area']
@@ -664,11 +740,13 @@ class SwinQualitySoft(BaseSegmentor):
                 lm = _generate_single_rect_mask(1, H, W, area, device=dev)
                 if modality == 'rgb':
                     dr[b:b+1] = _apply_local_missing(rgb[b:b+1], rm, rs, lm)
+                    dtr[b] = f'local_missing_{area:.0%}'
                     deg_level_rgb[b:b+1] = (lm > 0).long() * 5
                 else:
                     di[b:b+1] = _apply_local_missing(ir[b:b+1], im, iss, lm)
+                    dtt[b] = f'local_missing_{area:.0%}'
                     deg_level_t[b:b+1] = (lm > 0).long() * 5
-        return dr.to(rgb.dtype), di.to(ir.dtype), deg_level_rgb, deg_level_t
+        return dr.to(rgb.dtype), di.to(ir.dtype), dtr, dtt, deg_level_rgb, deg_level_t
 
     def loss(self, inputs, data_samples):
         rgb, ir = inputs[:, :3], inputs[:, 3:]
@@ -838,7 +916,7 @@ class SwinQualitySoft(BaseSegmentor):
              s_r, s_t, all_s, spr, spt) = self._extract_feat_single(rgb, t)
             fused = self.neck(ff) if self.with_neck else ff
 
-            deg_rgb, deg_t, deg_level_rgb, deg_level_t = self._generate_degraded_inputs(rgb, t)
+            deg_rgb, deg_t, dtr, dtt, deg_level_rgb, deg_level_t = self._generate_degraded_inputs(rgb, t)
             (zc_r_d, zc_t_d, zp_r_d, zp_t_d, zf_d, re_d, te_d, ff_d,
              ds_r_d, ds_t_d, dall_s_d, dspr_d, dspt_d) = self._extract_feat_single(deg_rgb, deg_t)
             fused_d = self.neck(ff_d) if self.with_neck else ff_d
@@ -854,8 +932,8 @@ class SwinQualitySoft(BaseSegmentor):
                 te_d[i] = F.interpolate(te_d[i], size=te[i].shape[-2:], mode='bilinear')
                 ff_d[i] = F.interpolate(ff_d[i], size=ff[i].shape[-2:], mode='bilinear')
 
-        deg_type_rgb = 'missing' if (deg_level_rgb == 5).any() else 'none'
-        deg_type_t = 'missing' if (deg_level_t == 5).any() else 'none'
+        deg_type_rgb = dtr[0] if isinstance(dtr, list) else dtr
+        deg_type_t = dtt[0] if isinstance(dtt, list) else dtt
 
         return dict(
             zc_rgb=zc_r, zc_t=zc_t,
@@ -946,15 +1024,17 @@ class SwinQualitySoft(BaseSegmentor):
         num_classes = self.num_classes
         ignore_index = 255
 
-        for deg_name, deg_rgb, deg_ir in [
+        for deg_name, deg_rgb, deg_ir, m_rgb, m_t in [
             ('rgb_missing',
-             _apply_missing_degradation(rgb, rm, rs), ir),
+             _apply_missing_degradation(rgb, rm, rs), ir, True, False),
             ('thermal_missing',
-             rgb, _apply_missing_degradation(ir, im, iss)),
+             rgb, _apply_missing_degradation(ir, im, iss), False, True),
         ]:
-            deg_inputs = torch.cat([deg_rgb, deg_ir], dim=1)
+            ff = self._extract_feat_forced_missing(deg_rgb, deg_ir,
+                                                    mask_rgb=m_rgb, mask_t=m_t)
+            ff = self.neck(ff) if self.with_neck else ff
             bm = [ds.metainfo for ds in data_samples]
-            seg_logits = self.encode_decode(deg_inputs, bm)
+            seg_logits = self.decode_head.predict(ff, bm, self.test_cfg)
             B, C, H, W = seg_logits.shape
             preds = seg_logits.argmax(dim=1)
 

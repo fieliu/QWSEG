@@ -301,6 +301,54 @@ def compute_missing_loss(ds_r, ds_t, dspr, dspt, miss_rgb, miss_t, num_stages=4)
     return total_loss
 
 
+def quality_guided_loss(s_clean_list, s_deg_list, deg_level,
+                        num_stages=4,
+                        w_low=1.0, w_high=1.0, w_rank=1.0,
+                        low_thresh=0.1, high_thresh=0.7, rank_margin=0.1):
+    total_loss = torch.tensor(0.0, device=deg_level.device)
+    count = 0
+
+    for i in range(min(num_stages, len(s_clean_list), len(s_deg_list))):
+        s_c = s_clean_list[i].float()
+        s_d = s_deg_list[i].float()
+        H_s, W_s = s_d.shape[2], s_d.shape[3]
+
+        if s_c.shape[2:] != s_d.shape[2:]:
+            s_c = F.interpolate(s_c, size=(H_s, W_s), mode='bilinear', align_corners=False)
+
+        lvl = F.adaptive_avg_pool2d(deg_level.float(), (H_s, W_s))
+        lvl = lvl.round().clamp(0, 5).long()
+
+        is_missing = (lvl == 5).float()
+        is_clean = (lvl == 0).float()
+
+        if is_missing.sum() > 0:
+            loss_low = (is_missing * F.relu(s_d - low_thresh).pow(2)).sum() / (is_missing.sum() + 1e-6)
+            total_loss = total_loss + w_low * loss_low
+            count += 1
+
+        if is_clean.sum() > 0:
+            loss_high_c = (is_clean * F.relu(high_thresh - s_c).pow(2)).sum() / (is_clean.sum() + 1e-6)
+            total_loss = total_loss + w_high * loss_high_c
+            count += 1
+            loss_high_d = (is_clean * F.relu(high_thresh - s_d).pow(2)).sum() / (is_clean.sum() + 1e-6)
+            total_loss = total_loss + w_high * loss_high_d
+            count += 1
+
+        if is_clean.sum() > 0:
+            loss_rank = (is_clean * F.relu(s_d - s_c.detach() + rank_margin).pow(2)).sum() / (is_clean.sum() + 1e-6)
+            total_loss = total_loss + w_rank * loss_rank
+            count += 1
+
+    if count > 0:
+        total_loss = total_loss / count
+
+    if torch.isnan(total_loss) or torch.isinf(total_loss):
+        return torch.tensor(0.0, device=deg_level.device, requires_grad=True)
+
+    return total_loss
+
+
 # ---------------------------------------------------------------------------
 # Quality degradation (progressive curriculum)
 # ---------------------------------------------------------------------------

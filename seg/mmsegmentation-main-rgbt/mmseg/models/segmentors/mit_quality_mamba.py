@@ -1,20 +1,7 @@
-"""Quality-Gated MiT with SegformerHead Decoder (Soft-Only Refactor).
+"""Quality-Gated MiT with DualGate Fusion.
 
-Three-branch architecture:
-  - Common:  one MiT backbone processing RGB+T concatenated -> zc_rgb, zc_t
-  - Private: two MiT branches (RGB, T) -> zp_rgb, zp_t
-  - QualityPredictor x 16 (4 stages x 4 predictor sets)
-  - SegformerHead main decoder + auxiliary decoders
-
-All hard-mask / STE / complementary-fix logic removed.  Continuous quality
-scores are used for attention bias injection and final-feature weighting.
-Auxiliary heads receive raw (unweighted) features.
-
-Training curriculum:
-  Warmup (epoch 0 ~ warmup_epochs):  Clean-only. QP frozen, force_all_keep=True,
-        no degradation branch, no distill/invariant/missing loss.
-  Main (warmup_epochs ~ end):        Quality-aware. QP unfrozen,
-        progressive missing degradation, all losses active.
+Three-branch architecture + DualGateFusion (channel+spatial gating).
+Smooth startup via QP bias=4.0 and clamp_min=0.1 for first 5 epochs.
 """
 
 import copy
@@ -48,10 +35,6 @@ from mmseg.utils import (ConfigType, OptConfigType, OptMultiConfig,
                          SampleList, add_prefix)
 
 
-# ---------------------------------------------------------------------------
-# Helper: MiT NLC <-> NCHW
-# ---------------------------------------------------------------------------
-
 def nlc_to_nchw(x, hw_shape):
     H, W = hw_shape
     B, _, C = x.shape
@@ -70,14 +53,6 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
                                  predictors_rgb, predictors_t,
                                  clamp_min=0.0,
                                  tau=0.3, alpha=10.0):
-    """Quality-aware forward through the shared MiT backbone (soft-only).
-
-    - QualityPredictor outputs continuous score s in (0,1).
-    - Independent f_attn bias per modality injected into attention.
-    - Cross-stage cascade: cumulative product (NOT detached).
-    - clamp_min on pooled_prev for early training stability.
-    - No hard mask, no STE, no complementary fix.
-    """
     outs, all_s_rgb, all_s_t = [], [], []
     cum_rgb, cum_t = None, None
 
@@ -99,31 +74,26 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
         if s_t is None:
             s_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
 
-        # Cross-stage cascade (gradient flows, NOT detached)
-        s_rgb_adj, cum_rgb = cascade_quality_suppress(
-            s_rgb, cum_rgb, H, W, clamp_min=clamp_min)
-        s_t_adj, cum_t = cascade_quality_suppress(
-            s_t, cum_t, H, W, clamp_min=clamp_min)
+        s_rgb_adj, cum_rgb = cascade_quality_suppress(s_rgb, cum_rgb, H, W, clamp_min=clamp_min)
+        s_t_adj, cum_t = cascade_quality_suppress(s_t, cum_t, H, W, clamp_min=clamp_min)
         cum_rgb = s_rgb_adj
         cum_t = s_t_adj
 
         all_s_rgb.append(s_rgb_adj)
         all_s_t.append(s_t_adj)
 
-        # Independent f_attn bias per modality
         bias_rgb = f_attn(s_rgb_adj, tau=tau, alpha=alpha)
         bias_t = f_attn(s_t_adj, tau=tau, alpha=alpha)
         bias_combined = torch.cat([bias_rgb, bias_t], dim=0)
 
-        for j, block in enumerate(blocks):
+        for block in blocks:
             residual = x
             x_norm1 = block.norm1(x)
             attn_module = block.attn
             x_q = x_norm1
             if attn_module.sr_ratio > 1:
                 x_kv = nlc_to_nchw(x_norm1, hw_shape)
-                x_kv = attn_module.sr(x_kv)
-                x_kv = nchw_to_nlc(x_kv)
+                x_kv = attn_module.sr(x_kv); x_kv = nchw_to_nlc(x_kv)
                 x_kv = attn_module.norm(x_kv)
             else:
                 x_kv = x_norm1
@@ -144,10 +114,8 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
             V = F.linear(x_kv, v_w, v_b)
 
             if attn_module.sr_ratio > 1:
-                K = nlc_to_nchw(K, hw_shape)
-                K = attn_module.sr(K)
-                hw_shape_k = K.shape[2:]
-                K = nchw_to_nlc(K)
+                K = nlc_to_nchw(K, hw_shape); K = attn_module.sr(K)
+                hw_shape_k = K.shape[2:]; K = nchw_to_nlc(K)
                 K = attn_module.norm(K)
 
             Q = Q.reshape(Bb, N_tok, num_heads, head_dim).permute(0, 2, 1, 3)
@@ -189,10 +157,6 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
 def _forward_branch_pruned(backbone, img, predictor_list,
                             clamp_min=0.0,
                             tau=0.3, alpha=10.0):
-    """Quality-aware forward through a single MiT branch (soft-only).
-
-    Same as common branch but for a single modality.
-    """
     outs, all_s = [], []
     cum_s = None
 
@@ -210,22 +174,18 @@ def _forward_branch_pruned(backbone, img, predictor_list,
         if s is None:
             s = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
 
-        # Cross-stage cascade (gradient flows, NOT detached)
-        s_adj, cum_s = cascade_quality_suppress(
-            s, cum_s, H, W, clamp_min=clamp_min)
+        s_adj, cum_s = cascade_quality_suppress(s, cum_s, H, W, clamp_min=clamp_min)
         cum_s = s_adj
-
         all_s.append(s_adj)
 
-        for j, block in enumerate(blocks):
+        for block in blocks:
             residual = x
             x_norm1 = block.norm1(x)
             attn_module = block.attn
             x_q = x_norm1
             if attn_module.sr_ratio > 1:
                 x_kv = nlc_to_nchw(x_norm1, hw_shape)
-                x_kv = attn_module.sr(x_kv)
-                x_kv = nchw_to_nlc(x_kv)
+                x_kv = attn_module.sr(x_kv); x_kv = nchw_to_nlc(x_kv)
                 x_kv = attn_module.norm(x_kv)
             else:
                 x_kv = x_norm1
@@ -246,10 +206,8 @@ def _forward_branch_pruned(backbone, img, predictor_list,
             V = F.linear(x_kv, v_w, v_b)
 
             if attn_module.sr_ratio > 1:
-                K = nlc_to_nchw(K, hw_shape)
-                K = attn_module.sr(K)
-                hw_shape_k = K.shape[2:]
-                K = nchw_to_nlc(K)
+                K = nlc_to_nchw(K, hw_shape); K = attn_module.sr(K)
+                hw_shape_k = K.shape[2:]; K = nchw_to_nlc(K)
                 K = attn_module.norm(K)
 
             Q = Q.reshape(Bb, N_tok, num_heads, head_dim).permute(0, 2, 1, 3)
@@ -289,26 +247,62 @@ def _forward_branch_pruned(backbone, img, predictor_list,
 
 
 # ===================================================================
-# QualityGatedMiTMamba (Soft-Only Refactor)
+# DualGateFusion
+# ===================================================================
+
+class DualGateFusion(nn.Module):
+    """Channel- and spatial-gated residual fusion module."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.channels = channels
+        mid_ch = max(channels // 4, 64)
+        self.ch_gate_conv1 = nn.Conv2d(channels * 3, mid_ch * 2, 1, bias=False)
+        self.ch_gate_conv2 = nn.Conv2d(mid_ch * 2, channels * 2, 1, bias=False)
+        self.sp_gate = nn.Conv2d(channels * 3, 2, 3, padding=1, bias=False)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+
+    def forward(self, zc_r, zc_t, zp_r, zp_t, w_r, w_t, w_pr, w_pt):
+        Fc_r = zc_r * w_r; Fc_t = zc_t * w_t
+        Fp_r = zp_r * w_pr; Fp_t = zp_t * w_pt
+
+        F_common = (Fc_r + Fc_t) / (w_r + w_t + 1e-8)
+        F_common = F_common.permute(0, 2, 3, 1).contiguous()
+        F_common = F.layer_norm(F_common, [F_common.size(-1)])
+        F_common = F_common.permute(0, 3, 1, 2).contiguous()
+
+        gate_input = torch.cat([F_common, Fp_r, Fp_t], dim=1)
+
+        ch_feat = F.adaptive_avg_pool2d(gate_input, 1)
+        ch_feat = self.ch_gate_conv1(ch_feat); ch_feat = F.relu(ch_feat)
+        ch_feat = self.ch_gate_conv2(ch_feat)
+        ch_gate_r, ch_gate_t = ch_feat.sigmoid().chunk(2, dim=1)
+
+        sp_gate_r, sp_gate_t = self.sp_gate(gate_input).sigmoid().chunk(2, dim=1)
+
+        Pr_gated = Fp_r * ch_gate_r * sp_gate_r
+        Pt_gated = Fp_t * ch_gate_t * sp_gate_t
+
+        F_final = F_common + Pr_gated + Pt_gated
+        F_final = F_final.permute(0, 2, 3, 1).contiguous()
+        F_final = F.layer_norm(F_final, [F_final.size(-1)])
+        F_final = F_final.permute(0, 3, 1, 2).contiguous()
+
+        return F_final
+
+
+# ===================================================================
+# QualityGatedMiTMamba
 # ===================================================================
 
 @MODELS.register_module()
 class QualityGatedMiTMamba(BaseSegmentor):
-    """Quality-gated MiT with SegformerHead decoder (soft-only).
-
-    Three-branch architecture:
-      - Common:  one MiT backbone processing RGB+T concatenated -> zc_rgb, zc_t
-      - Private: two MiT branches (RGB, T) -> zp_rgb, zp_t
-      - QualityPredictor x 16 (4 stages x 4 predictor sets)
-      - SegformerHead main decoder + auxiliary decoders
-
-    Key design choices (soft-only):
-      - Auxiliary heads receive raw (unweighted) features.
-      - Final fusion uses quality-weighted sum + LayerNorm.
-      - Attention bias via independent f_attn per modality.
-      - Cross-stage quality cascade (gradient flows, no detach).
-      - Progressive missing degradation curriculum.
-    """
+    """Quality-gated MiT with DualGateFusion and smooth startup."""
 
     def __init__(self,
                  backbone: ConfigType,
@@ -324,7 +318,6 @@ class QualityGatedMiTMamba(BaseSegmentor):
                  test_cfg: OptConfigType = None,
                  data_preprocessor: OptConfigType = None,
                  pretrained: Optional[str] = None,
-                 warmup_epochs: int = 10,
                  total_epochs: int = 200,
                  loss_align_weight: float = 0.1,
                  contrast_tau: float = 0.07,
@@ -333,7 +326,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
                  distill_temperature: float = 4.0,
                  aux_loss_weight: float = 0.5,
                  loss_invariant_weight: float = 0.03,
-                 loss_missing_weight: float = 5.0,
+                 loss_missing_weight: float = 0.5,
                  missing_ratio: float = 0.3,
                  global_deg_ratio: float = 0.3,
                  local_deg_ratio: float = 0.4,
@@ -356,10 +349,8 @@ class QualityGatedMiTMamba(BaseSegmentor):
         num_heads = backbone.get('num_heads', [1, 2, 5, 8])
         embed_dims_base = backbone.get('embed_dims', 64)
         self.embed_dims_list = [embed_dims_base * h for h in num_heads]
-        self.tau = tau
-        self.alpha = alpha
+        self.tau = tau; self.alpha = alpha
         self._build_predictors()
-        self.warmup_epochs = warmup_epochs
         self.total_epochs = total_epochs
         self.loss_align_weight = loss_align_weight
         self.contrast_tau, self.contrast_num_samples = contrast_tau, contrast_num_samples
@@ -369,13 +360,9 @@ class QualityGatedMiTMamba(BaseSegmentor):
         self.loss_invariant_weight = loss_invariant_weight
         self.loss_missing_weight = loss_missing_weight
 
-        # Final fusion: 1x1 conv for the last stage
+        self.dual_gate_fusion = DualGateFusion(self.embed_dims_list[-1])
         final_dim = self.embed_dims_list[-1]
         self.final_conv = nn.Conv2d(final_dim, final_dim, 1, bias=False)
-        self.final_norm = nn.LayerNorm(final_dim)
-
-        # Quality predictor freeze state
-        self._quality_frozen = False
 
     def _build_predictors(self):
         self.predictors_common_rgb = nn.ModuleList(
@@ -386,8 +373,6 @@ class QualityGatedMiTMamba(BaseSegmentor):
             [QualityPredictor(ch) for ch in self.embed_dims_list])
         self.predictors_priv_t = nn.ModuleList(
             [QualityPredictor(ch) for ch in self.embed_dims_list])
-
-    # ---- BaseSegmentor overrides ----
 
     def _init_decode_head(self, decode_head):
         self.decode_head = MODELS.build(decode_head)
@@ -416,99 +401,61 @@ class QualityGatedMiTMamba(BaseSegmentor):
             valid[i, pt:h - pb, pl:w - pr] = True
         return valid
 
-    # ---- Training phase / freeze control ----
-
-    @property
-    def force_all_keep(self):
-        ep = getattr(self, 'current_epoch', 0)
-        return ep < self.warmup_epochs
-
-    def _update_quality_freeze_status(self, epoch=None):
-        from mmengine.logging import print_log
-        if epoch is not None:
-            should_freeze = epoch < self.warmup_epochs
-        else:
-            should_freeze = self.warmup_epochs > 0
-        if should_freeze and not self._quality_frozen:
-            self._quality_frozen = True
-            for pred_list in [self.predictors_common_rgb, self.predictors_common_t,
-                              self.predictors_priv_rgb, self.predictors_priv_t]:
-                for p in pred_list.parameters():
-                    p.requires_grad = False
-                pred_list.eval()
-            print_log(f'Quality predictors FROZEN (epoch {epoch}, '
-                      f'warmup_epochs={self.warmup_epochs})', logger='current')
-        elif not should_freeze and self._quality_frozen:
-            self._quality_frozen = False
-            for pred_list in [self.predictors_common_rgb, self.predictors_common_t,
-                              self.predictors_priv_rgb, self.predictors_priv_t]:
-                for p in pred_list.parameters():
-                    p.requires_grad = True
-                pred_list.train()
-            print_log(f'Quality predictors UNFROZEN (epoch {epoch})', logger='current')
-
-    def _clamp_min_for_epoch(self, epoch):
-        if epoch is None:
-            return 0.0
-        if self.warmup_epochs <= epoch < self.warmup_epochs + 5:
-            return 0.1
+    @staticmethod
+    def _clamp_min_for_epoch(epoch):
+        if epoch is None: return 0.0
+        if epoch < 5: return 0.1
         return 0.0
+
+    @staticmethod
+    def _make_quality_gate(score, tau, target_h, target_w):
+        gate = (score > tau).float().detach()
+        gate_sq = gate.squeeze(1)
+        if gate_sq.shape[-2:] != (target_h, target_w):
+            gate_sq = F.interpolate(
+                gate_sq.unsqueeze(1).float(),
+                size=(target_h, target_w), mode='nearest').squeeze(1)
+        return gate_sq
 
     def init_weights(self):
         self.backbone.init_weights()
         self.private_branch_rgb.init_weights()
         self.private_branch_t.init_weights()
-        if self.init_cfg:
-            super().init_weights()
+        if self.init_cfg: super().init_weights()
 
     # ---- Core feature extraction ----
 
     def _extract_feat_single(self, rgb, t):
         B = rgb.shape[0]
-        force = self.force_all_keep
         ep = getattr(self, 'current_epoch', 0)
-        clamp_min = self._clamp_min_for_epoch(ep) if not force else 0.0
+        clamp_min = self._clamp_min_for_epoch(ep)
 
         zc_outs, s_r, s_t = _forward_common_dual_pruned(
             self.backbone, torch.cat([rgb, t], dim=0), orig_B=B,
             predictors_rgb=self.predictors_common_rgb,
             predictors_t=self.predictors_common_t,
-            clamp_min=clamp_min,
-            tau=self.tau, alpha=self.alpha)
-        zc_r = [f[:B] for f in zc_outs]
-        zc_t = [f[B:] for f in zc_outs]
+            clamp_min=clamp_min, tau=self.tau, alpha=self.alpha)
+        zc_r = [f[:B] for f in zc_outs]; zc_t = [f[B:] for f in zc_outs]
 
         zp_r, spr = _forward_branch_pruned(
             self.private_branch_rgb, rgb, self.predictors_priv_rgb,
-            clamp_min=clamp_min,
-            tau=self.tau, alpha=self.alpha)
+            clamp_min=clamp_min, tau=self.tau, alpha=self.alpha)
 
         zp_t, spt = _forward_branch_pruned(
             self.private_branch_t, t, self.predictors_priv_t,
-            clamp_min=clamp_min,
-            tau=self.tau, alpha=self.alpha)
-
-        if force:
-            s_r = [torch.ones_like(s) for s in s_r]
-            s_t = [torch.ones_like(s) for s in s_t]
-            spr = [torch.ones_like(s) for s in spr]
-            spt = [torch.ones_like(s) for s in spt]
+            clamp_min=clamp_min, tau=self.tau, alpha=self.alpha)
 
         re, te, ff, zf_weighted = [], [], [], []
         for i in range(len(self.embed_dims_list)):
-            zc_ri = zc_r[i]
-            zc_ti = zc_t[i]
-            zp_ri = zp_r[i]
-            zp_ti = zp_t[i]
-            dev = zc_ri.device
-            B1 = B
+            zc_ri = zc_r[i]; zc_ti = zc_t[i]; zp_ri = zp_r[i]; zp_ti = zp_t[i]
+            dev = zc_ri.device; B1 = B
 
             w_r = s_r[i] if s_r[i] is not None else torch.ones(B1, 1, zc_ri.shape[2], zc_ri.shape[3], device=dev)
             w_t = s_t[i] if s_t[i] is not None else torch.ones(B1, 1, zc_ti.shape[2], zc_ti.shape[3], device=dev)
             w_pr = spr[i] if spr[i] is not None else torch.ones(B1, 1, zc_ri.shape[2], zc_ri.shape[3], device=dev)
             w_pt = spt[i] if spt[i] is not None else torch.ones(B1, 1, zc_ti.shape[2], zc_ti.shape[3], device=dev)
 
-            # Aux head inputs: raw average (NO quality weighting)
+            # Aux heads: raw average + LN
             re_i = (zc_ri + zp_ri) / 2.0
             re_i = re_i.permute(0, 2, 3, 1).contiguous()
             re_i = F.layer_norm(re_i, [re_i.size(-1)])
@@ -521,20 +468,20 @@ class QualityGatedMiTMamba(BaseSegmentor):
             te_i = te_i.permute(0, 3, 1, 2).contiguous()
             te.append(te_i)
 
-            # Quality-weighted common fusion (for invariance loss)
+            # zf_weighted for invariance loss
             zf_w = (w_r * zc_ri + w_t * zc_ti) / (w_r + w_t + 1e-8)
             zf_w = zf_w.permute(0, 2, 3, 1).contiguous()
             zf_w = F.layer_norm(zf_w, [zf_w.size(-1)])
             zf_w = zf_w.permute(0, 3, 1, 2).contiguous()
             zf_weighted.append(zf_w)
 
-            # Final fusion: quality-weighted sum + LayerNorm
-            sum_feat = zc_ri * w_r + zc_ti * w_t + zp_ri * w_pr + zp_ti * w_pt
+            # DualGateFusion
+            ff_i = self.dual_gate_fusion(zc_ri, zc_ti, zp_ri, zp_ti, w_r, w_t, w_pr, w_pt)
             if i == len(self.embed_dims_list) - 1:
-                sum_feat = self.final_conv(sum_feat)
-            ff_i = sum_feat.permute(0, 2, 3, 1).contiguous()
-            ff_i = F.layer_norm(ff_i, [ff_i.size(-1)])
-            ff_i = ff_i.permute(0, 3, 1, 2).contiguous()
+                ff_i = self.final_conv(ff_i)
+                ff_i = ff_i.permute(0, 2, 3, 1).contiguous()
+                ff_i = F.layer_norm(ff_i, [ff_i.size(-1)])
+                ff_i = ff_i.permute(0, 3, 1, 2).contiguous()
             ff.append(ff_i)
 
         all_s = [s for sl in [s_r, s_t, spr, spt] for s in sl]
@@ -552,10 +499,8 @@ class QualityGatedMiTMamba(BaseSegmentor):
     def _generate_degraded_inputs(self, rgb, ir):
         B, C, H, W = rgb.shape
         dev = rgb.device
-        rm = self.data_preprocessor.mean[:3].to(dev)
-        rs = self.data_preprocessor.std[:3].to(dev)
-        im = self.data_preprocessor.mean[3:].to(dev)
-        iss = self.data_preprocessor.std[3:].to(dev)
+        rm = self.data_preprocessor.mean[:3].to(dev); rs = self.data_preprocessor.std[:3].to(dev)
+        im = self.data_preprocessor.mean[3:].to(dev); iss = self.data_preprocessor.std[3:].to(dev)
         dr, di = rgb.clone(), ir.clone()
         dtr, dtt = ['none'] * B, ['none'] * B
         miss_rgb = torch.zeros(B, 1, H, W, device=dev)
@@ -568,25 +513,20 @@ class QualityGatedMiTMamba(BaseSegmentor):
             if r < sched['p_global']:
                 if modality == 'rgb':
                     dr[b:b+1] = _apply_missing_degradation(rgb[b:b+1], rm, rs)
-                    dtr[b] = 'global_missing'
-                    miss_rgb[b:b+1] = 1.0
+                    dtr[b] = 'global_missing'; miss_rgb[b:b+1] = 1.0
                 else:
                     di[b:b+1] = _apply_missing_degradation(ir[b:b+1], im, iss)
-                    dtt[b] = 'global_missing'
-                    miss_t[b:b+1] = 1.0
+                    dtt[b] = 'global_missing'; miss_t[b:b+1] = 1.0
             elif r < sched['p_global'] + sched['p_local']:
                 area = sched['local_area']
-                if area <= 0:
-                    continue
+                if area <= 0: continue
                 lm = _generate_single_rect_mask(1, H, W, area, device=dev)
                 if modality == 'rgb':
                     dr[b:b+1] = _apply_local_missing(rgb[b:b+1], rm, rs, lm)
-                    dtr[b] = f'local_missing_{area:.0%}'
-                    miss_rgb[b:b+1] = lm
+                    dtr[b] = f'local_missing_{area:.0%}'; miss_rgb[b:b+1] = lm
                 else:
                     di[b:b+1] = _apply_local_missing(ir[b:b+1], im, iss, lm)
-                    dtt[b] = f'local_missing_{area:.0%}'
-                    miss_t[b:b+1] = lm
+                    dtt[b] = f'local_missing_{area:.0%}'; miss_t[b:b+1] = lm
         return dr.to(rgb.dtype), di.to(ir.dtype), dtr, dtt, miss_rgb, miss_t
 
     # ---- Loss ----
@@ -594,49 +534,37 @@ class QualityGatedMiTMamba(BaseSegmentor):
     def loss(self, inputs, data_samples):
         rgb, ir = inputs[:, :3], inputs[:, 3:]
         B = rgb.shape[0]
-        ep = getattr(self, 'current_epoch', 0)
-        self._update_quality_freeze_status(ep)
 
-        # ---- Clean branch ----
         (zc_r, zc_t, zp_r, zp_t, re, te, ff, zf_weighted,
          s_r, s_t, all_s, spr, spt) = self._extract_feat_single(rgb, ir)
 
         losses = {}
         sl = self._stack_batch_gt(data_samples)
         for ds in data_samples:
-            if hasattr(ds, 'gt_sem_seg'):
-                ds.gt_sem_seg.data = ds.gt_sem_seg.data.squeeze(0)
+            if hasattr(ds, 'gt_sem_seg'): ds.gt_sem_seg.data = ds.gt_sem_seg.data.squeeze(0)
 
         # Main decoder (clean)
-        losses.update(add_prefix(
-            self.decode_head.loss(ff, data_samples, self.train_cfg), 'decode'))
+        losses.update(add_prefix(self.decode_head.loss(ff, data_samples, self.train_cfg), 'decode'))
 
-        # Common auxiliary: concatenate zc_r and zc_t along batch, duplicate labels
+        # Common auxiliary
         if self.common_decode_head and zc_r and zc_t:
-            zc_common = []
-            for i in range(len(zc_r)):
-                zc_common.append(torch.cat([zc_r[i], zc_t[i]], dim=0))
+            zc_common = [torch.cat([zc_r[i], zc_t[i]], dim=0) for i in range(len(zc_r))]
             data_samples_x2 = data_samples + [copy.deepcopy(ds) for ds in data_samples]
             losses.update(add_prefix(
-                self.common_decode_head.loss(zc_common, data_samples_x2, self.train_cfg),
-                'common_decode'))
+                self.common_decode_head.loss(zc_common, data_samples_x2, self.train_cfg), 'common_decode'))
 
-        # Private aux heads (clean, raw features)
+        # Private aux heads
         if self.rgb_private_decode_head and re:
             losses.update(add_prefix(
-                self.rgb_private_decode_head.loss(re, data_samples, self.train_cfg),
-                'rgb_private_decode'))
+                self.rgb_private_decode_head.loss(re, data_samples, self.train_cfg), 'rgb_private_decode'))
         if self.t_private_decode_head and te:
             losses.update(add_prefix(
-                self.t_private_decode_head.loss(te, data_samples, self.train_cfg),
-                't_private_decode'))
+                self.t_private_decode_head.loss(te, data_samples, self.train_cfg), 't_private_decode'))
 
-        # Cross-modal contrastive (clean, gated by quality > tau)
+        # Contrastive
         if self.loss_align_weight > 0:
-            gt = sl.squeeze(1).long()
-            lc, cnt = 0., 0
-            pm = self._build_pad_mask(data_samples, inputs.shape[-2],
-                                      inputs.shape[-1], inputs.device)
+            gt = sl.squeeze(1).long(); lc, cnt = 0., 0
+            pm = self._build_pad_mask(data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
             for i in range(len(zc_r)):
                 if zc_r[i] is not None and zc_t[i] is not None:
                     Dr = (s_r[i] > self.tau).float().detach() if s_r[i] is not None else torch.ones(
@@ -650,67 +578,45 @@ class QualityGatedMiTMamba(BaseSegmentor):
                         tau_c=self.contrast_tau, num_samples=self.contrast_num_samples,
                         ignore_label=255, pad_mask=pm)
                     cnt += 1
-            if cnt:
-                losses['loss_align'] = (lc / cnt) * self.loss_align_weight
+            if cnt: losses['loss_align'] = (lc / cnt) * self.loss_align_weight
 
-        # ---- Degradation branch (only after warmup) ----
-        if self.training and not self.force_all_keep:
+        # Degradation branch (always active during training)
+        if self.training:
             (dzcr, dzct, dzpr, dzpt, dre, dte, dff, dzf_weighted,
              ds_r, ds_t, dall_s, dspr, dspt,
              miss_rgb, miss_t) = self._train_with_degradation(rgb, ir)
 
-            # Deg main decoder (full image, no gating)
-            losses.update(add_prefix(
-                self.decode_head.loss(dff, data_samples, self.train_cfg),
-                'deg_decode'))
+            gt_h, gt_w = sl.shape[2], sl.shape[3]
 
-            # Deg common aux: gated by quality score
+            # Deg main decoder
+            losses.update(add_prefix(
+                self.decode_head.loss(dff, data_samples, self.train_cfg), 'deg_decode'))
+
+            # Deg common aux: each head uses its own deepest quality score
             if self.common_decode_head and dzcr and dzct:
-                for modality, feats_d, scores_d, prefix in [
-                    ('rgb', dzcr, ds_r, 'deg_common_rgb_decode'),
-                    ('t',   dzct, ds_t, 'deg_common_t_decode'),
+                for feats_d, scores_d, prefix in [
+                    (dzcr, ds_r, 'deg_common_rgb_decode'),
+                    (dzct, ds_t, 'deg_common_t_decode'),
                 ]:
-                    gate_list = []
-                    for i in range(len(feats_d)):
-                        s_d = scores_d[i] if scores_d[i] is not None else torch.ones(
-                            B, 1, feats_d[i].shape[2], feats_d[i].shape[3], device=feats_d[i].device)
-                        gate = (s_d > self.tau).float().detach()
-                        gate_sq = gate.squeeze(1)
-                        if gate_sq.shape != sl.shape[2:]:
-                            gate_sq = F.interpolate(
-                                gate_sq.unsqueeze(1).float(),
-                                size=sl.shape[2:], mode='nearest').squeeze(1)
-                        gate_list.append(gate_sq)
-                    gate_agg = gate_list[-1]
-                    masked_gt = apply_mask_to_gt(data_samples, gate_agg)
+                    gate_sq = self._make_quality_gate(scores_d[-1], self.tau, gt_h, gt_w)
+                    masked_gt = apply_mask_to_gt(data_samples, gate_sq)
                     ld = self.common_decode_head.loss(feats_d, masked_gt, self.train_cfg)
                     losses.update(add_prefix(
                         {k: v * self.aux_loss_weight for k, v in ld.items()}, prefix))
 
-            # Deg private aux: gated by quality score
+            # Deg private aux
             for head, feats_d, scores_d, prefix in [
                 (self.rgb_private_decode_head, dre, dspr, 'deg_rgb_private_decode'),
                 (self.t_private_decode_head,   dte, dspt, 'deg_t_private_decode'),
             ]:
                 if head and feats_d:
-                    gate_list = []
-                    for i in range(len(feats_d)):
-                        s_d = scores_d[i] if scores_d[i] is not None else torch.ones(
-                            B, 1, feats_d[i].shape[2], feats_d[i].shape[3], device=feats_d[i].device)
-                        gate = (s_d > self.tau).float().detach()
-                        gate_sq = gate.squeeze(1)
-                        if gate_sq.shape != sl.shape[2:]:
-                            gate_sq = F.interpolate(
-                                gate_sq.unsqueeze(1).float(),
-                                size=sl.shape[2:], mode='nearest').squeeze(1)
-                        gate_list.append(gate_sq)
-                    gate_agg = gate_list[-1]
-                    masked_gt = apply_mask_to_gt(data_samples, gate_agg)
+                    gate_sq = self._make_quality_gate(scores_d[-1], self.tau, gt_h, gt_w)
+                    masked_gt = apply_mask_to_gt(data_samples, gate_sq)
                     ld = head.loss(feats_d, masked_gt, self.train_cfg)
                     losses.update(add_prefix(
                         {k: v * self.aux_loss_weight for k, v in ld.items()}, prefix))
 
-            # Contrastive (deg, gated)
+            # Contrastive (deg)
             if self.loss_align_weight > 0 and dzcr is not None and dzct is not None:
                 dlc, dcnt = 0., 0
                 for i in range(len(dzcr)):
@@ -726,10 +632,9 @@ class QualityGatedMiTMamba(BaseSegmentor):
                             tau_c=self.contrast_tau, num_samples=self.contrast_num_samples,
                             ignore_label=255, pad_mask=pm)
                         dcnt += 1
-                if dcnt:
-                    losses['loss_align_deg'] = (dlc / dcnt) * self.loss_align_weight
+                if dcnt: losses['loss_align_deg'] = (dlc / dcnt) * self.loss_align_weight
 
-            # Distillation loss
+            # Distillation
             if self.loss_distill_weight > 0:
                 T = self.distill_temperature
                 cl = self.decode_head.forward(ff).float()
@@ -737,14 +642,12 @@ class QualityGatedMiTMamba(BaseSegmentor):
                 tp = F.softmax(cl.detach() / T, dim=1)
                 sp = F.log_softmax(dl_ / T, dim=1)
                 kl = F.kl_div(sp, tp, reduction='none').sum(dim=1)
-                dm = self._build_pad_mask(data_samples, kl.shape[-2], kl.shape[-1], kl.device)
-                dm_f = dm.float()
-                losses['loss_distill'] = self.loss_distill_weight * (T * T) * (kl * dm_f).sum() / dm_f.sum().clamp(min=1)
+                dm = self._build_pad_mask(data_samples, kl.shape[-2], kl.shape[-1], kl.device).float()
+                losses['loss_distill'] = self.loss_distill_weight * (T * T) * (kl * dm).sum() / dm.sum().clamp(min=1)
 
-            # Invariance loss (on quality-weighted common fusion)
+            # Invariance loss (on zf_weighted)
             if self.loss_invariant_weight > 0:
-                inv_loss = torch.tensor(0.0, device=ff[0].device)
-                cnt = 0
+                inv_loss = torch.tensor(0.0, device=ff[0].device); cnt = 0
                 for i in range(len(zf_weighted)):
                     if (zf_weighted[i] is not None and dzf_weighted is not None
                             and i < len(dzf_weighted) and dzf_weighted[i] is not None):
@@ -773,12 +676,10 @@ class QualityGatedMiTMamba(BaseSegmentor):
                             q_distill = qc * qd * D_gate * pm_i
                             diff = F.smooth_l1_loss(zf_weighted[i], dzf_weighted[i], reduction='none')
                             denom = q_distill.sum() + 1e-6
-                            inv_loss += (q_distill * diff).sum() / denom
-                            cnt += 1
-                if cnt:
-                    losses['loss_inv'] = self.loss_invariant_weight * inv_loss / cnt
+                            inv_loss += (q_distill * diff).sum() / denom; cnt += 1
+                if cnt: losses['loss_inv'] = self.loss_invariant_weight * inv_loss / cnt
 
-            # Missing guidance loss
+            # Missing guidance
             if self.loss_missing_weight > 0:
                 l_miss = compute_missing_loss(
                     ds_r, ds_t, dspr, dspt, miss_rgb, miss_t,
@@ -797,8 +698,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
     def encode_decode(self, inputs, bm):
         rgb, ir = inputs[:, :3], inputs[:, 3:]
         ff = self._extract_feat_single(rgb, ir)[6]
-        if self.with_neck:
-            ff = self.neck(ff)
+        if self.with_neck: ff = self.neck(ff)
         return self.decode_head.predict(ff, bm, self.test_cfg)
 
     def extract_feat(self, inputs):
@@ -810,8 +710,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
         if inputs.shape[1] == 6:
             rgb, t = inputs[:, :3], inputs[:, 3:]
         else:
-            B = inputs.shape[0] // 2
-            rgb, t = inputs[:B], inputs[B:]
+            B = inputs.shape[0] // 2; rgb, t = inputs[:B], inputs[B:]
         with torch.no_grad():
             (zc_r, zc_t, zp_r, zp_t, re, te, ff, zf_weighted,
              s_r, s_t, all_s, spr, spt) = self._extract_feat_single(rgb, t)
@@ -836,7 +735,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
 
         return dict(
             zc_rgb=zc_r, zc_t=zc_t,
-            zc_fused=zf_weighted,
+            zc_fused=[(zc_r[i] + zc_t[i]) / 2.0 for i in range(len(zc_r))],
             zp_rgb=zp_r, zp_t=zp_t,
             rgb_pf=re, t_pf=te,
             final_fused=fused,
@@ -849,7 +748,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
             deg_type_rgb=deg_type_rgb[0] if isinstance(deg_type_rgb, list) else deg_type_rgb,
             deg_type_t=deg_type_t[0] if isinstance(deg_type_t, list) else deg_type_t,
             zc_rgb_deg=zc_r_d, zc_t_deg=zc_t_d,
-            zc_fused_deg=zf_weighted_d,
+            zc_fused_deg=[(zc_r_d[i] + zc_t_d[i]) / 2.0 for i in range(len(zc_r_d))],
             zp_rgb_deg=zp_r_d, zp_t_deg=zp_t_d,
             rgb_pf_deg=re_d, t_pf_deg=te_d,
             final_fused_deg=fused_d,
@@ -860,12 +759,10 @@ class QualityGatedMiTMamba(BaseSegmentor):
         )
 
     def _decode_head_predict_logits(self, feats, head=None):
-        if head is None:
-            head = self.decode_head
+        if head is None: head = self.decode_head
         if hasattr(head, 'pixel_decoder'):
             batch_img_metas = [
-                dict(ori_shape=feats[0].shape[2:],
-                     img_shape=feats[0].shape[2:])
+                dict(ori_shape=feats[0].shape[2:], img_shape=feats[0].shape[2:])
             ] * feats[0].shape[0]
             seg_logits = head.predict(feats, batch_img_metas, self.test_cfg)
         else:
@@ -894,35 +791,26 @@ class QualityGatedMiTMamba(BaseSegmentor):
         data_samples = data.get('data_samples', None)
         results = self._run_forward(data, mode='predict')
 
-        if not hasattr(self, '_val_deg_accum'):
-            self._val_deg_accum = {}
-        if data_samples is None:
-            return results
+        if not hasattr(self, '_val_deg_accum'): self._val_deg_accum = {}
+        if data_samples is None: return results
 
         if not hasattr(self, '_class_names') and data_samples:
             metainfo = data_samples[0].metainfo
-            if 'classes' in metainfo:
-                self._class_names = list(metainfo['classes'])
+            if 'classes' in metainfo: self._class_names = list(metainfo['classes'])
 
         dev = inputs.device
-        rm = self.data_preprocessor.mean[:3].to(dev)
-        rs = self.data_preprocessor.std[:3].to(dev)
-        im = self.data_preprocessor.mean[3:].to(dev)
-        iss = self.data_preprocessor.std[3:].to(dev)
+        rm = self.data_preprocessor.mean[:3].to(dev); rs = self.data_preprocessor.std[:3].to(dev)
+        im = self.data_preprocessor.mean[3:].to(dev); iss = self.data_preprocessor.std[3:].to(dev)
         rgb, ir = inputs[:, :3], inputs[:, 3:]
-        num_classes = self.num_classes
-        ignore_index = 255
+        num_classes = self.num_classes; ignore_index = 255
 
         for deg_name, deg_rgb, deg_ir in [
-            ('rgb_missing',
-             _apply_missing_degradation(rgb, rm, rs), ir),
-            ('thermal_missing',
-             rgb, _apply_missing_degradation(ir, im, iss)),
+            ('rgb_missing', _apply_missing_degradation(rgb, rm, rs), ir),
+            ('thermal_missing', rgb, _apply_missing_degradation(ir, im, iss)),
         ]:
             deg_inputs = torch.cat([deg_rgb, deg_ir], dim=1)
             bm = [ds.metainfo for ds in data_samples]
             seg_logits = self.encode_decode(deg_inputs, bm)
-            B, C, H, W = seg_logits.shape
             preds = seg_logits.argmax(dim=1)
 
             acc = self._val_deg_accum.setdefault(
@@ -932,7 +820,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
                      area_pred=torch.zeros(num_classes, device=dev, dtype=torch.long),
                      area_label=torch.zeros(num_classes, device=dev, dtype=torch.long)))
 
-            for b in range(B):
+            for b in range(seg_logits.shape[0]):
                 pred = preds[b]
                 label = data_samples[b].gt_sem_seg.data.squeeze().to(dev)
                 if pred.shape != label.shape:
@@ -940,11 +828,9 @@ class QualityGatedMiTMamba(BaseSegmentor):
                         pred.unsqueeze(0).unsqueeze(0).float(),
                         size=label.shape, mode='nearest').squeeze()
                 mask = (label != ignore_index)
-                pred_m = pred[mask]
-                label_m = label[mask]
+                pred_m = pred[mask]; label_m = label[mask]
                 for c in range(num_classes):
-                    pc = (pred_m == c)
-                    lc = (label_m == c)
+                    pc = (pred_m == c); lc = (label_m == c)
                     acc['area_intersect'][c] += (pc & lc).sum()
                     acc['area_union'][c] += (pc | lc).sum()
                     acc['area_pred'][c] += pc.sum()
@@ -958,26 +844,20 @@ class QualityGatedMiTMamba(BaseSegmentor):
     def compute_val_deg_metrics(self):
         from mmengine.logging import MMLogger
         logger = MMLogger.get_current_instance()
-        if not hasattr(self, '_val_deg_accum') or not self._val_deg_accum:
-            return
+        if not hasattr(self, '_val_deg_accum') or not self._val_deg_accum: return
         class_names = getattr(self, '_class_names', None)
-        if class_names is None:
-            class_names = [f'class_{i}' for i in range(self.num_classes)]
+        if class_names is None: class_names = [f'class_{i}' for i in range(self.num_classes)]
         for deg_name, acc in self._val_deg_accum.items():
-            iou_per_class = acc['area_intersect'].float() / (
-                acc['area_union'].float() + 1e-10) * 100
+            iou_per_class = acc['area_intersect'].float() / (acc['area_union'].float() + 1e-10) * 100
             valid = acc['area_union'] > 0
             miou = iou_per_class[valid].mean().item() if valid.any() else 0.0
-            acc_per_class = acc['area_intersect'].float() / (
-                acc['area_label'].float() + 1e-10) * 100
+            acc_per_class = acc['area_intersect'].float() / (acc['area_label'].float() + 1e-10) * 100
             macc = acc_per_class[valid].mean().item() if valid.any() else 0.0
-            all_acc = acc['area_intersect'].sum().float() / (
-                acc['area_label'].sum().float() + 1e-10) * 100
+            all_acc = acc['area_intersect'].sum().float() / (acc['area_label'].sum().float() + 1e-10) * 100
             cw = [max(len(str(class_names[i])), 8) for i in range(self.num_classes)]
             header = f'+{"-"*14}+' + '+'.join([f'{"-"*(cw[i]+2)}' for i in range(self.num_classes)]) + f'+{"-"*8}+{"-"*8}+{"-"*8}+'
             sep = '|' + f'{deg_name:^14}|' + '|'.join(
-                [f'{class_names[i]:^{cw[i]+2}}' for i in range(self.num_classes)]
-            ) + f'|{"mIoU":^8}|{"mAcc":^8}|{"aAcc":^8}|'
+                [f'{class_names[i]:^{cw[i]+2}}' for i in range(self.num_classes)]) + f'|{"mIoU":^8}|{"mAcc":^8}|{"aAcc":^8}|'
             vals = '|' + f'{"IoU(%)":^14}|' + '|'.join(
                 [f'{iou_per_class[i].item():^{cw[i]+2}.2f}' if valid[i] else f'{"N/A":^{cw[i]+2}}' for i in range(self.num_classes)]
             ) + f'|{miou:^8.2f}|{macc:^8.2f}|{all_acc:^8.2f}|'
@@ -987,8 +867,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
     def postprocess_result(self, seg_logits, data_samples):
         from mmengine.structures import PixelData
         B, C, H, W = seg_logits.shape
-        if data_samples is None:
-            data_samples = [SegDataSample() for _ in range(B)]
+        if data_samples is None: data_samples = [SegDataSample() for _ in range(B)]
         for i in range(B):
             img_meta = data_samples[i].metainfo
             ps = img_meta.get('padding_size', [0] * 4)
@@ -1007,8 +886,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
 
     def inference(self, inputs, bm):
         assert self.test_cfg.mode in ['slide', 'whole']
-        if self.test_cfg.mode == 'slide':
-            return self.slide_inference(inputs, bm)
+        if self.test_cfg.mode == 'slide': return self.slide_inference(inputs, bm)
         return self.whole_inference(inputs, bm)
 
     def whole_inference(self, inputs, bm):
@@ -1019,18 +897,14 @@ class QualityGatedMiTMamba(BaseSegmentor):
         hc, wc = self.test_cfg.crop_size
         B, _, h_img, w_img = inputs.size()
         oc = self.out_channels
-        hg = max(h_img - hc + hs - 1, 0) // hs + 1
-        wg = max(w_img - wc + ws - 1, 0) // ws + 1
+        hg = max(h_img - hc + hs - 1, 0) // hs + 1; wg = max(w_img - wc + ws - 1, 0) // ws + 1
         preds = inputs.new_zeros((B, oc, h_img, w_img))
         cnt = inputs.new_zeros((B, 1, h_img, w_img))
         for hi in range(hg):
             for wi in range(wg):
-                y1 = hi * hs
-                x1 = wi * ws
-                y2 = min(y1 + hc, h_img)
-                x2 = min(x1 + wc, w_img)
-                y1 = max(y2 - hc, 0)
-                x1 = max(x2 - wc, 0)
+                y1 = hi * hs; x1 = wi * ws
+                y2 = min(y1 + hc, h_img); x2 = min(x1 + wc, w_img)
+                y1 = max(y2 - hc, 0); x1 = max(x2 - wc, 0)
                 crop = inputs[:, :, y1:y2, x1:x2]
                 bm[0]['img_shape'] = crop.shape[2:]
                 csl = self.encode_decode(crop, bm)

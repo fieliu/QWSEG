@@ -1,21 +1,19 @@
-"""Quality-Gated Swin with Mask2Former Decoder (Soft-Only Refactor).
+"""Quality-Gated Swin with Mask2Former Decoder + DualGate Fusion.
 
 Three-branch architecture:
   - Common:  one Swin backbone processing RGB+T concatenated -> zc_rgb, zc_t
   - Private: two Swin branches (RGB, T) -> zp_rgb, zp_t
   - QualityPredictor x 16 (4 stages x 4 predictor sets)
+  - DualGateFusion: channel+spatial gating for final feature fusion
   - Mask2FormerHead main decoder
   - SegformerHead auxiliary decoders
 
 All hard-mask / STE / complementary-fix logic removed.  Continuous quality
-scores are used for attention bias injection and final-feature weighting.
-Auxiliary heads receive raw (unweighted) features.
+scores are used for attention bias injection. DualGateFusion provides
+channel- and spatial-gated residual fusion of private features.
 
-Training curriculum:
-  Warmup (epoch 0 ~ warmup_epochs):  Clean-only. QP frozen, force_all_keep=True,
-        no degradation branch, no distill/invariant/missing loss.
-  Main (warmup_epochs ~ end):        Quality-aware. QP unfrozen,
-        progressive missing degradation, all losses active.
+Smooth startup: QP bias=4.0 (initial score ~0.98), clamp_min=0.1 for first
+5 epochs, degradation curriculum starts from zero.
 """
 
 import copy
@@ -60,8 +58,7 @@ class _QualityWindowMSA(WindowMSA):
     """WindowMSA with an extra quality_bias injection point.
 
     After relative_position_bias is added to attention scores, quality_bias
-    is added before the optional mask.  This allows quality information to
-    influence attention without replacing the SW-MSA window mask.
+    is added before the optional mask.
     """
 
     def forward(self, x, mask=None, quality_bias=None):
@@ -104,7 +101,6 @@ class _QualityWindowMSA(WindowMSA):
 
 
 class _QualityShiftWindowMSA(ShiftWindowMSA):
-    """ShiftWindowMSA that forwards quality_bias to the inner WindowMSA."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -188,11 +184,6 @@ class _QualityShiftWindowMSA(ShiftWindowMSA):
 
 
 class QualitySwinBlock(SwinBlock):
-    """SwinBlock that accepts quality_bias and passes it to the MSA module.
-
-    quality_bias is added to attention scores *after* relative position bias
-    and *before* the SW-MSA window mask, so both can coexist.
-    """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -230,11 +221,6 @@ class QualitySwinBlock(SwinBlock):
 
 
 def _replace_swin_blocks_with_quality(swin_model):
-    """Replace SwinBlocks with QualitySwinBlocks that support quality_bias.
-
-    All pretrained weights (norm, ffn, attn qkv/proj/rpb, drop) are preserved
-    by direct attribute assignment or data copy.
-    """
     for stage in swin_model.stages:
         new_blocks = nn.ModuleList()
         for block in stage.blocks:
@@ -276,18 +262,6 @@ def _replace_swin_blocks_with_quality(swin_model):
 
 def _quality_score_to_swin_bias(s_2d, window_size, shift_size,
                                  tau=0.3, alpha=10.0, is_precomputed_bias=False):
-    """Convert continuous quality score to Swin window attention bias.
-
-    Args:
-        s_2d: [B, 1, H, W] continuous quality score in [0, 1] or precomputed bias map
-        window_size: Swin window size
-        shift_size: shift size for SW-MSA (0 for W-MSA)
-        tau: quality threshold for f_attn (unused if is_precomputed_bias)
-        alpha: max attention bias magnitude (unused if is_precomputed_bias)
-        is_precomputed_bias: if True, s_2d is already f_attn output, skip f_attn
-    Returns:
-        quality_bias: [nW*B, 1, wh*wh, wh*wh] attention bias tensor
-    """
     B, _, H, W = s_2d.shape
     if is_precomputed_bias:
         bias_map = s_2d
@@ -316,18 +290,6 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
                                       predictors_rgb, predictors_t,
                                       clamp_min=0.0,
                                       tau=0.3, alpha=10.0):
-    """Quality-aware forward through the shared Swin backbone (soft-only).
-
-    - QualityPredictor outputs continuous score s ∈ (0,1).
-    - Independent f_attn bias for each modality injected into attention.
-    - Cross-stage cascade: cumulative product (NOT detached, gradient flows).
-    - clamp_min on pooled_prev during early training for stability.
-    - No hard mask, no STE, no complementary fix.
-
-    Returns:
-        outs:    list of feature maps [B_tok, C_i, H_i, W_i]
-        all_s_rgb, all_s_t: per-stage quality scores for each modality
-    """
     window_size = swin_branch.stages[0].blocks[0].attn.window_size
     outs, all_s_rgb, all_s_t = [], [], []
     stages = swin_branch.stages
@@ -353,19 +315,16 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
         if s_t is None:
             s_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
 
-        # Cross-stage cascade (gradient flows, NOT detached)
         s_rgb_adj, cum_rgb = cascade_quality_suppress(
             s_rgb, cum_rgb, H, W, clamp_min=clamp_min)
         s_t_adj, cum_t = cascade_quality_suppress(
             s_t, cum_t, H, W, clamp_min=clamp_min)
-        # Overwrite cum with the adjusted (not detached) values for next stage
         cum_rgb = s_rgb_adj
         cum_t = s_t_adj
 
         all_s_rgb.append(s_rgb_adj)
         all_s_t.append(s_t_adj)
 
-        # Independent f_attn bias per modality
         bias_rgb = f_attn(s_rgb_adj, tau=tau, alpha=alpha)
         bias_t = f_attn(s_t_adj, tau=tau, alpha=alpha)
         bias_combined = torch.cat([bias_rgb, bias_t], dim=0)
@@ -396,14 +355,6 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
 def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
                                  clamp_min=0.0,
                                  tau=0.3, alpha=10.0):
-    """Quality-aware forward through a single Swin branch (soft-only).
-
-    Same as common branch but for a single modality.
-
-    Returns:
-        outs:    list of feature maps [B, C_i, H_i, W_i]
-        all_s:   list of per-stage quality scores
-    """
     window_size = swin_branch.stages[0].blocks[0].attn.window_size
     outs, all_s = [], []
     stages = swin_branch.stages
@@ -426,7 +377,6 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
         if s is None:
             s = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
 
-        # Cross-stage cascade (gradient flows, NOT detached)
         s_adj, cum_s = cascade_quality_suppress(
             s, cum_s, H, W, clamp_min=clamp_min)
         cum_s = s_adj
@@ -452,26 +402,91 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
 
 
 # ===================================================================
-# QualityGatedSwinMask2Former (Soft-Only Refactor)
+# DualGateFusion: channel + spatial gating for final feature fusion
+# ===================================================================
+
+class DualGateFusion(nn.Module):
+    """Channel- and spatial-gated residual fusion module.
+
+    Inputs:
+        zc_r, zc_t: common branch features [B, C, H, W]
+        zp_r, zp_t: private branch features [B, C, H, W]
+        w_r, w_t, w_pr, w_pt: quality weights [B, 1, H, W] (broadcast)
+
+    Output:
+        F_final: fused feature [B, C, H, W]
+    """
+
+    def __init__(self, channels):
+        super().__init__()
+        self.channels = channels
+        mid_ch = max(channels // 4, 64)
+
+        # Channel gate
+        self.ch_gate_conv1 = nn.Conv2d(channels * 3, mid_ch * 2, 1, bias=False)
+        self.ch_gate_conv2 = nn.Conv2d(mid_ch * 2, channels * 2, 1, bias=False)
+
+        # Spatial gate
+        self.sp_gate = nn.Conv2d(channels * 3, 2, 3, padding=1, bias=False)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+
+    def forward(self, zc_r, zc_t, zp_r, zp_t, w_r, w_t, w_pr, w_pt):
+        # Quality pre-weighting
+        Fc_r = zc_r * w_r
+        Fc_t = zc_t * w_t
+        Fp_r = zp_r * w_pr
+        Fp_t = zp_t * w_pt
+
+        # Common baseline: normalised weighted average
+        F_common = (Fc_r + Fc_t) / (w_r + w_t + 1e-8)
+        F_common = F_common.permute(0, 2, 3, 1).contiguous()
+        F_common = F.layer_norm(F_common, [F_common.size(-1)])
+        F_common = F_common.permute(0, 3, 1, 2).contiguous()
+
+        # Gate input
+        gate_input = torch.cat([F_common, Fp_r, Fp_t], dim=1)  # [B, 3C, H, W]
+
+        # Channel gate: global avg pool -> 1x1 convs -> sigmoid -> [B, 2C, 1, 1]
+        ch_feat = F.adaptive_avg_pool2d(gate_input, 1)
+        ch_feat = self.ch_gate_conv1(ch_feat)
+        ch_feat = F.relu(ch_feat)
+        ch_feat = self.ch_gate_conv2(ch_feat)
+        ch_gate = ch_feat.sigmoid()
+        ch_gate_r, ch_gate_t = ch_gate.chunk(2, dim=1)  # each [B, C, 1, 1]
+
+        # Spatial gate: 3x3 conv -> sigmoid -> [B, 2, H, W]
+        sp_gate = self.sp_gate(gate_input).sigmoid()
+        sp_gate_r, sp_gate_t = sp_gate.chunk(2, dim=1)  # each [B, 1, H, W]
+
+        # Gated private enhancement
+        Pr_gated = Fp_r * ch_gate_r * sp_gate_r
+        Pt_gated = Fp_t * ch_gate_t * sp_gate_t
+
+        # Residual fusion
+        F_final = F_common + Pr_gated + Pt_gated
+        F_final = F_final.permute(0, 2, 3, 1).contiguous()
+        F_final = F.layer_norm(F_final, [F_final.size(-1)])
+        F_final = F_final.permute(0, 3, 1, 2).contiguous()
+
+        return F_final
+
+
+# ===================================================================
+# QualityGatedSwinMask2Former
 # ===================================================================
 
 @MODELS.register_module()
 class QualityGatedSwinMask2Former(BaseSegmentor):
-    """Quality-gated Swin with Mask2Former decoder (soft-only).
+    """Quality-gated Swin with Mask2Former decoder and DualGateFusion.
 
-    Three-branch architecture:
-      - Common:  one Swin backbone processing RGB+T concatenated -> zc_rgb, zc_t
-      - Private: two Swin branches (RGB, T) -> zp_rgb, zp_t
-      - QualityPredictor x 16 (4 stages x 4 predictor sets)
-      - Mask2FormerHead main decoder
-      - SegformerHead auxiliary decoders
-
-    Key design choices (soft-only):
-      - Auxiliary heads receive raw (unweighted) features.
-      - Final fusion uses quality-weighted sum + LayerNorm.
-      - Attention bias via independent f_attn per modality.
-      - Cross-stage quality cascade (gradient flows, no detach).
-      - Progressive missing degradation curriculum.
+    Smooth startup via QP bias=4.0 (initial score ~0.98) and clamp_min=0.1
+    during first 5 epochs.  Degradation curriculum starts from zero.
     """
 
     def __init__(self,
@@ -488,7 +503,6 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                  test_cfg: OptConfigType = None,
                  data_preprocessor: OptConfigType = None,
                  pretrained: Optional[str] = None,
-                 warmup_epochs: int = 10,
                  total_epochs: int = 200,
                  loss_align_weight: float = 0.1,
                  contrast_tau: float = 0.07,
@@ -497,7 +511,7 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                  distill_temperature: float = 4.0,
                  aux_loss_weight: float = 0.5,
                  loss_invariant_weight: float = 0.03,
-                 loss_missing_weight: float = 5.0,
+                 loss_missing_weight: float = 0.5,
                  missing_ratio: float = 0.3,
                  global_deg_ratio: float = 0.3,
                  local_deg_ratio: float = 0.4,
@@ -520,14 +534,15 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                              t_private_decode_head, auxiliary_head)
         self.train_cfg, self.test_cfg = train_cfg, test_cfg
 
-        embed_dims = backbone.get('embed_dims', 128)
-        depths = backbone.get('depths', [2, 2, 6, 2])
-        self.embed_dims_list = [embed_dims * (2 ** i) for i in range(len(depths))]
+        embed_dims_list = backbone.get('embed_dims', 128)
+        if not isinstance(embed_dims_list, (list, tuple)):
+            depths = backbone.get('depths', [2, 2, 6, 2])
+            embed_dims_list = [embed_dims_list * (2 ** i) for i in range(len(depths))]
+        self.embed_dims_list = embed_dims_list
 
         self.tau = tau
         self.alpha = alpha
         self._build_predictors()
-        self.warmup_epochs = warmup_epochs
         self.total_epochs = total_epochs
         self.loss_align_weight = loss_align_weight
         self.contrast_tau, self.contrast_num_samples = contrast_tau, contrast_num_samples
@@ -537,13 +552,12 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         self.loss_invariant_weight = loss_invariant_weight
         self.loss_missing_weight = loss_missing_weight
 
-        # Final fusion: 1x1 conv for the last stage
+        # DualGateFusion (shared across stages)
+        self.dual_gate_fusion = DualGateFusion(self.embed_dims_list[-1])
+
+        # Final 1x1 conv projection (last stage only)
         final_dim = self.embed_dims_list[-1]
         self.final_conv = nn.Conv2d(final_dim, final_dim, 1, bias=False)
-        self.final_norm = nn.LayerNorm(final_dim)
-
-        # Quality predictor freeze state
-        self._quality_frozen = False
 
     def _build_predictors(self):
         self.predictors_common_rgb = nn.ModuleList(
@@ -554,8 +568,6 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             [QualityPredictor(ch) for ch in self.embed_dims_list])
         self.predictors_priv_t = nn.ModuleList(
             [QualityPredictor(ch) for ch in self.embed_dims_list])
-
-    # ---- BaseSegmentor overrides ----
 
     def _init_decode_head(self, decode_head):
         self.decode_head = MODELS.build(decode_head)
@@ -584,52 +596,13 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             valid[i, pt:h - pb, pl:w - pr] = True
         return valid
 
-    # ---- Training phase / freeze control ----
-
-    @property
-    def force_all_keep(self):
-        """During warmup, all quality scores are forced to 1 (all features kept)."""
-        ep = getattr(self, 'current_epoch', 0)
-        return ep < self.warmup_epochs
-
-    def _update_quality_freeze_status(self, epoch=None):
-        """Freeze QP during warmup, unfreeze after."""
-        from mmengine.logging import print_log
-        if epoch is not None:
-            should_freeze = epoch < self.warmup_epochs
-        else:
-            should_freeze = self.warmup_epochs > 0
-        if should_freeze and not self._quality_frozen:
-            self._quality_frozen = True
-            for pred_list in [self.predictors_common_rgb, self.predictors_common_t,
-                              self.predictors_priv_rgb, self.predictors_priv_t]:
-                for p in pred_list.parameters():
-                    p.requires_grad = False
-                pred_list.eval()
-            print_log(f'Quality predictors FROZEN (epoch {epoch}, '
-                      f'warmup_epochs={self.warmup_epochs})', logger='current')
-        elif not should_freeze and self._quality_frozen:
-            self._quality_frozen = False
-            for pred_list in [self.predictors_common_rgb, self.predictors_common_t,
-                              self.predictors_priv_rgb, self.predictors_priv_t]:
-                for p in pred_list.parameters():
-                    p.requires_grad = True
-                pred_list.train()
-            print_log(f'Quality predictors UNFROZEN (epoch {epoch})', logger='current')
-
-    def _clamp_min_for_epoch(self, epoch):
-        """Return clamp_min for cross-stage cascade.
-
-        Early epochs after warmup (first 5) use clamp_min=0.1 for stability.
-        Otherwise 0.0 (no clamping).
-        """
+    @staticmethod
+    def _clamp_min_for_epoch(epoch):
         if epoch is None:
             return 0.0
-        if self.warmup_epochs <= epoch < self.warmup_epochs + 5:
+        if epoch < 5:
             return 0.1
         return 0.0
-
-    # ---- Segmentation logits helper ----
 
     def _get_seg_logits(self, features, data_samples=None):
         if data_samples is not None:
@@ -659,67 +632,37 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
     # ---- Core feature extraction ----
 
     def _extract_feat_single(self, rgb, t):
-        """Extract features with quality scores (soft-only).
-
-        Returns:
-            zc_r, zc_t:        common branch features (raw) [list of tensors]
-            zp_r, zp_t:        private branch features (raw)
-            re, te:            aux head inputs (raw average, no quality weighting)
-            ff:                final fused features (quality-weighted sum + LN)
-            zf_weighted:       quality-weighted common fusion (for invariance loss)
-            s_r, s_t:          common branch quality scores
-            spr, spt:          private branch quality scores
-            all_s:             all quality scores (flattened)
-        """
         B = rgb.shape[0]
-        force = self.force_all_keep
         ep = getattr(self, 'current_epoch', 0)
-        clamp_min = self._clamp_min_for_epoch(ep) if not force else 0.0
+        clamp_min = self._clamp_min_for_epoch(ep)
 
-        # Common branch
         zc_outs, s_r, s_t = _forward_swin_common_dual_pruned(
             self.backbone, torch.cat([rgb, t], dim=0), orig_B=B,
             predictors_rgb=self.predictors_common_rgb,
             predictors_t=self.predictors_common_t,
-            clamp_min=clamp_min,
-            tau=self.tau, alpha=self.alpha)
+            clamp_min=clamp_min, tau=self.tau, alpha=self.alpha)
         zc_r = [f[:B] for f in zc_outs]
         zc_t = [f[B:] for f in zc_outs]
 
-        # Private branches
         zp_r, spr = _forward_swin_branch_pruned(
             self.private_branch_rgb, rgb, self.predictors_priv_rgb,
-            clamp_min=clamp_min,
-            tau=self.tau, alpha=self.alpha)
+            clamp_min=clamp_min, tau=self.tau, alpha=self.alpha)
 
         zp_t, spt = _forward_swin_branch_pruned(
             self.private_branch_t, t, self.predictors_priv_t,
-            clamp_min=clamp_min,
-            tau=self.tau, alpha=self.alpha)
-
-        # Force all-ones during warmup
-        if force:
-            s_r = [torch.ones_like(s) for s in s_r]
-            s_t = [torch.ones_like(s) for s in s_t]
-            spr = [torch.ones_like(s) for s in spr]
-            spt = [torch.ones_like(s) for s in spt]
+            clamp_min=clamp_min, tau=self.tau, alpha=self.alpha)
 
         re, te, ff, zf_weighted = [], [], [], []
         for i in range(len(self.embed_dims_list)):
-            zc_ri = zc_r[i]
-            zc_ti = zc_t[i]
-            zp_ri = zp_r[i]
-            zp_ti = zp_t[i]
-            dev = zc_ri.device
-            B1 = B
+            zc_ri = zc_r[i]; zc_ti = zc_t[i]; zp_ri = zp_r[i]; zp_ti = zp_t[i]
+            dev = zc_ri.device; B1 = B
 
-            # Quality weights (not detached)
             w_r = s_r[i] if s_r[i] is not None else torch.ones(B1, 1, zc_ri.shape[2], zc_ri.shape[3], device=dev)
             w_t = s_t[i] if s_t[i] is not None else torch.ones(B1, 1, zc_ti.shape[2], zc_ti.shape[3], device=dev)
             w_pr = spr[i] if spr[i] is not None else torch.ones(B1, 1, zc_ri.shape[2], zc_ri.shape[3], device=dev)
             w_pt = spt[i] if spt[i] is not None else torch.ones(B1, 1, zc_ti.shape[2], zc_ti.shape[3], device=dev)
 
-            # ---- Aux head inputs: raw average (NO quality weighting) ----
+            # Aux head inputs: raw average (NO quality weighting)
             re_i = (zc_ri + zp_ri) / 2.0
             re_i = re_i.permute(0, 2, 3, 1).contiguous()
             re_i = F.layer_norm(re_i, [re_i.size(-1)])
@@ -732,20 +675,20 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             te_i = te_i.permute(0, 3, 1, 2).contiguous()
             te.append(te_i)
 
-            # ---- Quality-weighted common fusion (for invariance loss) ----
+            # Quality-weighted common fusion (for invariance loss)
             zf_w = (w_r * zc_ri + w_t * zc_ti) / (w_r + w_t + 1e-8)
             zf_w = zf_w.permute(0, 2, 3, 1).contiguous()
             zf_w = F.layer_norm(zf_w, [zf_w.size(-1)])
             zf_w = zf_w.permute(0, 3, 1, 2).contiguous()
             zf_weighted.append(zf_w)
 
-            # ---- Final fusion: quality-weighted sum + LayerNorm ----
-            sum_feat = zc_ri * w_r + zc_ti * w_t + zp_ri * w_pr + zp_ti * w_pt
+            # DualGateFusion: weight → DualGate(ch+spatial) → LN
+            ff_i = self.dual_gate_fusion(zc_ri, zc_ti, zp_ri, zp_ti, w_r, w_t, w_pr, w_pt)
             if i == len(self.embed_dims_list) - 1:
-                sum_feat = self.final_conv(sum_feat)
-            ff_i = sum_feat.permute(0, 2, 3, 1).contiguous()
-            ff_i = F.layer_norm(ff_i, [ff_i.size(-1)])
-            ff_i = ff_i.permute(0, 3, 1, 2).contiguous()
+                ff_i = self.final_conv(ff_i)
+                ff_i = ff_i.permute(0, 2, 3, 1).contiguous()
+                ff_i = F.layer_norm(ff_i, [ff_i.size(-1)])
+                ff_i = ff_i.permute(0, 3, 1, 2).contiguous()
             ff.append(ff_i)
 
         all_s = [s for sl in [s_r, s_t, spr, spt] for s in sl]
@@ -754,7 +697,6 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
     # ---- Degradation ----
 
     def _train_with_degradation(self, rgb, ir):
-        """Run feature extraction on degraded inputs, returning features + miss masks."""
         dr, di, _, _, miss_rgb, miss_t = self._generate_degraded_inputs(rgb, ir)
         (zc_r, zc_t, zp_r, zp_t, re, te, ff, zf_weighted,
          s_r, s_t, all_s, spr, spt) = self._extract_feat_single(dr, di)
@@ -762,13 +704,6 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                 s_r, s_t, all_s, spr, spt, miss_rgb, miss_t)
 
     def _generate_degraded_inputs(self, rgb, ir):
-        """Apply progressive missing degradation.
-
-        Returns:
-            dr, di: degraded images
-            dtr, dtt: degradation type strings per sample
-            miss_rgb, miss_t: [B, 1, H, W] binary masks (1 = missing pixel)
-        """
         B, C, H, W = rgb.shape
         dev = rgb.device
         rm = self.data_preprocessor.mean[:3].to(dev)
@@ -808,15 +743,23 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                     miss_t[b:b+1] = lm
         return dr.to(rgb.dtype), di.to(ir.dtype), dtr, dtt, miss_rgb, miss_t
 
+    @staticmethod
+    def _make_quality_gate(score, tau, target_h, target_w):
+        """Convert quality score to binary gate at target resolution."""
+        gate = (score > tau).float().detach()  # [B, 1, H_s, W_s]
+        gate_sq = gate.squeeze(1)  # [B, H_s, W_s]
+        if gate_sq.shape[-2:] != (target_h, target_w):
+            gate_sq = F.interpolate(
+                gate_sq.unsqueeze(1).float(),
+                size=(target_h, target_w), mode='nearest').squeeze(1)
+        return gate_sq
+
     # ---- Loss ----
 
     def loss(self, inputs, data_samples):
         rgb, ir = inputs[:, :3], inputs[:, 3:]
         B = rgb.shape[0]
-        ep = getattr(self, 'current_epoch', 0)
-        self._update_quality_freeze_status(ep)
 
-        # ---- Clean branch ----
         (zc_r, zc_t, zp_r, zp_t, re, te, ff, zf_weighted,
          s_r, s_t, all_s, spr, spt) = self._extract_feat_single(rgb, ir)
 
@@ -830,15 +773,12 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         losses.update(add_prefix(
             self.decode_head.loss(ff, data_samples, self.train_cfg), 'decode'))
 
-        # Common auxiliary: concatenate zc_r and zc_t along batch, duplicate labels
+        # Common auxiliary: concatenate zc_r and zc_t along batch
         if self.common_decode_head and zc_r and zc_t:
             zc_common = []
             for i in range(len(zc_r)):
                 zc_common.append(torch.cat([zc_r[i], zc_t[i]], dim=0))
             data_samples_x2 = data_samples + [copy.deepcopy(ds) for ds in data_samples]
-            for ds2 in data_samples_x2:
-                if hasattr(ds2, 'gt_sem_seg'):
-                    ds2.gt_sem_seg.data = ds2.gt_sem_seg.data
             losses.update(add_prefix(
                 self.common_decode_head.loss(zc_common, data_samples_x2, self.train_cfg),
                 'common_decode'))
@@ -853,10 +793,9 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                 self.t_private_decode_head.loss(te, data_samples, self.train_cfg),
                 't_private_decode'))
 
-        # Cross-modal contrastive (clean, gated by quality > tau)
+        # Cross-modal contrastive (clean)
         if self.loss_align_weight > 0:
-            gt = sl.squeeze(1).long()
-            lc, cnt = 0., 0
+            gt = sl.squeeze(1).long(); lc, cnt = 0., 0
             pm = self._build_pad_mask(data_samples, inputs.shape[-2],
                                       inputs.shape[-1], inputs.device)
             for i in range(len(zc_r)):
@@ -875,64 +814,44 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             if cnt:
                 losses['loss_align'] = (lc / cnt) * self.loss_align_weight
 
-        # ---- Degradation branch (only after warmup) ----
-        if self.training and not self.force_all_keep:
+        # ---- Degradation branch (always active during training) ----
+        if self.training:
             (dzcr, dzct, dzpr, dzpt, dre, dte, dff, dzf_weighted,
              ds_r, ds_t, dall_s, dspr, dspt,
              miss_rgb, miss_t) = self._train_with_degradation(rgb, ir)
 
-            # Deg main decoder (full image, no gating)
+            gt_h, gt_w = sl.shape[2], sl.shape[3]
+
+            # Deg main decoder (full image)
             losses.update(add_prefix(
                 self.decode_head.loss(dff, data_samples, self.train_cfg),
                 'deg_decode'))
 
-            # Deg common aux: gated by quality score
+            # Deg common aux: each head uses its OWN deepest quality score
             if self.common_decode_head and dzcr and dzct:
-                for modality, feats_d, scores_d, prefix in [
-                    ('rgb', dzcr, ds_r, 'deg_common_rgb_decode'),
-                    ('t',   dzct, ds_t, 'deg_common_t_decode'),
+                for feats_d, scores_d, prefix in [
+                    (dzcr, ds_r, 'deg_common_rgb_decode'),
+                    (dzct, ds_t, 'deg_common_t_decode'),
                 ]:
-                    gate_list = []
-                    for i in range(len(feats_d)):
-                        s_d = scores_d[i] if scores_d[i] is not None else torch.ones(
-                            B, 1, feats_d[i].shape[2], feats_d[i].shape[3], device=feats_d[i].device)
-                        gate = (s_d > self.tau).float().detach()
-                        gate_sq = gate.squeeze(1)
-                        if gate_sq.shape != sl.shape[2:]:
-                            gate_sq = F.interpolate(
-                                gate_sq.unsqueeze(1).float(),
-                                size=sl.shape[2:], mode='nearest').squeeze(1)
-                        gate_list.append(gate_sq)
-                    gate_agg = gate_list[-1]
-                    masked_gt = apply_mask_to_gt(data_samples, gate_agg)
+                    gate_sq = self._make_quality_gate(scores_d[-1], self.tau, gt_h, gt_w)
+                    masked_gt = apply_mask_to_gt(data_samples, gate_sq)
                     ld = self.common_decode_head.loss(feats_d, masked_gt, self.train_cfg)
                     losses.update(add_prefix(
                         {k: v * self.aux_loss_weight for k, v in ld.items()}, prefix))
 
-            # Deg private aux: gated by quality score
+            # Deg private aux: each head uses its OWN deepest quality score
             for head, feats_d, scores_d, prefix in [
                 (self.rgb_private_decode_head, dre, dspr, 'deg_rgb_private_decode'),
                 (self.t_private_decode_head,   dte, dspt, 'deg_t_private_decode'),
             ]:
                 if head and feats_d:
-                    gate_list = []
-                    for i in range(len(feats_d)):
-                        s_d = scores_d[i] if scores_d[i] is not None else torch.ones(
-                            B, 1, feats_d[i].shape[2], feats_d[i].shape[3], device=feats_d[i].device)
-                        gate = (s_d > self.tau).float().detach()
-                        gate_sq = gate.squeeze(1)
-                        if gate_sq.shape != sl.shape[2:]:
-                            gate_sq = F.interpolate(
-                                gate_sq.unsqueeze(1).float(),
-                                size=sl.shape[2:], mode='nearest').squeeze(1)
-                        gate_list.append(gate_sq)
-                    gate_agg = gate_list[-1]
-                    masked_gt = apply_mask_to_gt(data_samples, gate_agg)
+                    gate_sq = self._make_quality_gate(scores_d[-1], self.tau, gt_h, gt_w)
+                    masked_gt = apply_mask_to_gt(data_samples, gate_sq)
                     ld = head.loss(feats_d, masked_gt, self.train_cfg)
                     losses.update(add_prefix(
                         {k: v * self.aux_loss_weight for k, v in ld.items()}, prefix))
 
-            # Contrastive (deg, gated)
+            # Contrastive (deg)
             if self.loss_align_weight > 0 and dzcr is not None and dzct is not None:
                 dlc, dcnt = 0., 0
                 for i in range(len(dzcr)):
@@ -951,7 +870,7 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                 if dcnt:
                     losses['loss_align_deg'] = (dlc / dcnt) * self.loss_align_weight
 
-            # Distillation loss
+            # Distillation
             if self.loss_distill_weight > 0:
                 T = self.distill_temperature
                 cl = self._get_seg_logits(ff, data_samples).float()
@@ -961,7 +880,7 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                 kl = F.kl_div(sp, tp, reduction='none').sum(dim=1)
                 losses['loss_distill'] = self.loss_distill_weight * (T * T) * kl.mean()
 
-            # Invariance loss (on quality-weighted common fusion)
+            # Invariance loss (on zf_weighted)
             if self.loss_invariant_weight > 0:
                 inv_loss = torch.tensor(0.0, device=ff[0].device)
                 cnt = 0
@@ -1004,7 +923,6 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                     num_stages=len(self.embed_dims_list))
                 losses['loss_missing'] = self.loss_missing_weight * l_miss
 
-        # Clamp for safety
         for key in list(losses.keys()):
             if not torch.isfinite(losses[key]):
                 losses[key] = torch.tensor(0.0, device=losses[key].device)
@@ -1056,7 +974,7 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
 
         return dict(
             zc_rgb=zc_r, zc_t=zc_t,
-            zc_fused=zf_weighted,
+            zc_fused=[(zc_r[i] + zc_t[i]) / 2.0 for i in range(len(zc_r))],
             zp_rgb=zp_r, zp_t=zp_t,
             rgb_pf=re, t_pf=te,
             final_fused=fused,
@@ -1069,7 +987,7 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             deg_type_rgb=deg_type_rgb[0] if isinstance(deg_type_rgb, list) else deg_type_rgb,
             deg_type_t=deg_type_t[0] if isinstance(deg_type_t, list) else deg_type_t,
             zc_rgb_deg=zc_r_d, zc_t_deg=zc_t_d,
-            zc_fused_deg=zf_weighted_d,
+            zc_fused_deg=[(zc_r_d[i] + zc_t_d[i]) / 2.0 for i in range(len(zc_r_d))],
             zp_rgb_deg=zp_r_d, zp_t_deg=zp_t_d,
             rgb_pf_deg=re_d, t_pf_deg=te_d,
             final_fused_deg=fused_d,
@@ -1245,12 +1163,9 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         cnt = inputs.new_zeros((B, 1, h_img, w_img))
         for hi in range(hg):
             for wi in range(wg):
-                y1 = hi * hs
-                x1 = wi * ws
-                y2 = min(y1 + hc, h_img)
-                x2 = min(x1 + wc, w_img)
-                y1 = max(y2 - hc, 0)
-                x1 = max(x2 - wc, 0)
+                y1 = hi * hs; x1 = wi * ws
+                y2 = min(y1 + hc, h_img); x2 = min(x1 + wc, w_img)
+                y1 = max(y2 - hc, 0); x1 = max(x2 - wc, 0)
                 crop = inputs[:, :, y1:y2, x1:x2]
                 bm[0]['img_shape'] = crop.shape[2:]
                 csl = self.encode_decode(crop, bm)

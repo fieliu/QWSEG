@@ -360,7 +360,8 @@ class QualityGatedMiTMamba(BaseSegmentor):
         self.loss_invariant_weight = loss_invariant_weight
         self.loss_missing_weight = loss_missing_weight
 
-        self.dual_gate_fusion = DualGateFusion(self.embed_dims_list[-1])
+        self.dual_gate_fusions = nn.ModuleList(
+            [DualGateFusion(ch) for ch in self.embed_dims_list])
         final_dim = self.embed_dims_list[-1]
         self.final_conv = nn.Conv2d(final_dim, final_dim, 1, bias=False)
 
@@ -476,7 +477,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
             zf_weighted.append(zf_w)
 
             # DualGateFusion
-            ff_i = self.dual_gate_fusion(zc_ri, zc_ti, zp_ri, zp_ti, w_r, w_t, w_pr, w_pt)
+            ff_i = self.dual_gate_fusions[i](zc_ri, zc_ti, zp_ri, zp_ti, w_r, w_t, w_pr, w_pt)
             if i == len(self.embed_dims_list) - 1:
                 ff_i = self.final_conv(ff_i)
                 ff_i = ff_i.permute(0, 2, 3, 1).contiguous()

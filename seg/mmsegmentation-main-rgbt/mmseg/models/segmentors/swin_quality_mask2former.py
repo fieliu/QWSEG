@@ -552,8 +552,9 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         self.loss_invariant_weight = loss_invariant_weight
         self.loss_missing_weight = loss_missing_weight
 
-        # DualGateFusion (shared across stages)
-        self.dual_gate_fusion = DualGateFusion(self.embed_dims_list[-1])
+        # DualGateFusion (one per stage)
+        self.dual_gate_fusions = nn.ModuleList(
+            [DualGateFusion(ch) for ch in self.embed_dims_list])
 
         # Final 1x1 conv projection (last stage only)
         final_dim = self.embed_dims_list[-1]
@@ -683,7 +684,7 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             zf_weighted.append(zf_w)
 
             # DualGateFusion: weight → DualGate(ch+spatial) → LN
-            ff_i = self.dual_gate_fusion(zc_ri, zc_ti, zp_ri, zp_ti, w_r, w_t, w_pr, w_pt)
+            ff_i = self.dual_gate_fusions[i](zc_ri, zc_ti, zp_ri, zp_ti, w_r, w_t, w_pr, w_pt)
             if i == len(self.embed_dims_list) - 1:
                 ff_i = self.final_conv(ff_i)
                 ff_i = ff_i.permute(0, 2, 3, 1).contiguous()

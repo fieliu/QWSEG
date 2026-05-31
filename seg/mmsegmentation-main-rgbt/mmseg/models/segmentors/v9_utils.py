@@ -1,5 +1,5 @@
-"""Shared utilities for V9 model family: QualityPredictor, Gumbel-Softmax,
-complementary mask fix, quality degradation, contrastive loss."""
+"""Shared utilities for V9 model family: QualityPredictor, CrossAttnFusion,
+quality supervision loss, degradation, contrastive loss."""
 
 import math
 import random
@@ -400,10 +400,10 @@ def _lerp(a, b, t):
 def get_missing_schedule(r):
     """Return degradation schedule for missing-only training.
 
-    Progressive curriculum:
-    - r < 0.01:     no degradation (2-epoch clean-only warmup at 200E)
-    - 0.01 - 0.10:  local missing only, area 5% -> 30%
-    - 0.10+:        local missing 30% -> 60%, global missing 20% -> 60%
+    Progressive curriculum (accelerated for 200E training):
+    - r < 0.02:     no degradation (4-epoch clean-only warmup at 200E)
+    - 0.02 - 0.10:  local missing only, area 15% -> 50%
+    - 0.10+:        local missing 50% -> 70%, global missing 25% -> 70%
 
     Returns:
         dict with keys:
@@ -411,16 +411,16 @@ def get_missing_schedule(r):
             p_global: probability of global missing (entire modality zeroed)
             local_area: area ratio for local missing rectangle
     """
-    if r < 0.01:
+    if r < 0.02:
         return dict(p_local=0.0, p_global=0.0, local_area=0.0)
     elif r < 0.10:
-        t = (r - 0.01) / 0.09
-        local_area = _lerp(0.05, 0.30, t)
+        t = (r - 0.02) / 0.08
+        local_area = _lerp(0.15, 0.50, t)
         return dict(p_local=1.0, p_global=0.0, local_area=local_area)
     else:
         t = min((r - 0.10) / 0.90, 1.0)
-        local_area = _lerp(0.30, 0.60, t)
-        p_global = _lerp(0.20, 0.60, t)
+        local_area = _lerp(0.50, 0.70, t)
+        p_global = _lerp(0.25, 0.70, t)
         p_local = 1.0 - p_global
         return dict(p_local=p_local, p_global=p_global, local_area=local_area)
 
@@ -538,3 +538,221 @@ def compute_cross_modal_contrastive_loss(feat_rgb, feat_t, labels, D_rgb, D_t,
         w = torch.ones(N, device=device) / N
 
     return (loss_per_sample * w).sum()
+
+
+# ---------------------------------------------------------------------------
+# Cross-Attention Fusion (replaces DualGateFusion / DualGateEnhancedFusion)
+# ---------------------------------------------------------------------------
+
+class CrossAttnFusion(nn.Module):
+    """Cross-attention fusion with quality-biased KV.
+
+    Query = F_common (quality-weighted average of common branch features)
+    Key/Value = [zp_rgb, zp_t] concatenated (private branch features)
+    Quality bias is injected into attention scores via f_attn, same mechanism
+    as in the backbone attention.  KV is optionally spatially reduced.
+
+    Args:
+        channels: feature dimension.
+        sr_ratio: spatial reduction ratio for K/V (1 = no reduction).
+    """
+
+    def __init__(self, channels, sr_ratio=1):
+        super().__init__()
+        self.channels = channels
+        self.sr_ratio = sr_ratio
+        self.scale = channels ** -0.5
+
+        self.q_proj = nn.Linear(channels, channels, bias=False)
+        self.k_proj = nn.Linear(channels, channels, bias=False)
+        self.v_proj = nn.Linear(channels, channels, bias=False)
+        self.out_proj = nn.Linear(channels, channels, bias=False)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+
+    def forward(self, F_common, zp_r, zp_t, w_pr, w_pt,
+                tau=0.3, alpha=10.0):
+        B, C, H, W = F_common.shape
+
+        # Query from common fused feature
+        Q = self.q_proj(F_common.flatten(2).transpose(1, 2))  # [B, HW, C]
+
+        # KV spatial reduction
+        if self.sr_ratio > 1:
+            zp_r_kv = F.avg_pool2d(zp_r, self.sr_ratio, self.sr_ratio)
+            zp_t_kv = F.avg_pool2d(zp_t, self.sr_ratio, self.sr_ratio)
+            H_k, W_k = H // self.sr_ratio, W // self.sr_ratio
+        else:
+            zp_r_kv, zp_t_kv = zp_r, zp_t
+            H_k, W_k = H, W
+
+        # KV: treat zp_r and zp_t as two separate token sets, concat along
+        # the sequence dimension -> [B, 2*Hk*Wk, C]
+        zp_r_seq = zp_r_kv.flatten(2).transpose(1, 2)  # [B, Hk*Wk, C]
+        zp_t_seq = zp_t_kv.flatten(2).transpose(1, 2)  # [B, Hk*Wk, C]
+        kv_in = torch.cat([zp_r_seq, zp_t_seq], dim=1)  # [B, 2*Hk*Wk, C]
+        K = self.k_proj(kv_in)
+        V = self.v_proj(kv_in)
+
+        # Quality bias follows KV spatial reduction
+        if self.sr_ratio > 1:
+            w_pr_k = F.adaptive_avg_pool2d(w_pr, (H_k, W_k))
+            w_pt_k = F.adaptive_avg_pool2d(w_pt, (H_k, W_k))
+        else:
+            w_pr_k, w_pt_k = w_pr, w_pt
+
+        bias_r = f_attn(w_pr_k, tau=tau, alpha=alpha)  # [B, 1, Hk, Wk]
+        bias_t = f_attn(w_pt_k, tau=tau, alpha=alpha)
+        bias = torch.cat([bias_r, bias_t], dim=1).flatten(1)  # [B, 2*Hk*Wk]
+
+        # Attention with quality bias on key dimension
+        attn = (Q @ K.transpose(-2, -1)) * self.scale
+        attn = attn + bias.unsqueeze(1)  # [B, HW, 2*Hk*Wk]
+        attn = attn.softmax(dim=-1)
+
+        enhanced = attn @ V  # [B, HW, C]
+        enhanced = self.out_proj(enhanced)
+
+        return enhanced.transpose(1, 2).reshape(B, C, H, W)
+
+
+class BaselineCrossAttnFusion(nn.Module):
+    """Cross-attention fusion without quality bias (for baseline model).
+
+    Same architecture as CrossAttnFusion but without quality bias injection.
+    The baseline uses simple average for F_common and plain cross-attention.
+    """
+
+    def __init__(self, channels, sr_ratio=1):
+        super().__init__()
+        self.channels = channels
+        self.sr_ratio = sr_ratio
+        self.scale = channels ** -0.5
+
+        self.q_proj = nn.Linear(channels, channels, bias=False)
+        self.k_proj = nn.Linear(channels, channels, bias=False)
+        self.v_proj = nn.Linear(channels, channels, bias=False)
+        self.out_proj = nn.Linear(channels, channels, bias=False)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+
+    def forward(self, F_common, zp_r, zp_t):
+        B, C, H, W = F_common.shape
+
+        Q = self.q_proj(F_common.flatten(2).transpose(1, 2))
+
+        if self.sr_ratio > 1:
+            zp_r_kv = F.avg_pool2d(zp_r, self.sr_ratio, self.sr_ratio)
+            zp_t_kv = F.avg_pool2d(zp_t, self.sr_ratio, self.sr_ratio)
+        else:
+            zp_r_kv, zp_t_kv = zp_r, zp_t
+
+        # KV: two private token sets concatenated along the sequence dim
+        zp_r_seq = zp_r_kv.flatten(2).transpose(1, 2)  # [B, Hk*Wk, C]
+        zp_t_seq = zp_t_kv.flatten(2).transpose(1, 2)  # [B, Hk*Wk, C]
+        kv_in = torch.cat([zp_r_seq, zp_t_seq], dim=1)  # [B, 2*Hk*Wk, C]
+        K = self.k_proj(kv_in)
+        V = self.v_proj(kv_in)
+
+        attn = (Q @ K.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+
+        enhanced = attn @ V
+        enhanced = self.out_proj(enhanced)
+
+        return enhanced.transpose(1, 2).reshape(B, C, H, W)
+
+
+# ---------------------------------------------------------------------------
+# Quality Supervision Loss (explicit supervision for QualityPredictor)
+# ---------------------------------------------------------------------------
+
+def compute_quality_supervision_loss(s_clean_list, s_deg_list,
+                                      miss_rgb, miss_t,
+                                      num_stages=4,
+                                      clean_target=0.7, deg_target=0.1,
+                                      rank_margin=0.3):
+    """Explicit quality supervision loss.
+
+    Three sub-losses per stage:
+    1. clean_loss: clean region quality → clean_target (MSE)
+    2. deg_loss:   degraded region quality → deg_target (MSE)
+    3. rank_loss:  same-position clean_quality - deg_quality > rank_margin (hinge)
+
+    Args:
+        s_clean_list: clean-branch quality scores, list of [B, 1, H_i, W_i]
+        s_deg_list:   degraded-branch quality scores, same structure
+        miss_rgb:     [B, 1, H, W] RGB missing mask (1 = missing/degraded)
+        miss_t:       [B, 1, H, W] thermal missing mask
+        num_stages:   number of stages
+        clean_target: target quality for clean regions
+        deg_target:   target quality for degraded regions
+        rank_margin:  minimum clean-deg quality gap at same position
+
+    Returns:
+        scalar loss
+    """
+    device = miss_rgb.device
+    total_loss = torch.tensor(0.0, device=device)
+    count = 0
+
+    for i in range(min(num_stages, len(s_clean_list), len(s_deg_list))):
+        s_c = s_clean_list[i]
+        s_d = s_deg_list[i]
+        if s_c is None or s_d is None:
+            continue
+
+        H_s, W_s = s_d.shape[2], s_d.shape[3]
+
+        # Downsample missing masks to stage resolution (continuous ratio)
+        miss_r_s = F.adaptive_avg_pool2d(miss_rgb.float(), (H_s, W_s))
+        miss_t_s = F.adaptive_avg_pool2d(miss_t.float(), (H_s, W_s))
+        miss_any = torch.max(miss_r_s, miss_t_s)
+
+        # Degraded mask: >50% of the receptive field is degraded
+        deg_mask = (miss_any > 0.5).float()
+        # Clean mask: <10% of the receptive field is degraded
+        clean_mask = (miss_any < 0.1).float()
+
+        # 1) clean_loss: clean region quality → clean_target
+        if clean_mask.sum() > 0:
+            clean_loss = F.mse_loss(
+                s_c * clean_mask,
+                torch.full_like(s_c, clean_target) * clean_mask,
+                reduction='sum') / (clean_mask.sum() + 1e-6)
+            total_loss = total_loss + clean_loss
+            count += 1
+
+        # 2) deg_loss: degraded region quality → deg_target
+        if deg_mask.sum() > 0:
+            deg_loss = F.mse_loss(
+                s_d * deg_mask,
+                torch.full_like(s_d, deg_target) * deg_mask,
+                reduction='sum') / (deg_mask.sum() + 1e-6)
+            total_loss = total_loss + deg_loss
+            count += 1
+
+        # 3) rank_loss: clean_quality - deg_quality > margin at degraded positions
+        if deg_mask.sum() > 0:
+            diff = s_c - s_d
+            rank_loss = (F.relu(rank_margin - diff) * deg_mask).sum() / (deg_mask.sum() + 1e-6)
+            total_loss = total_loss + rank_loss
+            count += 1
+
+    if count > 0:
+        total_loss = total_loss / count
+
+    if not torch.isfinite(total_loss):
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    return total_loss

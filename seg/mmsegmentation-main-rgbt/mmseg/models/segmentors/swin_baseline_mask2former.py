@@ -4,21 +4,8 @@ Three-branch architecture identical to QualityGatedSwinMask2Former but with
 all quality-related components removed.  Serves as the "no quality awareness"
 ablation baseline.
 
-Kept:
-  - Three-branch architecture (common + private RGB + private T)
-  - SwinTransformer backbones (plain forward, no quality bias injection)
-  - DualGateEnhancedFusion (same as quality model)
-  - Mask2FormerHead main decoder + SegformerHead auxiliary decoders
-  - Degradation training pipeline
-  - Cross-modal contrastive loss (all-1 quality gates)
-  - Knowledge distillation loss
-  - Feature invariant loss (all-1 quality gates)
-
-Removed:
-  - QualityPredictor, quality bias injection, retention loss
-  - Training phase control (force_all_keep, phase1/2/3)
-  - Quality-weighted fusion (replaced by simple average + LayerNorm)
-  - Private quality distillation loss
+Uses BaselineCrossAttnFusion (same architecture as CrossAttnFusion but
+without quality bias injection) for fair comparison.
 """
 
 import random
@@ -30,9 +17,10 @@ import torch.nn.functional as F
 
 from mmseg.models.segmentors.base import BaseSegmentor
 from mmseg.models.segmentors.v9_utils import (
-    get_degradation_schedule,
-    sample_level,
-    _apply_degradation,
+    BaselineCrossAttnFusion,
+    get_missing_schedule,
+    _apply_missing_degradation,
+    _apply_local_missing,
     _generate_local_mask,
     compute_cross_modal_contrastive_loss,
 )
@@ -61,53 +49,6 @@ def _forward_swin_plain(backbone, img):
     return outs
 
 
-class DualGateEnhancedFusion(nn.Module):
-    def __init__(self, in_channels_list):
-        super().__init__()
-        self.num_stages = len(in_channels_list)
-        self.ch_gates = nn.ModuleList()
-        self.sp_gates = nn.ModuleList()
-        self.post_norms = nn.ModuleList()
-        self.post_convs = nn.ModuleList()
-        for ch in in_channels_list:
-            self.ch_gates.append(nn.Sequential(
-                nn.Conv2d(ch * 2, ch * 2, 1, bias=False), nn.ReLU(inplace=True),
-                nn.Conv2d(ch * 2, ch * 2, 1, bias=False), nn.Sigmoid()))
-            self.sp_gates.append(nn.Sequential(
-                nn.Conv2d(ch * 2, 2, 3, padding=1, bias=False), nn.Sigmoid()))
-            self.post_norms.append(nn.LayerNorm(ch))
-            self.post_convs.append(nn.Sequential(
-                nn.Conv2d(ch, ch, 1, bias=False), nn.GELU()))
-
-    def forward(self, rgb_enhanced_list, t_enhanced_list, common_fused_list):
-        fused_list = []
-        for i in range(self.num_stages):
-            Fr, Ft, Fg = rgb_enhanced_list[i], t_enhanced_list[i], common_fused_list[i]
-            ref_h, ref_w = Fg.shape[2], Fg.shape[3]
-            if Fr.shape[2:] != (ref_h, ref_w):
-                Fr = F.interpolate(Fr, size=(ref_h, ref_w), mode='bilinear', align_corners=False)
-            if Ft.shape[2:] != (ref_h, ref_w):
-                Ft = F.interpolate(Ft, size=(ref_h, ref_w), mode='bilinear', align_corners=False)
-
-            B, C, H, W = Fr.shape
-            concat = torch.cat([Fr, Ft], dim=1)
-            ch_gate = self.ch_gates[i](concat)
-            ch_r, ch_t = ch_gate.split(C, dim=1)
-            sp_gate = self.sp_gates[i](concat)
-            sp_r, sp_t = sp_gate[:, 0:1], sp_gate[:, 1:2]
-            fused = ch_r * sp_r * Fr + ch_t * sp_t * Ft
-
-            fused_norm = fused.permute(0, 2, 3, 1).contiguous()
-            fused_norm = self.post_norms[i](fused_norm).permute(0, 3, 1, 2).contiguous()
-            out = self.post_convs[i](fused_norm)
-            fused_out = Fg + out
-            fused_out = fused_out.permute(0, 2, 3, 1).contiguous()
-            fused_out = F.layer_norm(fused_out, [fused_out.size(-1)])
-            fused_out = fused_out.permute(0, 3, 1, 2).contiguous()
-            fused_list.append(fused_out)
-        return fused_list
-
-
 @MODELS.register_module()
 class SwinBaselineMask2Former(BaseSegmentor):
     """Swin three-branch baseline without quality awareness.
@@ -116,19 +57,10 @@ class SwinBaselineMask2Former(BaseSegmentor):
       - Common:  one Swin backbone, RGB+T batch-concatenated -> zc_rgb, zc_t
       - Private: two Swin branches (RGB, T) -> zp_rgb, zp_t
       - Common fusion:  (zc_rgb + zc_t) / 2 + LayerNorm
-      - Private enhance: zf + zp + LayerNorm
-      - Final fusion: DualGateEnhancedFusion (same as quality model)
+      - Final fusion: BaselineCrossAttnFusion (same architecture as quality model,
+        but without quality bias)
       - Mask2FormerHead main decoder + SegformerHead auxiliary decoders
-      - Degradation training + contrastive + distillation + invariant losses
-
-    Three-phase training curriculum (same schedule as quality model):
-      Phase 1 (epoch 0 ~ phase1_epochs):   Clean-only warmup,
-            no degradation branch, no distill/invariant loss.
-      Phase 2 (phase1_epochs ~ phase1+phase2): Robustness warmup,
-            mild local+global degradation (no missing),
-            distill + invariant loss activated.
-      Phase 3 (phase1+phase2 ~ end):        Full degradation,
-            missing introduced progressively.
+      - Degradation training + contrastive + distillation losses
     """
 
     def __init__(self,
@@ -151,13 +83,10 @@ class SwinBaselineMask2Former(BaseSegmentor):
                  loss_distill_weight: float = 0.3,
                  distill_temperature: float = 4.0,
                  aux_loss_weight: float = 0.3,
-                 loss_invariant_weight: float = 0.03,
                  missing_ratio: float = 0.3,
                  global_deg_ratio: float = 0.3,
                  local_deg_ratio: float = 0.4,
                  total_epochs: int = 200,
-                 phase1_epochs: int = 15,
-                 phase2_epochs: int = 15,
                  init_cfg: OptMultiConfig = None):
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
         if pretrained is not None:
@@ -176,7 +105,12 @@ class SwinBaselineMask2Former(BaseSegmentor):
         depths = backbone.get('depths', [2, 2, 6, 2])
         self.embed_dims_list = [embed_dims * (2 ** i) for i in range(len(depths))]
 
-        self.final_fusion = DualGateEnhancedFusion(self.embed_dims_list)
+        # BaselineCrossAttnFusion (same architecture, no quality bias)
+        sr_ratios = [8, 4, 1, 1]
+        self.cross_attn_fusions = nn.ModuleList([
+            BaselineCrossAttnFusion(ch, sr_ratio=sr)
+            for ch, sr in zip(self.embed_dims_list, sr_ratios)
+        ])
 
         self.loss_align_weight = loss_align_weight
         self.contrast_tau = contrast_tau
@@ -184,13 +118,10 @@ class SwinBaselineMask2Former(BaseSegmentor):
         self.loss_distill_weight = loss_distill_weight
         self.distill_temperature = distill_temperature
         self.aux_loss_weight = aux_loss_weight
-        self.loss_invariant_weight = loss_invariant_weight
         self.missing_ratio = missing_ratio
         self.global_deg_ratio = global_deg_ratio
         self.local_deg_ratio = local_deg_ratio
         self.total_epochs = total_epochs
-        self.phase1_epochs = phase1_epochs
-        self.phase2_epochs = phase2_epochs
 
     def _init_decode_head(self, decode_head):
         self.decode_head = MODELS.build(decode_head)
@@ -209,11 +140,6 @@ class SwinBaselineMask2Former(BaseSegmentor):
     @property
     def with_neck(self):
         return hasattr(self, 'neck') and self.neck is not None
-
-    def _get_training_phase(self, epoch):
-        if epoch < self.phase1_epochs: return 1
-        elif epoch < self.phase1_epochs + self.phase2_epochs: return 2
-        return 3
 
     @staticmethod
     def _stack_batch_gt(data_samples):
@@ -246,38 +172,46 @@ class SwinBaselineMask2Former(BaseSegmentor):
         zp_r = _forward_swin_plain(self.private_branch_rgb, rgb)
         zp_t = _forward_swin_plain(self.private_branch_t, t)
 
-        zf, re, te = [], [], []
+        zf, re, te, ff = [], [], [], []
         for i in range(len(self.embed_dims_list)):
-            fused = (zc_r[i] + zc_t[i]) / 2.0
-            fused = fused.permute(0, 2, 3, 1).contiguous()
-            fused = F.layer_norm(fused, [fused.size(-1)])
-            fused = fused.permute(0, 3, 1, 2).contiguous()
-            zf.append(fused)
+            F_common = (zc_r[i] + zc_t[i]) / 2.0
+            F_common = F_common.permute(0, 2, 3, 1).contiguous()
+            F_common = F.layer_norm(F_common, [F_common.size(-1)])
+            F_common = F_common.permute(0, 3, 1, 2).contiguous()
+            zf.append(F_common)
 
-            if zf[i].shape[2:] == zp_r[i].shape[2:]:
-                out_r = zf[i] + zp_r[i]
+            if F_common.shape[2:] == zp_r[i].shape[2:]:
+                out_r = F_common + zp_r[i]
             else:
-                zp_r_resized = F.interpolate(zp_r[i], size=zf[i].shape[2:], mode='bilinear', align_corners=False)
-                out_r = zf[i] + zp_r_resized
+                zp_r_resized = F.interpolate(zp_r[i], size=F_common.shape[2:], mode='bilinear', align_corners=False)
+                out_r = F_common + zp_r_resized
             out_r = out_r.permute(0, 2, 3, 1).contiguous()
             out_r = F.layer_norm(out_r, [out_r.size(-1)])
             out_r = out_r.permute(0, 3, 1, 2).contiguous()
             re.append(out_r)
 
-            if zf[i].shape[2:] == zp_t[i].shape[2:]:
-                out_t = zf[i] + zp_t[i]
+            if F_common.shape[2:] == zp_t[i].shape[2:]:
+                out_t = F_common + zp_t[i]
             else:
-                zp_t_resized = F.interpolate(zp_t[i], size=zf[i].shape[2:], mode='bilinear', align_corners=False)
-                out_t = zf[i] + zp_t_resized
+                zp_t_resized = F.interpolate(zp_t[i], size=F_common.shape[2:], mode='bilinear', align_corners=False)
+                out_t = F_common + zp_t_resized
             out_t = out_t.permute(0, 2, 3, 1).contiguous()
             out_t = F.layer_norm(out_t, [out_t.size(-1)])
             out_t = out_t.permute(0, 3, 1, 2).contiguous()
             te.append(out_t)
 
-        ff = self.final_fusion(re, te, zf)
+            # BaselineCrossAttnFusion
+            enhanced = self.cross_attn_fusions[i](F_common, zp_r[i], zp_t[i])
+            ff_i = F_common + enhanced
+            ff_i = ff_i.permute(0, 2, 3, 1).contiguous()
+            ff_i = F.layer_norm(ff_i, [ff_i.size(-1)])
+            ff_i = ff_i.permute(0, 3, 1, 2).contiguous()
+            ff.append(ff_i)
+
         return zc_r, zc_t, zp_r, zp_t, zf, re, te, ff
 
     def _generate_degraded_inputs(self, rgb, ir):
+        """Generate degraded inputs using missing-only degradation (same as quality model)."""
         B, C, H, W = rgb.shape
         dev = rgb.device
         rm = self.data_preprocessor.mean[:3].to(dev)
@@ -286,38 +220,34 @@ class SwinBaselineMask2Former(BaseSegmentor):
         iss = self.data_preprocessor.std[3:].to(dev)
         dr, di = rgb.clone(), ir.clone()
         dtr, dtt = ['none'] * B, ['none'] * B
+        miss_rgb = torch.zeros(B, 1, H, W, device=dev)
+        miss_t = torch.zeros(B, 1, H, W, device=dev)
         ep = getattr(self, 'current_epoch', 0)
-        sched = get_degradation_schedule(min(ep / max(self.total_epochs, 1), 1.0))
+        sched = get_missing_schedule(min(ep / max(self.total_epochs, 1), 1.0))
         for b in range(B):
+            modality = 'rgb' if random.random() < 0.5 else 'thermal'
             r = random.random()
-            if r < sched['p_missing']:
-                if random.random() < 0.5:
-                    dr[b:b + 1] = _apply_degradation(rgb[b:b + 1], 'rgb', rm, rs, deg_type='missing', level=5)
-                    dtr[b] = 'missing'
+            if r < sched['p_global']:
+                if modality == 'rgb':
+                    dr[b:b+1] = _apply_missing_degradation(rgb[b:b+1], rm, rs)
+                    dtr[b] = 'global_missing'; miss_rgb[b:b+1] = 1.0
                 else:
-                    di[b:b + 1] = _apply_degradation(ir[b:b + 1], 'thermal', im, iss, deg_type='missing', level=5)
-                    dtt[b] = 'missing'
-            elif r < sched['p_missing'] + sched['p_global']:
-                lv = sample_level(sched['global_levels'])
-                if random.random() < 0.5:
-                    dr[b:b + 1] = _apply_degradation(rgb[b:b + 1], 'rgb', rm, rs, level=lv)
-                    dtr[b] = 'global'
+                    di[b:b+1] = _apply_missing_degradation(ir[b:b+1], im, iss)
+                    dtt[b] = 'global_missing'; miss_t[b:b+1] = 1.0
+            elif r < sched['p_global'] + sched['p_local']:
+                area = sched['local_area']
+                if area <= 0: continue
+                lm = _generate_local_mask(1, H, W, area, device=dev)
+                if modality == 'rgb':
+                    dr[b:b+1] = _apply_local_missing(rgb[b:b+1], rm, rs, lm)
+                    dtr[b] = f'local_missing_{area:.0%}'; miss_rgb[b:b+1] = lm
                 else:
-                    di[b:b + 1] = _apply_degradation(ir[b:b + 1], 'thermal', im, iss, level=lv)
-                    dtt[b] = 'global'
-            else:
-                lv = sample_level(sched['local_levels'])
-                lm = _generate_local_mask(1, H, W, num_regions=3, device=dev, level=lv)
-                if random.random() < 0.5:
-                    dr[b:b + 1] = _apply_degradation(rgb[b:b + 1], 'rgb', rm, rs, level=lv, is_local=True, local_mask=lm)
-                    dtr[b] = 'local'
-                else:
-                    di[b:b + 1] = _apply_degradation(ir[b:b + 1], 'thermal', im, iss, level=lv, is_local=True, local_mask=lm)
-                    dtt[b] = 'local'
-        return dr.to(rgb.dtype), di.to(ir.dtype), dtr, dtt
+                    di[b:b+1] = _apply_local_missing(ir[b:b+1], im, iss, lm)
+                    dtt[b] = f'local_missing_{area:.0%}'; miss_t[b:b+1] = lm
+        return dr.to(rgb.dtype), di.to(ir.dtype), dtr, dtt, miss_rgb, miss_t
 
     def _train_with_degradation(self, rgb, ir):
-        dr, di, _, _ = self._generate_degraded_inputs(rgb, ir)
+        dr, di, _, _, miss_rgb, miss_t = self._generate_degraded_inputs(rgb, ir)
         return self._extract_feat_single(dr, di)
 
     def _get_seg_logits(self, features, data_samples=None):
@@ -341,8 +271,6 @@ class SwinBaselineMask2Former(BaseSegmentor):
     def loss(self, inputs, data_samples):
         rgb, ir = inputs[:, :3], inputs[:, 3:]
         B = rgb.shape[0]
-        ep = getattr(self, 'current_epoch', 0)
-        ph = self._get_training_phase(ep)
 
         zc_r, zc_t, zp_r, zp_t, zf, re, te, ff = self._extract_feat_single(rgb, ir)
 
@@ -376,7 +304,7 @@ class SwinBaselineMask2Former(BaseSegmentor):
             if cnt:
                 losses['loss_align'] = (lc / cnt) * self.loss_align_weight
 
-        if self.training and ph >= 2:
+        if self.training:
             dzcr, dzct, dzpr, dzpt, dzf, drl, dtl, df = self._train_with_degradation(rgb, ir)
 
             losses.update(add_prefix(self.decode_head.loss(df, data_samples, self.train_cfg), 'deg_decode'))
@@ -410,21 +338,8 @@ class SwinBaselineMask2Former(BaseSegmentor):
                 tp = F.softmax(cl.detach() / T, dim=1)
                 sp = F.log_softmax(dl_ / T, dim=1)
                 kl = F.kl_div(sp, tp, reduction='none').sum(dim=1)
-                losses['loss_distill'] = self.loss_distill_weight * (T * T) * kl.mean()
-
-            if self.loss_invariant_weight > 0:
-                inv_loss = torch.tensor(0.0, device=ff[0].device)
-                cnt = 0
-                for i in range(len(zf)):
-                    if zf[i] is not None and dzf is not None and i < len(dzf) and dzf[i] is not None:
-                        if zf[i].shape == dzf[i].shape:
-                            D_gate = torch.ones(B, 1, zf[i].shape[2], zf[i].shape[3], device=zf[i].device)
-                            diff = F.smooth_l1_loss(zf[i], dzf[i], reduction='none')
-                            denom = D_gate.sum() + 1e-6
-                            inv_loss += (D_gate * diff).sum() / denom
-                            cnt += 1
-                if cnt:
-                    losses['loss_inv'] = self.loss_invariant_weight * inv_loss / cnt
+                dm = self._build_pad_mask(data_samples, kl.shape[-2], kl.shape[-1], kl.device).float()
+                losses['loss_distill'] = self.loss_distill_weight * (T * T) * (kl * dm).sum() / dm.sum().clamp(min=1)
 
         for key in list(losses.keys()):
             if not torch.isfinite(losses[key]):

@@ -1,6 +1,6 @@
-"""Quality-Gated MiT with DualGate Fusion.
+"""Quality-Gated MiT with Cross-Attention Fusion.
 
-Three-branch architecture + DualGateFusion (channel+spatial gating).
+Three-branch architecture + CrossAttnFusion (quality-biased cross-attention).
 Smooth startup via QP bias=4.0 and clamp_min=0.1 for first 5 epochs.
 """
 
@@ -18,6 +18,8 @@ from torch import Tensor
 from mmseg.models.segmentors.base import BaseSegmentor
 from mmseg.models.segmentors.v9_utils import (
     QualityPredictor,
+    CrossAttnFusion,
+    compute_quality_supervision_loss,
     f_attn,
     cascade_quality_suppress,
     downsample_mask,
@@ -247,62 +249,12 @@ def _forward_branch_pruned(backbone, img, predictor_list,
 
 
 # ===================================================================
-# DualGateFusion
-# ===================================================================
-
-class DualGateFusion(nn.Module):
-    """Channel- and spatial-gated residual fusion module."""
-
-    def __init__(self, channels):
-        super().__init__()
-        self.channels = channels
-        mid_ch = max(channels // 4, 64)
-        self.ch_gate_conv1 = nn.Conv2d(channels * 3, mid_ch * 2, 1, bias=False)
-        self.ch_gate_conv2 = nn.Conv2d(mid_ch * 2, channels * 2, 1, bias=False)
-        self.sp_gate = nn.Conv2d(channels * 3, 2, 3, padding=1, bias=False)
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
-
-    def forward(self, zc_r, zc_t, zp_r, zp_t, w_r, w_t, w_pr, w_pt):
-        Fc_r = zc_r * w_r; Fc_t = zc_t * w_t
-        Fp_r = zp_r * w_pr; Fp_t = zp_t * w_pt
-
-        F_common = (Fc_r + Fc_t) / (w_r + w_t + 1e-8)
-        F_common = F_common.permute(0, 2, 3, 1).contiguous()
-        F_common = F.layer_norm(F_common, [F_common.size(-1)])
-        F_common = F_common.permute(0, 3, 1, 2).contiguous()
-
-        gate_input = torch.cat([F_common, Fp_r, Fp_t], dim=1)
-
-        ch_feat = F.adaptive_avg_pool2d(gate_input, 1)
-        ch_feat = self.ch_gate_conv1(ch_feat); ch_feat = F.relu(ch_feat)
-        ch_feat = self.ch_gate_conv2(ch_feat)
-        ch_gate_r, ch_gate_t = ch_feat.sigmoid().chunk(2, dim=1)
-
-        sp_gate_r, sp_gate_t = self.sp_gate(gate_input).sigmoid().chunk(2, dim=1)
-
-        Pr_gated = Fp_r * ch_gate_r * sp_gate_r
-        Pt_gated = Fp_t * ch_gate_t * sp_gate_t
-
-        F_final = F_common + Pr_gated + Pt_gated
-        F_final = F_final.permute(0, 2, 3, 1).contiguous()
-        F_final = F.layer_norm(F_final, [F_final.size(-1)])
-        F_final = F_final.permute(0, 3, 1, 2).contiguous()
-
-        return F_final
-
-
-# ===================================================================
 # QualityGatedMiTMamba
 # ===================================================================
 
 @MODELS.register_module()
 class QualityGatedMiTMamba(BaseSegmentor):
-    """Quality-gated MiT with DualGateFusion and smooth startup."""
+    """Quality-gated MiT with CrossAttnFusion and smooth startup."""
 
     def __init__(self,
                  backbone: ConfigType,
@@ -325,8 +277,8 @@ class QualityGatedMiTMamba(BaseSegmentor):
                  loss_distill_weight: float = 0.3,
                  distill_temperature: float = 4.0,
                  aux_loss_weight: float = 0.5,
-                 loss_invariant_weight: float = 0.03,
                  loss_missing_weight: float = 0.5,
+                 loss_quality_sup_weight: float = 1.0,
                  missing_ratio: float = 0.3,
                  global_deg_ratio: float = 0.3,
                  local_deg_ratio: float = 0.4,
@@ -357,13 +309,15 @@ class QualityGatedMiTMamba(BaseSegmentor):
         self.loss_distill_weight = loss_distill_weight
         self.distill_temperature = distill_temperature
         self.aux_loss_weight = aux_loss_weight
-        self.loss_invariant_weight = loss_invariant_weight
         self.loss_missing_weight = loss_missing_weight
+        self.loss_quality_sup_weight = loss_quality_sup_weight
 
-        self.dual_gate_fusions = nn.ModuleList(
-            [DualGateFusion(ch) for ch in self.embed_dims_list])
-        final_dim = self.embed_dims_list[-1]
-        self.final_conv = nn.Conv2d(final_dim, final_dim, 1, bias=False)
+        # Cross-Attention Fusion (KV spatial reduction per stage)
+        sr_ratios = [8, 4, 1, 1]  # S0,S1: KV reduction; S2,S3: full attention
+        self.cross_attn_fusions = nn.ModuleList([
+            CrossAttnFusion(ch, sr_ratio=sr)
+            for ch, sr in zip(self.embed_dims_list, sr_ratios)
+        ])
 
     def _build_predictors(self):
         self.predictors_common_rgb = nn.ModuleList(
@@ -446,7 +400,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
             self.private_branch_t, t, self.predictors_priv_t,
             clamp_min=clamp_min, tau=self.tau, alpha=self.alpha)
 
-        re, te, ff, zf_weighted = [], [], [], []
+        re, te, ff = [], [], []
         for i in range(len(self.embed_dims_list)):
             zc_ri = zc_r[i]; zc_ti = zc_t[i]; zp_ri = zp_r[i]; zp_ti = zp_t[i]
             dev = zc_ri.device; B1 = B
@@ -456,7 +410,13 @@ class QualityGatedMiTMamba(BaseSegmentor):
             w_pr = spr[i] if spr[i] is not None else torch.ones(B1, 1, zc_ri.shape[2], zc_ri.shape[3], device=dev)
             w_pt = spt[i] if spt[i] is not None else torch.ones(B1, 1, zc_ti.shape[2], zc_ti.shape[3], device=dev)
 
-            # Aux heads: raw average + LN
+            # Common fusion: quality-weighted average
+            F_common = (w_r * zc_ri + w_t * zc_ti) / (w_r + w_t + 1e-8)
+            F_common = F_common.permute(0, 2, 3, 1).contiguous()
+            F_common = F.layer_norm(F_common, [F_common.size(-1)])
+            F_common = F_common.permute(0, 3, 1, 2).contiguous()
+
+            # Aux heads: simple average + LN
             re_i = (zc_ri + zp_ri) / 2.0
             re_i = re_i.permute(0, 2, 3, 1).contiguous()
             re_i = F.layer_norm(re_i, [re_i.size(-1)])
@@ -469,32 +429,28 @@ class QualityGatedMiTMamba(BaseSegmentor):
             te_i = te_i.permute(0, 3, 1, 2).contiguous()
             te.append(te_i)
 
-            # zf_weighted for invariance loss
-            zf_w = (w_r * zc_ri + w_t * zc_ti) / (w_r + w_t + 1e-8)
-            zf_w = zf_w.permute(0, 2, 3, 1).contiguous()
-            zf_w = F.layer_norm(zf_w, [zf_w.size(-1)])
-            zf_w = zf_w.permute(0, 3, 1, 2).contiguous()
-            zf_weighted.append(zf_w)
+            # Cross-Attention Fusion: common Q attends to private K/V
+            enhanced = self.cross_attn_fusions[i](
+                F_common, zp_ri, zp_ti, w_pr, w_pt,
+                tau=self.tau, alpha=self.alpha)
 
-            # DualGateFusion
-            ff_i = self.dual_gate_fusions[i](zc_ri, zc_ti, zp_ri, zp_ti, w_r, w_t, w_pr, w_pt)
-            if i == len(self.embed_dims_list) - 1:
-                ff_i = self.final_conv(ff_i)
-                ff_i = ff_i.permute(0, 2, 3, 1).contiguous()
-                ff_i = F.layer_norm(ff_i, [ff_i.size(-1)])
-                ff_i = ff_i.permute(0, 3, 1, 2).contiguous()
+            # Residual fusion
+            ff_i = F_common + enhanced
+            ff_i = ff_i.permute(0, 2, 3, 1).contiguous()
+            ff_i = F.layer_norm(ff_i, [ff_i.size(-1)])
+            ff_i = ff_i.permute(0, 3, 1, 2).contiguous()
             ff.append(ff_i)
 
         all_s = [s for sl in [s_r, s_t, spr, spt] for s in sl]
-        return zc_r, zc_t, zp_r, zp_t, re, te, ff, zf_weighted, s_r, s_t, all_s, spr, spt
+        return zc_r, zc_t, zp_r, zp_t, re, te, ff, s_r, s_t, all_s, spr, spt
 
     # ---- Degradation ----
 
     def _train_with_degradation(self, rgb, ir):
         dr, di, _, _, miss_rgb, miss_t = self._generate_degraded_inputs(rgb, ir)
-        (zc_r, zc_t, zp_r, zp_t, re, te, ff, zf_weighted,
+        (zc_r, zc_t, zp_r, zp_t, re, te, ff,
          s_r, s_t, all_s, spr, spt) = self._extract_feat_single(dr, di)
-        return (zc_r, zc_t, zp_r, zp_t, re, te, ff, zf_weighted,
+        return (zc_r, zc_t, zp_r, zp_t, re, te, ff,
                 s_r, s_t, all_s, spr, spt, miss_rgb, miss_t)
 
     def _generate_degraded_inputs(self, rgb, ir):
@@ -536,7 +492,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
         rgb, ir = inputs[:, :3], inputs[:, 3:]
         B = rgb.shape[0]
 
-        (zc_r, zc_t, zp_r, zp_t, re, te, ff, zf_weighted,
+        (zc_r, zc_t, zp_r, zp_t, re, te, ff,
          s_r, s_t, all_s, spr, spt) = self._extract_feat_single(rgb, ir)
 
         losses = {}
@@ -583,7 +539,7 @@ class QualityGatedMiTMamba(BaseSegmentor):
 
         # Degradation branch (always active during training)
         if self.training:
-            (dzcr, dzct, dzpr, dzpt, dre, dte, dff, dzf_weighted,
+            (dzcr, dzct, dzpr, dzpt, dre, dte, dff,
              ds_r, ds_t, dall_s, dspr, dspt,
              miss_rgb, miss_t) = self._train_with_degradation(rgb, ir)
 
@@ -646,39 +602,22 @@ class QualityGatedMiTMamba(BaseSegmentor):
                 dm = self._build_pad_mask(data_samples, kl.shape[-2], kl.shape[-1], kl.device).float()
                 losses['loss_distill'] = self.loss_distill_weight * (T * T) * (kl * dm).sum() / dm.sum().clamp(min=1)
 
-            # Invariance loss (on zf_weighted)
-            if self.loss_invariant_weight > 0:
-                inv_loss = torch.tensor(0.0, device=ff[0].device); cnt = 0
-                for i in range(len(zf_weighted)):
-                    if (zf_weighted[i] is not None and dzf_weighted is not None
-                            and i < len(dzf_weighted) and dzf_weighted[i] is not None):
-                        if zf_weighted[i].shape == dzf_weighted[i].shape:
-                            Dc = torch.max(
-                                (s_r[i] > self.tau).float().detach() if s_r[i] is not None else torch.ones(
-                                    B, 1, zf_weighted[i].shape[2], zf_weighted[i].shape[3], device=zf_weighted[i].device),
-                                (s_t[i] > self.tau).float().detach() if s_t[i] is not None else torch.ones(
-                                    B, 1, zf_weighted[i].shape[2], zf_weighted[i].shape[3], device=zf_weighted[i].device))
-                            Dd = torch.max(
-                                (ds_r[i] > self.tau).float().detach() if ds_r is not None and i < len(ds_r) and ds_r[i] is not None else torch.ones(
-                                    B, 1, zf_weighted[i].shape[2], zf_weighted[i].shape[3], device=zf_weighted[i].device),
-                                (ds_t[i] > self.tau).float().detach() if ds_t is not None and i < len(ds_t) and ds_t[i] is not None else torch.ones(
-                                    B, 1, zf_weighted[i].shape[2], zf_weighted[i].shape[3], device=zf_weighted[i].device))
-                            D_gate = Dc * Dd
-                            qc = torch.max(
-                                s_r[i].detach() if s_r[i] is not None else torch.ones_like(D_gate),
-                                s_t[i].detach() if s_t[i] is not None else torch.ones_like(D_gate))
-                            qd = torch.max(
-                                ds_r[i].detach() if ds_r is not None and i < len(ds_r) and ds_r[i] is not None else torch.ones_like(D_gate),
-                                ds_t[i].detach() if ds_t is not None and i < len(ds_t) and ds_t[i] is not None else torch.ones_like(D_gate))
-                            D_gate = F.interpolate(D_gate, size=zf_weighted[i].shape[2:], mode='nearest') if D_gate.shape[2:] != zf_weighted[i].shape[2:] else D_gate
-                            qc = F.interpolate(qc, size=zf_weighted[i].shape[2:], mode='nearest') if qc.shape[2:] != zf_weighted[i].shape[2:] else qc
-                            qd = F.interpolate(qd, size=zf_weighted[i].shape[2:], mode='nearest') if qd.shape[2:] != zf_weighted[i].shape[2:] else qd
-                            pm_i = self._build_pad_mask(data_samples, zf_weighted[i].shape[2], zf_weighted[i].shape[3], zf_weighted[i].device).float().unsqueeze(1)
-                            q_distill = qc * qd * D_gate * pm_i
-                            diff = F.smooth_l1_loss(zf_weighted[i], dzf_weighted[i], reduction='none')
-                            denom = q_distill.sum() + 1e-6
-                            inv_loss += (q_distill * diff).sum() / denom; cnt += 1
-                if cnt: losses['loss_inv'] = self.loss_invariant_weight * inv_loss / cnt
+            # Quality supervision (explicit)
+            if self.loss_quality_sup_weight > 0:
+                l_qs_r = compute_quality_supervision_loss(
+                    s_r, ds_r, miss_rgb, miss_t,
+                    num_stages=len(self.embed_dims_list))
+                l_qs_t = compute_quality_supervision_loss(
+                    s_t, ds_t, miss_rgb, miss_t,
+                    num_stages=len(self.embed_dims_list))
+                l_qs_pr = compute_quality_supervision_loss(
+                    spr, dspr, miss_rgb, miss_t,
+                    num_stages=len(self.embed_dims_list))
+                l_qs_pt = compute_quality_supervision_loss(
+                    spt, dspt, miss_rgb, miss_t,
+                    num_stages=len(self.embed_dims_list))
+                losses['loss_quality_sup'] = self.loss_quality_sup_weight * (
+                    l_qs_r + l_qs_t + l_qs_pr + l_qs_pt) / 4.0
 
             # Missing guidance
             if self.loss_missing_weight > 0:
@@ -713,13 +652,13 @@ class QualityGatedMiTMamba(BaseSegmentor):
         else:
             B = inputs.shape[0] // 2; rgb, t = inputs[:B], inputs[B:]
         with torch.no_grad():
-            (zc_r, zc_t, zp_r, zp_t, re, te, ff, zf_weighted,
+            (zc_r, zc_t, zp_r, zp_t, re, te, ff,
              s_r, s_t, all_s, spr, spt) = self._extract_feat_single(rgb, t)
             fused = self.neck(ff) if self.with_neck else ff
 
             deg_rgb, deg_t, deg_type_rgb, deg_type_t, miss_rgb, miss_t = \
                 self._generate_degraded_inputs(rgb, t)
-            (zc_r_d, zc_t_d, zp_r_d, zp_t_d, re_d, te_d, ff_d, zf_weighted_d,
+            (zc_r_d, zc_t_d, zp_r_d, zp_t_d, re_d, te_d, ff_d,
              ds_r_d, ds_t_d, dall_s_d, dspr_d, dspt_d) = self._extract_feat_single(deg_rgb, deg_t)
             fused_d = self.neck(ff_d) if self.with_neck else ff_d
 
@@ -732,7 +671,6 @@ class QualityGatedMiTMamba(BaseSegmentor):
                 re_d[i] = F.interpolate(re_d[i], size=re[i].shape[-2:], mode='bilinear')
                 te_d[i] = F.interpolate(te_d[i], size=te[i].shape[-2:], mode='bilinear')
                 ff_d[i] = F.interpolate(ff_d[i], size=ff[i].shape[-2:], mode='bilinear')
-                zf_weighted_d[i] = F.interpolate(zf_weighted_d[i], size=zf_weighted[i].shape[-2:], mode='bilinear')
 
         return dict(
             zc_rgb=zc_r, zc_t=zc_t,

@@ -935,6 +935,28 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         if self.with_neck: ff = self.neck(ff)
         return self.decode_head.predict(ff, bm, self.test_cfg)
 
+    def encode_decode_with_missing(self, inputs, bm, mask_rgb=False, mask_t=False):
+        """Encode-decode with one modality forced to missing.
+
+        Missing modality is set to -mean/std (black in [0,1] space then
+        re-normalized), matching the training-time _apply_degradation
+        with deg_type='missing', level=5.
+        """
+        rgb, t = inputs[:, :3], inputs[:, 3:]
+        dev = inputs.device
+        if mask_rgb:
+            mean = self.data_preprocessor.mean[:3].view(1, 3, 1, 1).to(dev)
+            std = self.data_preprocessor.std[:3].view(1, 3, 1, 1).to(dev)
+            rgb = torch.full_like(rgb, 0) - mean / std
+        if mask_t:
+            mean = self.data_preprocessor.mean[3:].view(1, 3, 1, 1).to(dev)
+            std = self.data_preprocessor.std[3:].view(1, 3, 1, 1).to(dev)
+            t = torch.full_like(t, 0) - mean / std
+        ff = self._extract_feat_single(rgb, t)[7]
+        if self.with_neck:
+            ff = self.neck(ff)
+        return self.decode_head.predict(ff, bm, self.test_cfg)
+
     def extract_feat(self, inputs):
         rgb, t = inputs[:,:3], inputs[:,3:]
         ff = self._extract_feat_single(rgb,t)[7]
@@ -1020,6 +1042,13 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         else:
             bm = [dict(ori_shape=inputs.shape[2:],img_shape=inputs.shape[2:],pad_shape=inputs.shape[2:],padding_size=[0,0,0,0])]*inputs.shape[0]
         sl = self.encode_decode(inputs, bm)
+        return self.postprocess_result(sl, data_samples)
+
+    def predict_with_missing(self, inputs, data_samples, mask_rgb=False, mask_t=False):
+        """Predict with one modality forced to missing (all-zero)."""
+        bm = [ds.metainfo for ds in data_samples]
+        sl = self.encode_decode_with_missing(
+            inputs, bm, mask_rgb=mask_rgb, mask_t=mask_t)
         return self.postprocess_result(sl, data_samples)
 
     def postprocess_result(self, seg_logits, data_samples):

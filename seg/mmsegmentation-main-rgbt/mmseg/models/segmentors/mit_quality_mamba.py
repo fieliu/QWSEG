@@ -21,13 +21,14 @@ from mmseg.models.segmentors.v9_utils import (
     f_attn,
     f_fuse,
     f_hard_mask,
-    cascade_quality_suppress,
     downsample_mask,
     get_degradation_schedule,
     sample_level,
     _apply_degradation,
     _generate_local_mask,
     compute_cross_modal_contrastive_loss,
+    compute_quality_anchor_loss,
+    compute_quality_rank_loss,
 )
 from mmseg.registry import MODELS
 from mmseg.structures import SegDataSample
@@ -52,7 +53,14 @@ def nchw_to_nlc(x):
 # ---------------------------------------------------------------------------
 
 class DualGateEnhancedFusion(nn.Module):
-    """Channel + spatial dual-gate fusion for multi-scale features."""
+    """Channel + spatial dual-gate fusion of the PURE private residuals.
+
+    Inputs are zp_rgb·f_fuse(s_priv) / zp_t·f_fuse(s_priv) (quality-modulated,
+    so a missing modality's residual is already driven toward 0) and the common
+    fused feature zf. zf is the single base; the gated private residuals are
+    added on top. zf is no longer triple-counted (it previously leaked in via
+    re=zf+priv and te=zf+priv), which over-weighted the common branch.
+    """
 
     def __init__(self, in_channels_list):
         super().__init__()
@@ -70,25 +78,25 @@ class DualGateEnhancedFusion(nn.Module):
             self.post_norms.append(nn.LayerNorm(ch))
             self.post_convs.append(nn.Sequential(nn.Conv2d(ch, ch, 1, bias=False), nn.GELU()))
 
-    def forward(self, rgb_enhanced_list, t_enhanced_list, common_fused_list):
+    def forward(self, priv_r_list, priv_t_list, common_fused_list):
         fused_list = []
         for i in range(self.num_stages):
-            Fr, Ft, Fg = rgb_enhanced_list[i], t_enhanced_list[i], common_fused_list[i]
+            Pr, Pt, Fg = priv_r_list[i], priv_t_list[i], common_fused_list[i]
             ref_h, ref_w = Fg.shape[2], Fg.shape[3]
-            if Fr.shape[2:] != (ref_h, ref_w):
-                Fr = F.interpolate(Fr, size=(ref_h, ref_w), mode='bilinear', align_corners=False)
-            if Ft.shape[2:] != (ref_h, ref_w):
-                Ft = F.interpolate(Ft, size=(ref_h, ref_w), mode='bilinear', align_corners=False)
-            B, C, H, W = Fr.shape
-            concat = torch.cat([Fr, Ft], dim=1)
+            if Pr.shape[2:] != (ref_h, ref_w):
+                Pr = F.interpolate(Pr, size=(ref_h, ref_w), mode='bilinear', align_corners=False)
+            if Pt.shape[2:] != (ref_h, ref_w):
+                Pt = F.interpolate(Pt, size=(ref_h, ref_w), mode='bilinear', align_corners=False)
+            B, C, H, W = Pr.shape
+            concat = torch.cat([Pr, Pt], dim=1)
             ch_gate = self.ch_gates[i](concat)
             ch_r, ch_t = ch_gate.split(C, dim=1)
             sp_gate = self.sp_gates[i](concat)
             sp_r, sp_t = sp_gate[:, 0:1], sp_gate[:, 1:2]
-            fused = ch_r * sp_r * Fr + ch_t * sp_t * Ft
-            fused_norm = fused.permute(0, 2, 3, 1).contiguous()
-            fused_norm = self.post_norms[i](fused_norm).permute(0, 3, 1, 2).contiguous()
-            out = self.post_convs[i](fused_norm)
+            gated = ch_r * sp_r * Pr + ch_t * sp_t * Pt
+            gated_norm = gated.permute(0, 2, 3, 1).contiguous()
+            gated_norm = self.post_norms[i](gated_norm).permute(0, 3, 1, 2).contiguous()
+            out = self.post_convs[i](gated_norm)
             fused_out = Fg + out
             fused_out = fused_out.permute(0, 2, 3, 1).contiguous()
             fused_out = F.layer_norm(fused_out, [fused_out.size(-1)])
@@ -105,17 +113,14 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
                                  predictors_rgb, predictors_t,
                                  training=True,
                                  force_all_keep=False, phase=3,
-                                 tau=0.3, alpha=10.0, tau_hard=0.2,
-                                 clamp_min=0.0):
+                                 tau=0.3, alpha=10.0, tau_hard=0.2):
     """Quality-aware forward through a single MiT backbone for both modalities.
 
-    Uses continuous quality score with piecewise modulation instead of
-    hard gating. No Gumbel-Softmax, no complementary fix, no cumulative masks.
-    Cross-stage cascading suppression ensures low-quality regions detected
-    in shallow stages are never "recovered" by deeper stages.
+    Uses continuous quality score with piecewise modulation instead of hard
+    gating. Per-stage scores are raw (no cross-stage cascade): each predictor
+    is explicitly supervised, so deeper stages judge quality independently.
     """
     outs, all_s_rgb, all_s_t = [], [], []
-    cum_rgb, cum_t = None, None
 
     for i, layer in enumerate(backbone.layers):
         patch_embed, blocks, norm = layer[0], layer[1], layer[2]
@@ -138,9 +143,8 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
         if s_t is None:
             s_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
 
-        s_rgb, cum_rgb = cascade_quality_suppress(s_rgb, cum_rgb, H, W, clamp_min=clamp_min)
-        s_t, cum_t = cascade_quality_suppress(s_t, cum_t, H, W, clamp_min=clamp_min)
-
+        # Raw per-stage quality scores (no cross-stage cascade): each predictor
+        # is now explicitly supervised, so deeper stages judge independently.
         all_s_rgb.append(s_rgb)
         all_s_t.append(s_t)
 
@@ -226,20 +230,17 @@ def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
 def _forward_branch_pruned(backbone, img, predictor_list,
                             training=True,
                             force_all_keep=False, phase=3,
-                            tau=0.3, alpha=10.0, tau_hard=0.2,
-                            clamp_min=0.0):
+                            tau=0.3, alpha=10.0, tau_hard=0.2):
     """Quality-aware forward through a single-branch MiT backbone.
 
-    Uses continuous quality score with piecewise modulation instead of
-    hard gating. Cross-stage cascading suppression ensures low-quality
-    regions detected in shallow stages are never "recovered" by deeper stages.
+    Uses continuous quality score with piecewise modulation instead of hard
+    gating. Per-stage scores are raw (no cross-stage cascade).
 
     Returns:
         outs:      list of feature maps [B, C_i, H_i, W_i]
         all_s:     list of per-stage quality scores
     """
     outs, all_s = [], []
-    cum_s = None
 
     for i, layer in enumerate(backbone.layers):
         patch_embed, blocks, norm = layer[0], layer[1], layer[2]
@@ -257,8 +258,7 @@ def _forward_branch_pruned(backbone, img, predictor_list,
         if s is None:
             s = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
 
-        s, cum_s = cascade_quality_suppress(s, cum_s, H, W, clamp_min=clamp_min)
-
+        # Raw per-stage score (no cross-stage cascade — explicitly supervised).
         all_s.append(s)
         hard_mask = f_hard_mask(s, tau_hard=tau_hard)
 
@@ -352,9 +352,8 @@ class QualityGatedMiTMamba(BaseSegmentor):
                  test_cfg: OptConfigType = None,
                  data_preprocessor: OptConfigType = None,
                  pretrained: Optional[str] = None,
-                 retention_min: float = 0.4,
-                 retention_max: float = 0.98,
-                 retention_loss_weight: float = 2.0,
+                 loss_quality_weight: float = 0.5,
+                 loss_rank_weight: float = 0.3,
                  phase1_epochs: int = 10,
                  phase2_epochs: int = 20,
                  total_epochs: int = 200,
@@ -401,8 +400,8 @@ class QualityGatedMiTMamba(BaseSegmentor):
         self._build_predictors()
         self.final_fusion = DualGateEnhancedFusion(self.embed_dims_list)
 
-        self.retention_min, self.retention_max = retention_min, retention_max
-        self.retention_loss_weight = retention_loss_weight
+        self.loss_quality_weight = loss_quality_weight
+        self.loss_rank_weight = loss_rank_weight
         self.phase1_epochs, self.phase2_epochs = phase1_epochs, phase2_epochs
         self.total_epochs = total_epochs
         self.phase_mode = phase_mode
@@ -482,21 +481,30 @@ class QualityGatedMiTMamba(BaseSegmentor):
                     for p in m.parameters(): p.requires_grad = True
         return phase
 
-    def _compute_retention_loss(self, all_s):
-        dev = None
-        for s in all_s:
-            if s is not None:
-                dev = s.device
-                break
-        loss = torch.tensor(0., device=dev or 'cpu')
-        cnt = 0
-        for s in all_s:
-            if s is None: continue
-            r = (s > self.tau).float().mean()
-            if r < self.retention_min: loss += (self.retention_min - r)**2
-            elif r > self.retention_max: loss += (r - self.retention_max)**2
-            cnt += 1
-        return loss / max(cnt, 1) if cnt else loss
+    def _quality_anchor_all(self, s_lists, lm_list, pm_full):
+        """Hinge anchors over quality maps. s_lists/lm_list are parallel: each
+        score list is supervised by its modality level map (clean=1, deg=2..5).
+        RGB maps (s_r, spr) use the RGB level map; T maps (s_t, spt) the T map."""
+        total, cnt = 0., 0
+        for s_list, lm in zip(s_lists, lm_list):
+            if lm is None: continue
+            for s in s_list:
+                if s is None: continue
+                total = total + compute_quality_anchor_loss(s, lm, pad_mask=pm_full)
+                cnt += 1
+        return (total / cnt) if cnt else None
+
+    def _quality_rank_all(self, sc_lists, sd_lists, lmc_list, lmd_list, pm_full):
+        """Level-staircase ranking: same token, clean vs degraded forward.
+        Enforces s_clean - s_deg >= 0.2*(L_deg - L_clean) where deg is higher."""
+        total, cnt = 0., 0
+        for sc, sd, lmc, lmd in zip(sc_lists, sd_lists, lmc_list, lmd_list):
+            if lmc is None or lmd is None: continue
+            for a, b in zip(sc, sd):
+                if a is None or b is None: continue
+                total = total + compute_quality_rank_loss(a, b, lmc, lmd, pad_mask=pm_full)
+                cnt += 1
+        return (total / cnt) if cnt else None
 
     def _quality_weighted_common_fusion(self, zc_rgb, zc_t, s_rgb, s_t):
         if s_rgb.shape[2:] != zc_rgb.shape[2:]:
@@ -519,29 +527,24 @@ class QualityGatedMiTMamba(BaseSegmentor):
         epoch = getattr(self, 'current_epoch', 0)
         ph = self._get_training_phase(epoch)
         fa = (ph < 3)
-        phase3_start = self.phase1_epochs + self.phase2_epochs
-        clamp_min = 0.1 if (ph == 3 and epoch < phase3_start + 5) else 0.0
 
         zc_outs, s_r, s_t = _forward_common_dual_pruned(
             self.backbone, torch.cat([rgb, t], dim=0), orig_B=B,
             predictors_rgb=self.predictors_common_rgb,
             predictors_t=self.predictors_common_t,
             training=self.training, force_all_keep=fa, phase=ph,
-            tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard,
-            clamp_min=clamp_min)
+            tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard)
         zc_r = [f[:B] for f in zc_outs]; zc_t = [f[B:] for f in zc_outs]
 
         zp_r, spr = _forward_branch_pruned(
             self.private_branch_rgb, rgb, self.predictors_priv_rgb,
             training=self.training, force_all_keep=fa, phase=ph,
-            tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard,
-            clamp_min=clamp_min)
+            tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard)
 
         zp_t, spt = _forward_branch_pruned(
             self.private_branch_t, t, self.predictors_priv_t,
             training=self.training, force_all_keep=fa, phase=ph,
-            tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard,
-            clamp_min=clamp_min)
+            tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard)
 
         zf, re, te = [], [], []
         for i in range(len(self.embed_dims_list)):
@@ -575,7 +578,16 @@ class QualityGatedMiTMamba(BaseSegmentor):
                 te.append(out)
             else: te.append(zp_t[i])
 
-        ff = self.final_fusion(re, te, zf)
+        # A-scheme final fusion: gate the PURE private residuals (zp · f_fuse(s_priv)),
+        # with zf as the single base. re/te (= zf + private) still feed the private
+        # decode heads, but no longer triple-count zf inside the final fusion.
+        priv_r_list, priv_t_list = [], []
+        for i in range(len(self.embed_dims_list)):
+            spr_i = spr[i] if spr[i] is not None else torch.ones(B,1,zp_r[i].shape[2],zp_r[i].shape[3],device=zp_r[i].device)
+            spt_i = spt[i] if spt[i] is not None else torch.ones(B,1,zp_t[i].shape[2],zp_t[i].shape[3],device=zp_t[i].device)
+            priv_r_list.append(zp_r[i] * f_fuse(spr_i, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta))
+            priv_t_list.append(zp_t[i] * f_fuse(spt_i, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta))
+        ff = self.final_fusion(priv_r_list, priv_t_list, zf)
         all_s = [s for sl in [s_r, s_t, spr, spt] for s in sl]
         return zc_r, zc_t, zp_r, zp_t, zf, re, te, ff, s_r, s_t, all_s, spr, spt
 
@@ -590,6 +602,10 @@ class QualityGatedMiTMamba(BaseSegmentor):
         im = self.data_preprocessor.mean[3:].to(dev); iss = self.data_preprocessor.std[3:].to(dev)
         dr, di = rgb.clone(), ir.clone()
         dtr, dtt = ['none']*B, ['none']*B
+        # Per-pixel degradation-level maps (clean=1, deg=2..5; missing=5). Stashed
+        # on self for the quality/rank losses to read after this forward.
+        lvl_r = torch.ones(B, 1, H, W, device=dev)
+        lvl_t = torch.ones(B, 1, H, W, device=dev)
         ep = getattr(self,'current_epoch',0)
         sched = get_degradation_schedule(min(ep/max(self.total_epochs,1),1.0))
         for b in range(B):
@@ -597,25 +613,26 @@ class QualityGatedMiTMamba(BaseSegmentor):
             if r < sched['p_missing']:
                 if random.random() < 0.5:
                     dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,deg_type='missing',level=5)
-                    dtr[b]='missing'
+                    dtr[b]='missing'; lvl_r[b] = 5.0
                 else:
                     di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,deg_type='missing',level=5)
-                    dtt[b]='missing'
+                    dtt[b]='missing'; lvl_t[b] = 5.0
             elif r < sched['p_missing']+sched['p_global']:
                 lv = sample_level(sched['global_levels'])
                 if random.random() < 0.5:
-                    dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,level=lv); dtr[b]='global'
+                    dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,level=lv); dtr[b]='global'; lvl_r[b] = float(lv)
                 else:
-                    di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,level=lv); dtt[b]='global'
+                    di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,level=lv); dtt[b]='global'; lvl_t[b] = float(lv)
             else:
                 lv = sample_level(sched['local_levels'])
                 lm = _generate_local_mask(1,H,W,num_regions=3,device=dev,level=lv)
                 if random.random() < 0.5:
                     dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,level=lv,is_local=True,local_mask=lm)
-                    dtr[b]='local'
+                    dtr[b]='local'; lvl_r[b] = 1.0 + (float(lv) - 1.0) * lm[0]
                 else:
                     di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,level=lv,is_local=True,local_mask=lm)
-                    dtt[b]='local'
+                    dtt[b]='local'; lvl_t[b] = 1.0 + (float(lv) - 1.0) * lm[0]
+        self._last_level_rgb, self._last_level_t = lvl_r, lvl_t
         return dr, di, dtr, dtt
 
     # ---- loss / predict / inference ----
@@ -650,7 +667,16 @@ class QualityGatedMiTMamba(BaseSegmentor):
                         ignore_label=255, pad_mask=pm)
                     cnt += 1
             if cnt: losses['loss_align'] = (lc/cnt)*self.loss_align_weight
-        if self.retention_loss_weight > 0: losses['loss_retention'] = self.retention_loss_weight*self._compute_retention_loss(all_s)
+        # Quality anchor on the CLEAN forward: every token is clean (level=1),
+        # so push all 16 quality maps up toward >0.8. RGB maps (s_r, spr) and
+        # T maps (s_t, spt) share an all-ones level map here.
+        if self.loss_quality_weight > 0:
+            pm_q = self._build_pad_mask(data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device).float().unsqueeze(1)
+            ones_lm = torch.ones(B, 1, inputs.shape[-2], inputs.shape[-1], device=inputs.device)
+            q_clean = self._quality_anchor_all([s_r, spr, s_t, spt],
+                                               [ones_lm, ones_lm, ones_lm, ones_lm], pm_q)
+            if q_clean is not None:
+                losses['loss_quality'] = self.loss_quality_weight * q_clean
         if self.training:
             (dzcr,dzct,dzpr,dzpt,dzf,drl,dtl,df,ds_r,ds_t,dall_s,dspr,dspt) = self._train_with_degradation(rgb,ir)
             if torch.isnan(df[0]).any():
@@ -660,6 +686,25 @@ class QualityGatedMiTMamba(BaseSegmentor):
                 (dzcr,dzct,dzpr,dzpt,dzf,drl,dtl,df,ds_r,ds_t,dall_s,dspr,dspt) = \
                     zc_r,zc_t,zp_r,zp_t,zf,re,te,ff,s_r,s_t,all_s,spr,spt
             losses.update(add_prefix(self.decode_head.loss(df,data_samples,self.train_cfg),'deg_decode'))
+            # Degraded forward: anchor level-5 tokens down (<0.2), clean tokens up
+            # (>0.8); and rank clean-vs-degraded so each extra level drops quality
+            # by >=0.2. lvl_r/lvl_t are the per-pixel level maps for this deg pass.
+            lvl_r = getattr(self, '_last_level_rgb', None)
+            lvl_t = getattr(self, '_last_level_t', None)
+            if self.loss_quality_weight > 0 and ph >= 3 and lvl_r is not None and lvl_t is not None:
+                pm_q = self._build_pad_mask(data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device).float().unsqueeze(1)
+                q_deg = self._quality_anchor_all([ds_r, dspr, ds_t, dspt],
+                                                 [lvl_r, lvl_r, lvl_t, lvl_t], pm_q)
+                if q_deg is not None:
+                    losses['loss_quality_deg'] = self.loss_quality_weight * q_deg
+                if self.loss_rank_weight > 0:
+                    ones_lm = torch.ones_like(lvl_r)
+                    q_rank = self._quality_rank_all(
+                        [s_r, spr, s_t, spt], [ds_r, dspr, ds_t, dspt],
+                        [ones_lm, ones_lm, ones_lm, ones_lm],
+                        [lvl_r, lvl_r, lvl_t, lvl_t], pm_q)
+                    if q_rank is not None:
+                        losses['loss_rank'] = self.loss_rank_weight * q_rank
             for head, feats, pfx in [
                 (self.common_decode_head, dzf, 'deg_common_decode'),
                 (self.rgb_private_decode_head, drl, 'deg_rgb_private_decode'),

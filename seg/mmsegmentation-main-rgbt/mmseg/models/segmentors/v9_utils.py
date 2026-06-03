@@ -411,3 +411,81 @@ def compute_cross_modal_contrastive_loss(feat_rgb, feat_t, labels, D_rgb, D_t,
         w = torch.ones(N, device=device) / N
 
     return (loss_per_sample * w).sum()
+
+
+# ---------------------------------------------------------------------------
+# Explicit quality-score supervision (anchor + ordinal ranking)
+# ---------------------------------------------------------------------------
+
+def _pool_level_map(level_map, target_h, target_w):
+    """Down-sample a per-pixel degradation-level map to a stage resolution.
+
+    Returns:
+        lvl: [B,1,h,w] max-pooled level (token takes the HIGHEST level it covers)
+        cov: [B,1,h,w] degraded-pixel fraction inside the token (avg-pool of the
+             level>1 binary mask) — used for the local-boundary ignore band.
+    """
+    lm = level_map.float()
+    if lm.shape[2:] != (target_h, target_w):
+        lvl = F.adaptive_max_pool2d(lm, (target_h, target_w))
+        cov = F.adaptive_avg_pool2d((lm > 1.5).float(), (target_h, target_w))
+    else:
+        lvl = lm
+        cov = (lm > 1.5).float()
+    return lvl, cov
+
+
+def _pool_pad(pad_mask, h, w):
+    pm = pad_mask.float()
+    if pm.shape[2:] != (h, w):
+        pm = F.adaptive_max_pool2d(pm, (h, w))
+    return pm
+
+
+def compute_quality_anchor_loss(s, level_map, pad_mask=None,
+                                clean_target=0.8, deg5_target=0.2,
+                                cov_lo=0.1, cov_hi=0.9):
+    """Single-sided hinge anchors on a raw quality map.
+
+    s:          [B,1,h,w] raw quality score (pre-cascade, post-sigmoid).
+    level_map:  [B,1,H,W] per-pixel degradation level (clean=1, deg=2..5).
+    Anchors:
+        clean tokens (level==1): relu(clean_target - s)  → push up, no ceiling.
+        level-5 tokens:          relu(s - deg5_target)    → push down, no floor.
+    Mid levels (2/3/4) get NO anchor — shaped only by the ranking loss.
+    Local-boundary tokens (cov in (cov_lo, cov_hi)) are ignored.
+    """
+    h, w = s.shape[2:]
+    lvl, cov = _pool_level_map(level_map, h, w)
+    clean_mask = (lvl < 1.5).float()
+    deg5_mask = (lvl > 4.5).float()
+    keep = 1.0 - ((cov > cov_lo) & (cov < cov_hi)).float()
+    if pad_mask is not None:
+        keep = keep * _pool_pad(pad_mask, h, w)
+    loss_clean = F.relu(clean_target - s) * clean_mask * keep
+    loss_deg5 = F.relu(s - deg5_target) * deg5_mask * keep
+    denom = (clean_mask * keep).sum() + (deg5_mask * keep).sum() + 1e-6
+    return (loss_clean.sum() + loss_deg5.sum()) / denom
+
+
+def compute_quality_rank_loss(s_clean, s_deg, level_clean, level_deg,
+                              pad_mask=None, step=0.2, cov_lo=0.1, cov_hi=0.9):
+    """Ordinal ranking between the clean and degraded forward passes.
+
+    Where the degraded pass has a higher level than the clean pass, enforce
+        s_clean - s_deg >= step * (L_deg - L_clean)
+    via relu(step*(L_deg-L_clean) - (s_clean - s_deg)). With clean L=1 this is
+    the 0.2-per-level staircase (L2⇒gap≥0.2 … L5⇒gap≥0.8). Unchanged positions
+    contribute nothing; local-boundary tokens on either pass are ignored.
+    """
+    h, w = s_clean.shape[2:]
+    lvl_c, cov_c = _pool_level_map(level_clean, h, w)
+    lvl_d, cov_d = _pool_level_map(level_deg, h, w)
+    margin = step * (lvl_d - lvl_c)
+    keep = (margin > 1e-6).float() * (1.0 - (
+        ((cov_c > cov_lo) & (cov_c < cov_hi)) |
+        ((cov_d > cov_lo) & (cov_d < cov_hi))).float())
+    if pad_mask is not None:
+        keep = keep * _pool_pad(pad_mask, h, w)
+    loss = F.relu(margin - (s_clean - s_deg)) * keep
+    return loss.sum() / (keep.sum() + 1e-6)

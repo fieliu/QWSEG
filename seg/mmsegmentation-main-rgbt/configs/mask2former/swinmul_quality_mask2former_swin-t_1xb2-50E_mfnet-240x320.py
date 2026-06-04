@@ -327,4 +327,7 @@ default_hooks = dict(
     sampler_seed=dict(type='DistSamplerSeedHook'),
     visualization=dict(type='SegVisualizationHook'))
 
-custom_hooks = [dict(type='TrainVisHook', interval=2, num_samples=2, mask_threshold=0.3)]
+custom_hooks = [
+    dict(type='TrainVisHook', interval=2, num_samples=2, mask_threshold=0.3),
+    dict(type='MissingModalityEvalHook', interval=1),
+]

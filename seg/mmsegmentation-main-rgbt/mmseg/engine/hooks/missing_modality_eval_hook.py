@@ -80,16 +80,10 @@ class MissingModalityEvalHook(Hook):
             model = model.module
 
         if not hasattr(model, 'predict_with_missing'):
+            runner.logger.warning(
+                'MissingModalityEvalHook: model has no predict_with_missing, '
+                'skipping')
             return
-
-        # Skip during phase 1/2 (predictors frozen, quality scores all 1)
-        epoch_val = getattr(model, 'current_epoch', epoch)
-        if hasattr(model, '_get_training_phase'):
-            ph = model._get_training_phase(epoch_val)
-            if ph < 3:
-                runner.logger.info(
-                    'MissingModalityEvalHook: skipping (phase < 3)')
-                return
 
         dataloader = runner.val_dataloader
         dataset_meta = getattr(dataloader.dataset, 'metainfo', {})

@@ -22,13 +22,14 @@ from mmseg.models.segmentors.v9_utils import (
     f_attn,
     f_fuse,
     f_hard_mask,
-    cascade_quality_suppress,
     downsample_mask,
     get_degradation_schedule,
     sample_level,
     _apply_degradation,
     _generate_local_mask,
     compute_cross_modal_contrastive_loss,
+    compute_quality_anchor_loss,
+    compute_quality_rank_loss,
 )
 from mmseg.registry import MODELS
 from mmseg.structures import SegDataSample
@@ -303,18 +304,15 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
                                       predictors_rgb, predictors_t,
                                       training=True,
                                       force_all_keep=False, phase=3,
-                                      tau=0.3, alpha=10.0, tau_hard=0.2,
-                                      clamp_min=0.0):
+                                      tau=0.3, alpha=10.0, tau_hard=0.2):
     """Quality-aware forward through a single Swin backbone for both modalities.
 
     Uses continuous quality score with piecewise modulation instead of
-    hard gating. No Gumbel-Softmax, no complementary fix, no cumulative masks.
-    Cross-stage cascading suppression ensures low-quality regions detected
-    in shallow stages are never "recovered" by deeper stages.
+    hard gating. Raw quality scores are used directly (no cascade),
+    relying on explicit anchor+rank supervision for cross-stage consistency.
     """
     window_size = swin_branch.stages[0].blocks[0].attn.window_size
     outs, all_s_rgb, all_s_t = [], [], []
-    cum_rgb, cum_t = None, None
 
     stages = swin_branch.stages
     x, (H, W) = swin_branch.patch_embed(input_rgbt)
@@ -340,9 +338,6 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
             s_rgb = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
         if s_t is None:
             s_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
-
-        s_rgb, cum_rgb = cascade_quality_suppress(s_rgb, cum_rgb, H, W, clamp_min=clamp_min)
-        s_t, cum_t = cascade_quality_suppress(s_t, cum_t, H, W, clamp_min=clamp_min)
 
         all_s_rgb.append(s_rgb)
         all_s_t.append(s_t)
@@ -381,13 +376,12 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
 def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
                                  training=True,
                                  force_all_keep=False, phase=3,
-                                 tau=0.3, alpha=10.0, tau_hard=0.2,
-                                 clamp_min=0.0):
+                                 tau=0.3, alpha=10.0, tau_hard=0.2):
     """Quality-aware forward through a single Swin branch.
 
     Uses continuous quality score with piecewise modulation instead of
-    hard gating. Cross-stage cascading suppression ensures low-quality
-    regions detected in shallow stages are never "recovered" by deeper stages.
+    hard gating. Raw quality scores are used directly (no cascade),
+    relying on explicit anchor+rank supervision for cross-stage consistency.
 
     Returns:
         outs:        list of feature maps [B, C_i, H_i, W_i]
@@ -395,7 +389,6 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
     """
     window_size = swin_branch.stages[0].blocks[0].attn.window_size
     outs, all_s = [], []
-    cum_s = None
 
     stages = swin_branch.stages
     x, (H, W) = swin_branch.patch_embed(img)
@@ -417,8 +410,6 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
 
         if s is None:
             s = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
-
-        s, cum_s = cascade_quality_suppress(s, cum_s, H, W, clamp_min=clamp_min)
 
         all_s.append(s)
         hard_mask = f_hard_mask(s, tau_hard=tau_hard)
@@ -448,6 +439,15 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
 # ---------------------------------------------------------------------------
 
 class DualGateEnhancedFusion(nn.Module):
+    """A-scheme fusion: common fused as sole base, private as pure residual.
+
+    forward(priv_r_list, priv_t_list, common_fused_list) ->
+        fused_out = Fg + DualGate(priv_r, priv_t)
+
+    This avoids triple-counting zf (common fusion + re + te) and
+    double-gating private features.
+    """
+
     def __init__(self, in_channels_list):
         super().__init__()
         self.num_stages = len(in_channels_list)
@@ -465,33 +465,30 @@ class DualGateEnhancedFusion(nn.Module):
             self.post_convs.append(nn.Sequential(
                 nn.Conv2d(ch, ch, 1, bias=False), nn.GELU()))
 
-    def forward(self, rgb_enhanced_list, t_enhanced_list, common_fused_list):
+    def forward(self, priv_r_list, priv_t_list, common_fused_list):
         fused_list = []
         for i in range(self.num_stages):
-            Fr, Ft, Fg = rgb_enhanced_list[i], t_enhanced_list[i], common_fused_list[i]
-            # 空间对齐
+            Pr, Pt, Fg = priv_r_list[i], priv_t_list[i], common_fused_list[i]
+            # 空间对齐到 common fused 的分辨率
             ref_h, ref_w = Fg.shape[2], Fg.shape[3]
-            if Fr.shape[2:] != (ref_h, ref_w):
-                Fr = F.interpolate(Fr, size=(ref_h, ref_w), mode='bilinear', align_corners=False)
-            if Ft.shape[2:] != (ref_h, ref_w):
-                Ft = F.interpolate(Ft, size=(ref_h, ref_w), mode='bilinear', align_corners=False)
+            if Pr.shape[2:] != (ref_h, ref_w):
+                Pr = F.interpolate(Pr, size=(ref_h, ref_w), mode='bilinear', align_corners=False)
+            if Pt.shape[2:] != (ref_h, ref_w):
+                Pt = F.interpolate(Pt, size=(ref_h, ref_w), mode='bilinear', align_corners=False)
 
-            # 双门控融合
-            B, C, H, W = Fr.shape
-            concat = torch.cat([Fr, Ft], dim=1)
+            # 双门控融合纯私有残差
+            B, C, H, W = Pr.shape
+            concat = torch.cat([Pr, Pt], dim=1)
             ch_gate = self.ch_gates[i](concat)
             ch_r, ch_t = ch_gate.split(C, dim=1)
             sp_gate = self.sp_gates[i](concat)
             sp_r, sp_t = sp_gate[:, 0:1], sp_gate[:, 1:2]
-            fused = ch_r * sp_r * Fr + ch_t * sp_t * Ft
+            fused = ch_r * sp_r * Pr + ch_t * sp_t * Pt
 
-            # --- 修正点：Pre-Norm 残差连接 ---
-            # 对 fused 做 LayerNorm
+            # Pre-Norm 残差连接：Fg 为唯一基底，私有残差叠加
             fused_norm = fused.permute(0, 2, 3, 1).contiguous()
             fused_norm = self.post_norms[i](fused_norm).permute(0, 3, 1, 2).contiguous()
-            # 主分支变换
             out = self.post_convs[i](fused_norm)
-            # 残差 = 归一化后的 fused
             fused_out = Fg + out
             fused_out = fused_out.permute(0, 2, 3, 1).contiguous()
             fused_out = F.layer_norm(fused_out, [fused_out.size(-1)])
@@ -530,9 +527,6 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                  test_cfg: OptConfigType = None,
                  data_preprocessor: OptConfigType = None,
                  pretrained: Optional[str] = None,
-                 retention_min: float = 0.4,
-                 retention_max: float = 0.98,
-                 retention_loss_weight: float = 2.0,
                  phase1_epochs: int = 10,
                  phase2_epochs: int = 20,
                  total_epochs: int = 200,
@@ -544,6 +538,8 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                  distill_temperature: float = 4.0,
                  aux_loss_weight: float = 0.3,
                  loss_invariant_weight: float = 0.03,
+                 loss_quality_weight: float = 0.5,
+                 loss_rank_weight: float = 0.3,
                  missing_ratio: float = 0.3,
                  global_deg_ratio: float = 0.3,
                  local_deg_ratio: float = 0.4,
@@ -585,8 +581,6 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         self._build_predictors()
         self.final_fusion = DualGateEnhancedFusion(self.embed_dims_list)
 
-        self.retention_min, self.retention_max = retention_min, retention_max
-        self.retention_loss_weight = retention_loss_weight
         self.phase1_epochs, self.phase2_epochs = phase1_epochs, phase2_epochs
         self.total_epochs = total_epochs
         self.phase_mode = phase_mode
@@ -596,6 +590,8 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         self.distill_temperature = distill_temperature
         self.aux_loss_weight = aux_loss_weight
         self.loss_invariant_weight = loss_invariant_weight
+        self.loss_quality_weight = loss_quality_weight
+        self.loss_rank_weight = loss_rank_weight
         self.missing_ratio, self.global_deg_ratio = missing_ratio, global_deg_ratio
         self.local_deg_ratio = local_deg_ratio
         self.skip_phases = skip_phases
@@ -665,20 +661,46 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                     for p in m.parameters(): p.requires_grad = True
         return phase
 
-    def _compute_retention_loss(self, all_s):
-        dev = None
-        for s in all_s:
-            if s is not None:
-                dev = s.device
-                break
-        loss = torch.tensor(0., device=dev or 'cpu')
+    def _quality_anchor_all(self, s_r, s_t, spr, spt,
+                            level_rgb, level_t, pad_mask):
+        """Anchor loss on all 16 quality maps (4 stages x 4 predictor sets).
+
+        Same-modality common and private predictors share one level map
+        because they see the same input image with the same degradation.
+        mask_rgb -> {s_r, spr}; mask_t -> {s_t, spt}.
+        """
+        loss = torch.tensor(0.0, device=level_rgb.device)
         cnt = 0
-        for s in all_s:
-            if s is None: continue
-            r = (s > self.tau).float().mean()
-            if r < self.retention_min: loss += (self.retention_min - r)**2
-            elif r > self.retention_max: loss += (r - self.retention_max)**2
-            cnt += 1
+        for i in range(len(s_r)):
+            pm = pad_mask
+            for s_list, lvl in [
+                ([s_r[i], spr[i]], level_rgb),
+                ([s_t[i], spt[i]], level_t),
+            ]:
+                for s in s_list:
+                    if s is not None:
+                        loss = loss + compute_quality_anchor_loss(s, lvl, pad_mask=pm)
+                        cnt += 1
+        return loss / max(cnt, 1) if cnt else loss
+
+    def _quality_rank_all(self, s_r, s_t, spr, spt,
+                          ds_r, ds_t, dspr, dspt,
+                          level_rgb_clean, level_t_clean,
+                          level_rgb_deg, level_t_deg,
+                          pad_mask):
+        """Rank loss: clean vs degraded, all 16 quality maps."""
+        loss = torch.tensor(0.0, device=level_rgb_clean.device)
+        cnt = 0
+        for i in range(len(s_r)):
+            for s_clean_list, s_deg_list, lvl_c_rgb, lvl_d_rgb in [
+                ([s_r[i], spr[i]], [ds_r[i], dspr[i]], level_rgb_clean, level_rgb_deg),
+                ([s_t[i], spt[i]], [ds_t[i], dspt[i]], level_t_clean, level_t_deg),
+            ]:
+                for s_c, s_d in zip(s_clean_list, s_deg_list):
+                    if s_c is not None and s_d is not None:
+                        loss = loss + compute_quality_rank_loss(
+                            s_c, s_d, lvl_c_rgb, lvl_d_rgb, pad_mask=pad_mask)
+                        cnt += 1
         return loss / max(cnt, 1) if cnt else loss
 
     def _quality_weighted_common_fusion(self, zc_rgb, zc_t, s_rgb, s_t):
@@ -720,29 +742,24 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         epoch = getattr(self, 'current_epoch', 0)
         ph = self._get_training_phase(epoch)
         fa = (ph < 3)
-        phase3_start = self.phase1_epochs + self.phase2_epochs
-        clamp_min = 0.1 if (ph == 3 and epoch < phase3_start + 5) else 0.0
 
         zc_outs, s_r, s_t = _forward_swin_common_dual_pruned(
             self.backbone, torch.cat([rgb, t], dim=0), orig_B=B,
             predictors_rgb=self.predictors_common_rgb,
             predictors_t=self.predictors_common_t,
             training=self.training, force_all_keep=fa, phase=ph,
-            tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard,
-            clamp_min=clamp_min)
+            tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard)
         zc_r = [f[:B] for f in zc_outs]; zc_t = [f[B:] for f in zc_outs]
 
         zp_r, spr = _forward_swin_branch_pruned(
             self.private_branch_rgb, rgb, self.predictors_priv_rgb,
             training=self.training, force_all_keep=fa, phase=ph,
-            tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard,
-            clamp_min=clamp_min)
+            tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard)
 
         zp_t, spt = _forward_swin_branch_pruned(
             self.private_branch_t, t, self.predictors_priv_t,
             training=self.training, force_all_keep=fa, phase=ph,
-            tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard,
-            clamp_min=clamp_min)
+            tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard)
 
         zf, re, te = [], [], []
         for i in range(len(self.embed_dims_list)):
@@ -754,6 +771,7 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             zf_i = zf_i.permute(0,3,1,2).contiguous()
             zf.append(zf_i)
 
+            # re/te: zf + quality-weighted private (for auxiliary decode heads)
             if zf[i].shape[2:]==zp_r[i].shape[2:]:
                 spr_i = spr[i] if spr[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device)
                 w_priv = f_fuse(spr_i, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
@@ -776,7 +794,18 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                 te.append(out)
             else: te.append(zp_t[i])
 
-        ff = self.final_fusion(re, te, zf)
+        # A-scheme: final fusion uses pure private residual, not re/te
+        priv_r = []
+        priv_t = []
+        for i in range(len(self.embed_dims_list)):
+            spr_i = spr[i] if spr[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device)
+            spt_i = spt[i] if spt[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device)
+            w_r = f_fuse(spr_i, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
+            w_t = f_fuse(spt_i, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
+            priv_r.append(zp_r[i] * w_r)
+            priv_t.append(zp_t[i] * w_t)
+
+        ff = self.final_fusion(priv_r, priv_t, zf)
         all_s = [s for sl in [s_r, s_t, spr, spt] for s in sl]
         return zc_r, zc_t, zp_r, zp_t, zf, re, te, ff, s_r, s_t, all_s, spr, spt
 
@@ -791,6 +820,9 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         im = self.data_preprocessor.mean[3:].to(dev); iss = self.data_preprocessor.std[3:].to(dev)
         dr, di = rgb.clone(), ir.clone()
         dtr, dtt = ['none']*B, ['none']*B
+        # level map: [B,1,H,W], clean=1, missing/global=L, local=1+(L-1)*lm
+        level_rgb = torch.ones(B, 1, H, W, device=dev, dtype=rgb.dtype)
+        level_t = torch.ones(B, 1, H, W, device=dev, dtype=ir.dtype)
         ep = getattr(self,'current_epoch',0)
         sched = get_degradation_schedule(min(ep/max(self.total_epochs,1),1.0))
         for b in range(B):
@@ -799,24 +831,33 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                 if random.random() < 0.5:
                     dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,deg_type='missing',level=5)
                     dtr[b]='missing'
+                    level_rgb[b:b+1] = 5
                 else:
                     di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,deg_type='missing',level=5)
                     dtt[b]='missing'
+                    level_t[b:b+1] = 5
             elif r < sched['p_missing']+sched['p_global']:
                 lv = sample_level(sched['global_levels'])
                 if random.random() < 0.5:
                     dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,level=lv); dtr[b]='global'
+                    level_rgb[b:b+1] = lv
                 else:
                     di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,level=lv); dtt[b]='global'
+                    level_t[b:b+1] = lv
             else:
                 lv = sample_level(sched['local_levels'])
                 lm = _generate_local_mask(1,H,W,num_regions=3,device=dev,level=lv)
                 if random.random() < 0.5:
                     dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,level=lv,is_local=True,local_mask=lm)
                     dtr[b]='local'
+                    level_rgb[b:b+1] = 1 + (lv - 1) * lm
                 else:
                     di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,level=lv,is_local=True,local_mask=lm)
                     dtt[b]='local'
+                    level_t[b:b+1] = 1 + (lv - 1) * lm
+        # 存到 self 供 loss() 读取，不改返回签名避免破坏外部调用方
+        self._last_level_rgb = level_rgb
+        self._last_level_t = level_t
         return dr.to(rgb.dtype), di.to(ir.dtype), dtr, dtt
 
     # ---- loss / predict / inference ----
@@ -851,7 +892,18 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                         ignore_label=255, pad_mask=pm)
                     cnt += 1
             if cnt: losses['loss_align'] = (lc/cnt)*self.loss_align_weight
-        if self.retention_loss_weight > 0: losses['loss_retention'] = self.retention_loss_weight*self._compute_retention_loss(all_s)
+
+        # Quality anchor loss on clean forward (all 16 maps, level=1 → push > 0.8)
+        if self.loss_quality_weight > 0:
+            pm = self._build_pad_mask(data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
+            level_clean_rgb = torch.ones(B, 1, inputs.shape[-2], inputs.shape[-1],
+                                         device=inputs.device, dtype=inputs.dtype)
+            level_clean_t = torch.ones(B, 1, inputs.shape[-2], inputs.shape[-1],
+                                       device=inputs.device, dtype=inputs.dtype)
+            losses['loss_quality'] = self.loss_quality_weight * self._quality_anchor_all(
+                s_r, s_t, spr, spt, level_clean_rgb, level_clean_t,
+                pad_mask=pm.float().unsqueeze(1) if pm.ndim == 3 else pm.float())
+
         if self.training:
             (dzcr,dzct,dzpr,dzpt,dzf,drl,dtl,df,ds_r,ds_t,dall_s,dspr,dspt) = self._train_with_degradation(rgb,ir)
             if torch.isnan(df[0]).any():
@@ -920,6 +972,28 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                             cnt += 1
                 if cnt:
                     losses['loss_inv'] = self.loss_invariant_weight * inv_loss / cnt
+
+            # Quality anchor loss on degraded forward (level-5 → push < 0.2)
+            if self.loss_quality_weight > 0 and hasattr(self, '_last_level_rgb'):
+                dpm = self._build_pad_mask(data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
+                losses['loss_quality_deg'] = self.loss_quality_weight * self._quality_anchor_all(
+                    ds_r, ds_t, dspr, dspt,
+                    self._last_level_rgb, self._last_level_t,
+                    pad_mask=dpm.float().unsqueeze(1) if dpm.ndim == 3 else dpm.float())
+
+            # Quality rank loss (clean vs degraded, all 16 maps)
+            if self.loss_rank_weight > 0 and hasattr(self, '_last_level_rgb'):
+                rpm = self._build_pad_mask(data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
+                level_clean_rgb = torch.ones(B, 1, inputs.shape[-2], inputs.shape[-1],
+                                             device=inputs.device, dtype=inputs.dtype)
+                level_clean_t = torch.ones(B, 1, inputs.shape[-2], inputs.shape[-1],
+                                           device=inputs.device, dtype=inputs.dtype)
+                losses['loss_rank'] = self.loss_rank_weight * self._quality_rank_all(
+                    s_r, s_t, spr, spt,
+                    ds_r, ds_t, dspr, dspt,
+                    level_clean_rgb, level_clean_t,
+                    self._last_level_rgb, self._last_level_t,
+                    pad_mask=rpm.float().unsqueeze(1) if rpm.ndim == 3 else rpm.float())
 
             pass
         for key in list(losses.keys()):

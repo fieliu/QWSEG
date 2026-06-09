@@ -1,5 +1,5 @@
 _base_ = [
-    '../_base_/datasets/mfnet_ab_240x320.py',
+    '../_base_/datasets/mfnet_ab_480x640.py',
     '../_base_/default_runtime.py',
 ]
 
@@ -11,7 +11,7 @@ custom_imports = dict(
              'mmdet.models'],
     allow_failed_imports=False)
 
-crop_size = (240, 320)
+crop_size = (480, 640)
 num_classes = 9
 
 data_preprocessor = dict(
@@ -239,7 +239,7 @@ model = dict(
     loss_distill_weight=0.3,
     distill_temperature=4.0,
     aux_loss_weight=0.3,
-    total_epochs=50,
+    total_epochs=200,
     missing_ratio=0.3,
     global_deg_ratio=0.3,
     local_deg_ratio=0.4,
@@ -248,7 +248,7 @@ model = dict(
     tau_hard=0.2,
     fuse_epsilon=1e-3,
     fuse_beta=6.0,
-    test_cfg=dict(mode='slide', crop_size=crop_size, stride=(160, 214)))
+    test_cfg=dict(mode='slide', crop_size=crop_size, stride=(320, 427)))
 
 # ---------------------------------------------------------------------------
 # Optimizer: separate lr for Swin-L common, Swin-T private, and others
@@ -328,31 +328,31 @@ optim_wrapper = dict(
         norm_decay_mult=0.0))
 
 param_scheduler = [
-    dict(type='LinearLR', start_factor=1e-6, by_epoch=False, begin=0, end=2000),
+    dict(type='LinearLR', start_factor=1e-6, by_epoch=False, begin=0, end=1500),
     dict(
         type='PolyLR',
         eta_min=0.0,
         power=0.9,
-        begin=2000,
-        end=29400,
+        begin=1500,
+        end=117600,
         by_epoch=False),
 ]
 
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=50, val_interval=2)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=200, val_interval=5)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
 default_hooks = dict(
     timer=dict(type='IterTimerHook'),
-    logger=dict(type='LoggerHook', interval=20, log_metric_by_epoch=True),
+    logger=dict(type='LoggerHook', interval=50, log_metric_by_epoch=True),
     param_scheduler=dict(type='ParamSchedulerHook'),
     checkpoint=dict(
-        type='CheckpointHook', by_epoch=True, interval=10,
+        type='CheckpointHook', by_epoch=True, interval=5,
         save_best='mIoU'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
     visualization=dict(type='SegVisualizationHook'))
 
 custom_hooks = [
-    dict(type='TrainVisHook', interval=2, num_samples=2, mask_threshold=0.3),
+    dict(type='TrainVisHook', interval=5, num_samples=2, mask_threshold=0.3),
     dict(type='MissingModalityEvalHook', interval=1),
 ]

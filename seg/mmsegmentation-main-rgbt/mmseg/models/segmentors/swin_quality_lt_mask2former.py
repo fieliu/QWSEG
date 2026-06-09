@@ -474,8 +474,42 @@ class QualityGatedSwinLTMask2Former(BaseSegmentor):
         ep = getattr(self,'current_epoch',0)
         ph = self._get_training_phase(ep)
         self._update_training_phase(ep)
-        (zc_r,zc_t,zp_r_raw,zp_t_raw,zp_r,zp_t,
-         zf,re,te,ff,s_r,s_t,all_s,spr,spt) = self._extract_feat_single(rgb,ir)
+
+        # Helper: split a list/tensor into clean[:B] and degraded[B:]
+        def _split(lst):
+            if lst is None: return None, None
+            if isinstance(lst, list):
+                return [x[:B] for x in lst], [x[B:] for x in lst]
+            return lst[:B], lst[B:]
+
+        # Phase 3: batch clean + degraded into a single forward pass
+        # Phase 1/2: clean only
+        if self.training and ph >= 3:
+            dr, di, _, _ = self._generate_degraded_inputs(rgb, ir)
+            cat_rgb = torch.cat([rgb, dr], dim=0)
+            cat_t = torch.cat([ir, di], dim=0)
+            (cat_zcr,cat_zct,cat_zpr_raw,cat_zpt_raw,cat_zpr,cat_zpt,
+             cat_zf,cat_re,cat_te,cat_ff,cat_sr,cat_st,cat_all_s,cat_spr,cat_spt) = \
+                self._extract_feat_single(cat_rgb, cat_t)
+            (zc_r, dzc_r) = _split(cat_zcr)
+            (zc_t, dzc_t) = _split(cat_zct)
+            (zp_r_raw, dzp_r_raw) = _split(cat_zpr_raw)
+            (zp_t_raw, dzp_t_raw) = _split(cat_zpt_raw)
+            (zp_r, dzp_r) = _split(cat_zpr)
+            (zp_t, dzp_t) = _split(cat_zpt)
+            (zf, dzf) = _split(cat_zf)
+            (re, drl) = _split(cat_re)
+            (te, dtl) = _split(cat_te)
+            (ff, df) = _split(cat_ff)
+            (s_r, ds_r) = _split(cat_sr)
+            (s_t, ds_t) = _split(cat_st)
+            (spr, dspr) = _split(cat_spr)
+            (spt, dspt) = _split(cat_spt)
+        else:
+            (zc_r,zc_t,zp_r_raw,zp_t_raw,zp_r,zp_t,
+             zf,re,te,ff,s_r,s_t,all_s,spr,spt) = self._extract_feat_single(rgb,ir)
+            dzc_r=dzc_t=dzp_r_raw=dzp_t_raw=dzp_r=dzp_t=dzf=drl=dtl=df=ds_r=ds_t=dspr=dspt=None
+
         losses = {}
         sl = self._stack_batch_gt(data_samples)
         for ds in data_samples:
@@ -500,8 +534,8 @@ class QualityGatedSwinLTMask2Former(BaseSegmentor):
                     cnt += 1
             if cnt: losses['loss_align'] = (lc/cnt)*self.loss_align_weight
 
-        # Quality anchor loss on clean forward (all 16 maps, level=1 → push > 0.8)
-        if self.loss_quality_weight > 0:
+        # Quality anchor loss on clean forward (only in Phase 3 when predictors are unfrozen)
+        if self.loss_quality_weight > 0 and ph >= 3:
             pm = self._build_pad_mask(data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
             level_clean_rgb = torch.ones(B, 1, inputs.shape[-2], inputs.shape[-1],
                                          device=inputs.device, dtype=inputs.dtype)
@@ -511,16 +545,14 @@ class QualityGatedSwinLTMask2Former(BaseSegmentor):
                 s_r, s_t, spr, spt, level_clean_rgb, level_clean_t,
                 pad_mask=pm.float().unsqueeze(1) if pm.ndim == 3 else pm.float())
 
-        if self.training:
-            (dzc_r,dzc_t,dzp_r_raw,dzp_t_raw,dzp_r,dzp_t,
-             dzf,drl,dtl,df,ds_r,ds_t,dall_s,dspr,dspt) = self._train_with_degradation(rgb,ir)
+        if self.training and ph >= 3:
             if torch.isnan(df[0]).any():
                 import logging
                 logging.getLogger(__name__).warning(
                     'NaN in degraded features — falling back to clean features for deg losses')
-                (dzc_r,dzc_t,dzp_r_raw,dzp_t_raw,dzp_r,dzp_t,
-                 dzf,drl,dtl,df,ds_r,ds_t,dall_s,dspr,dspt) = \
-                    zc_r,zc_t,zp_r_raw,zp_t_raw,zp_r,zp_t,zf,re,te,ff,s_r,s_t,all_s,spr,spt
+                dzc_r,dzc_t,dzp_r_raw,dzp_t_raw,dzp_r,dzp_t = zc_r,zc_t,zp_r_raw,zp_t_raw,zp_r,zp_t
+                dzf,drl,dtl,df = zf,re,te,ff
+                ds_r,ds_t,dspr,dspt = s_r,s_t,spr,spt
             losses.update(add_prefix(self.decode_head.loss(df,data_samples,self.train_cfg),'deg_decode'))
             for head, feats, pfx in [
                 (self.common_decode_head, dzf, 'deg_common_decode'),

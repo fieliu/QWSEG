@@ -869,14 +869,9 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         ph = self._get_training_phase(ep)
         self._update_training_phase(ep)
 
-        # Helper: split a list/tensor into clean[:B] and degraded[B:]
-        def _split(lst):
-            if lst is None: return None, None
-            if isinstance(lst, list):
-                return [x[:B] for x in lst], [x[B:] for x in lst]
-            return lst[:B], lst[B:]
-
         # Phase 3: batch clean + degraded into a single forward pass
+        # (requires use_reentrant=False in swin checkpoint to avoid
+        #  "backward through the graph a second time" error)
         # Phase 1/2: clean only
         if self.training and ph >= 3:
             dr, di, _, _ = self._generate_degraded_inputs(rgb, ir)
@@ -884,18 +879,19 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             cat_t = torch.cat([ir, di], dim=0)      # [2B, C, H, W]
             (cat_zcr,cat_zct,cat_zpr,cat_zpt,cat_zf,cat_re,cat_te,cat_ff,
              cat_sr,cat_st,cat_all_s,cat_spr,cat_spt) = self._extract_feat_single(cat_rgb, cat_t)
-            (zc_r, dzcr) = _split(cat_zcr)
-            (zc_t, dzct) = _split(cat_zct)
-            (zp_r, dzpr) = _split(cat_zpr)
-            (zp_t, dzpt) = _split(cat_zpt)
-            (zf, dzf) = _split(cat_zf)
-            (re, drl) = _split(cat_re)
-            (te, dtl) = _split(cat_te)
-            (ff, df) = _split(cat_ff)
-            (s_r, ds_r) = _split(cat_sr)
-            (s_t, ds_t) = _split(cat_st)
-            (spr, dspr) = _split(cat_spr)
-            (spt, dspt) = _split(cat_spt)
+            # Split cat-batch outputs into clean[:B] and degraded[B:]
+            zc_r = [f[:B] for f in cat_zcr]; dzcr = [f[B:] for f in cat_zcr]
+            zc_t = [f[:B] for f in cat_zct]; dzct = [f[B:] for f in cat_zct]
+            zp_r = [f[:B] for f in cat_zpr]; dzpr = [f[B:] for f in cat_zpr]
+            zp_t = [f[:B] for f in cat_zpt]; dzpt = [f[B:] for f in cat_zpt]
+            zf = [f[:B] for f in cat_zf]; dzf = [f[B:] for f in cat_zf]
+            re = [f[:B] for f in cat_re]; drl = [f[B:] for f in cat_re]
+            te = [f[:B] for f in cat_te]; dtl = [f[B:] for f in cat_te]
+            ff = [f[:B] for f in cat_ff]; df = [f[B:] for f in cat_ff]
+            s_r = [f[:B] for f in cat_sr]; ds_r = [f[B:] for f in cat_sr]
+            s_t = [f[:B] for f in cat_st]; ds_t = [f[B:] for f in cat_st]
+            spr = [f[:B] for f in cat_spr]; dspr = [f[B:] for f in cat_spr]
+            spt = [f[:B] for f in cat_spt]; dspt = [f[B:] for f in cat_spt]
         else:
             (zc_r,zc_t,zp_r,zp_t,zf,re,te,ff,s_r,s_t,all_s,spr,spt) = self._extract_feat_single(rgb,ir)
             dzcr=dzct=dzpr=dzpt=dzf=drl=dtl=df=ds_r=ds_t=dspr=dspt=None

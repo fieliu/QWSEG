@@ -420,3 +420,112 @@ work_dirs/
 4. **共享-私有特征解耦**: HSIC 约束 + InfoNCE 对齐，有效分离模态共享/独有特征
 5. **多 Backbone 对比**: MAE vs SAM 特征提取能力对比，LoRA vs 冻结微调策略对比
 6. **系统化鲁棒性评估**: 9 种退化场景 × 多强度级别，全面验证模型退化鲁棒性
+
+## 消融实验设计
+
+消融实验基于最优版本 `QualityGatedSwinMask2Former`（分支 `ablation-baseline`，对应提交 `317db11`）。所有消融通过模型的开关参数控制，**单类共享同一前向主干**，保证"除被消融的那一个变量外，其余完全相同"——这是消融可信度的前提。
+
+### 设计原则
+
+1. **统一基线**：所有消融继承同一基线配置 `swinmul_quality_mask2former_swin-t_1xb2-200E_mfnet-480x640.py`，每个消融配置只覆盖一个开关。
+2. **连锁一致性由代码强制**：质量机制内部强耦合（质量分是 attention bias、硬掩码、cascade、质量加权融合、多个 loss 的共同输入）。关闭主开关时，依赖它的组件/损失由代码**自动同步关闭**，无需在配置里手动设零，避免漏配导致的"假消融"。
+3. **统一实验条件**：同 seed、200 epoch、MFNet、Swin-T backbone，三栏报告 `clean / rgb_missing / thermal_missing` 三种 mIoU。
+4. **消融用 Swin-T**（快、省显存，定架构足够）；主结果表才用 Swin-L。
+
+### 组件依赖关系
+
+```
+质量预测器 → s_r/s_t (common), spr/spt (private)
+   ├─→ attention bias (f_attn, 注入每个 Swin block)
+   ├─→ 硬掩码 (f_hard_mask, tau_hard=0.2)
+   ├─→ cascade_quality_suppress (跨阶段累乘抑制)
+   ├─→ retention_loss (约束保留率)
+   ├─→ common 融合 (质量加权平均) → zf
+   ├─→ 私有加权 (f_fuse) → re/te
+   ├─→ final_fusion(re, te, zf) → ff (送主解码头)
+   ├─→ loss_align (质量门控对比采样)
+   └─→ loss_invariant (质量门控特征不变性)
+退化训练 → 第二次 forward → deg 损失 + loss_distill + loss_invariant
+```
+
+### 主消融表（进正文，leave-one-out）
+
+每行从完整模型移除**一套机制**（非单个代码组件），对应论文的一个核心贡献点。
+
+| ID | 配置文件 | 主开关 | 移除的内容 | 回答的问题 |
+|----|----------|--------|------------|------------|
+| M0 | （基线本身） | — | 无 | 完整模型，上界参考 |
+| M1 | `ablation/M1_no_quality.py` | `use_quality=False` | 质量预测器 + attention bias + 硬掩码 + 质量加权融合 + retention/align/invariant 损失 | 质量感知机制整体的贡献 |
+| M2 | `ablation/M2_no_degradation.py` | `use_degradation=False` | 退化第二次前向 + 全部退化损失 + distill + invariant | 退化鲁棒训练的贡献 |
+| M3 | `ablation/M3_no_private_branch.py` | `use_private_branch=False` | 双私有 Swin 分支 + 私有预测器 + 私有辅助头 + final_fusion | 三分支架构的贡献 |
+| M4 | `ablation/M4_no_cascade_retention.py` | `use_cascade=False` + `retention_loss_weight=0` | 跨阶段级联抑制 + 保留率约束 | 跨阶段一致性/稳定机制的贡献 |
+| M5 | `ablation/M5_no_curriculum.py` | `skip_phases=True` | 三阶段训练课程（warmup） | 渐进式课程的必要性 |
+
+### 每个消融的详细改动与连锁
+
+**M1 — 去掉质量感知（连锁最复杂）**
+- 主开关 `use_quality=False`，代码内部强制连锁关闭：① attention bias 传 None；② 硬掩码跳过；③ cascade 跳过；④ `retention_loss_weight`/`loss_align_weight`/`loss_invariant_weight` 自动归零（这三个损失都消费质量分，留着会用无意义的 s 算出错误损失）。
+- **融合变化**：common 融合的质量加权 `(w_r·zc_r + w_t·zc_t)/(w_r+w_t)` → 简单平均 `(zc_r+zc_t)/2`；私有加权 `f_fuse(spr)` → 权重恒 1，即直接相加。`final_fusion`（参数化 DualGate 模块，不依赖质量分）结构保留。
+- **意义**：结果等价于"同参数三分支 + 朴素融合"，同时回答审稿人"提升是否只来自参数量"。
+
+**M2 — 去掉退化鲁棒训练（融合不变）**
+- `use_degradation=False`：`loss()` 中 `if self.training and self.use_degradation` 跳过整个退化分支。代码连锁关闭 `loss_distill`（clean→deg 的 KL，无 deg 分支则无意义）和 `loss_invariant`（clean vs deg 特征）。
+- **融合变化**：无。clean 前向与融合一字不变，是干净的单变量消融。
+
+**M3 — 去掉私有双分支（架构级）**
+- `use_private_branch=False`：不构建两个私有 Swin 分支、私有预测器；私有辅助头自动设 None。
+- **融合变化**：`re/te` 不存在，**旁路 `final_fusion`**，直接用质量加权 common 融合 `zf` 作为最终特征 `ff` 送主解码头。即从"common + 双私有三路融合"退化为"纯 common 双模态融合"。common 分支的质量加权保留。
+
+**M4 — 去掉跨阶段一致性（连锁最少）**
+- `use_cascade=False` + `retention_loss_weight=0`（这两个是一对稳定机制，一起关）。
+- **融合变化**：公式不变，但喂给下游的质量分 s 从"级联累乘抑制后的值"变为"每层独立原始值"。这会影响硬掩码的跨层稳定性（缺失区域可能逐层抖动地丢/留）。
+
+**M5 — 去掉三阶段课程（调度级）**
+- `skip_phases=True`：`_get_training_phase` 直接返回 phase 3，`force_all_keep=False` 从 epoch 0 生效，质量预测器与退化训练从头全开，无 warmup。
+- **融合变化**：无。仅改训练调度，不改结构。
+
+### 附录消融（设计选择验证）
+
+确定主架构后再跑，证明"机制内部的设计选择合理"，放正文小表或附录。
+
+| ID | 配置文件 | 改动 | 回答 |
+|----|----------|------|------|
+| D1a | `ablation/D1a_no_hard_mask.py` | `use_hard_mask=False`（保留软门控） | 硬掩码是否必要 |
+| D1b | （调 `tau_hard` 0.1/0.2/0.3） | 硬掩码阈值 | 阈值敏感性 |
+| D2 | （切换 common 融合方式） | 质量加权 vs add vs softmax | 为何选质量加权 |
+| D3 | （调 `tau` 0.2/0.3/0.4） | 质量阈值 | 超参鲁棒性 |
+
+**D1a 预测**：clean 持平或略升，缺失场景掉点——若如此，说明"硬掩码对干净输入冗余，但对模态缺失鲁棒性关键"，把可删组件变成有明确作用边界的设计；若哪儿都不掉，则直接删掉，更契合"用 gating 不用 pruning"的论文叙事。
+
+### 边角损失删减探针（不进消融表）
+
+用于决定是否从最终模型删除边际损失项。各跑一次 leave-one-out，掉点 < 0.3 mIoU 即从最终模型删除，论文一句话带过。三者权重小（0.1/0.3/0.03）且功能疑似重叠（distill 与 invariant 都做 deg→clean 对齐）。
+
+| ID | 配置文件 | 改动 |
+|----|----------|------|
+| E1 | `ablation/E1_no_align.py` | `loss_align_weight=0` |
+| E2 | `ablation/E2_no_distill.py` | `loss_distill_weight=0` |
+| E3 | `ablation/E3_no_invariant.py` | `loss_invariant_weight=0` |
+
+### 运行方式
+
+```bash
+# 单个消融训练（示例：M1）
+CUDA_VISIBLE_DEVICES=0 python tools/train.py \
+    configs/mask2former/ablation/M1_no_quality.py
+
+# 显存紧张时加梯度检查点
+CUDA_VISIBLE_DEVICES=0 python tools/train.py \
+    configs/mask2former/ablation/M1_no_quality.py \
+    --cfg-options model.backbone.with_cp=True \
+        model.private_branch_rgb.with_cp=True \
+        model.private_branch_t.with_cp=True
+
+# 鲁棒性评测（clean / rgb_missing / thermal_missing 三栏）
+python tools/test_robustness.py \
+    configs/mask2former/ablation/M1_no_quality.py \
+    <checkpoint.pth>
+```
+
+> 注意：当前基线配置使用 fp32 + 梯度检查点。Swin + Mask2Former 在 AMP（`--amp`）下易出 NaN（deformable attention 与 dice/mask loss 在半精度下数值不稳），消融实验**不要加 `--amp`**，以免引入与消融无关的训练不稳定变量。
+

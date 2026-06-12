@@ -304,14 +304,29 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
                                       training=True,
                                       force_all_keep=False, phase=3,
                                       tau=0.3, alpha=10.0, tau_hard=0.2,
-                                      clamp_min=0.0):
+                                      clamp_min=0.0,
+                                      use_quality=True, use_cascade=True,
+                                      use_hard_mask=True):
     """Quality-aware forward through a single Swin backbone for both modalities.
 
     Uses continuous quality score with piecewise modulation instead of
     hard gating. No Gumbel-Softmax, no complementary fix, no cumulative masks.
     Cross-stage cascading suppression ensures low-quality regions detected
     in shallow stages are never "recovered" by deeper stages.
+
+    Ablation switches:
+        use_quality:   if False, quality predictors / attention bias / hard
+                       mask are all disabled (s == 1 everywhere). Implies
+                       use_cascade=False and use_hard_mask=False.
+        use_cascade:   if False, skip cross-stage cascading suppression;
+                       per-stage raw scores are used directly.
+        use_hard_mask: if False, skip the hard zeroing of low-quality tokens.
     """
+    # Quality off => no cascade, no hard mask, no attn bias (forced all-keep).
+    if not use_quality:
+        force_all_keep = True
+        use_cascade = False
+        use_hard_mask = False
     window_size = swin_branch.stages[0].blocks[0].attn.window_size
     outs, all_s_rgb, all_s_t = [], [], []
     cum_rgb, cum_t = None, None
@@ -341,8 +356,10 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
         if s_t is None:
             s_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
 
-        s_rgb, cum_rgb = cascade_quality_suppress(s_rgb, cum_rgb, H, W, clamp_min=clamp_min)
-        s_t, cum_t = cascade_quality_suppress(s_t, cum_t, H, W, clamp_min=clamp_min)
+        s_rgb, cum_rgb = cascade_quality_suppress(s_rgb, cum_rgb, H, W, clamp_min=clamp_min) \
+            if use_cascade else (s_rgb, cum_rgb)
+        s_t, cum_t = cascade_quality_suppress(s_t, cum_t, H, W, clamp_min=clamp_min) \
+            if use_cascade else (s_t, cum_t)
 
         all_s_rgb.append(s_rgb)
         all_s_t.append(s_t)
@@ -352,12 +369,14 @@ def _forward_swin_common_dual_pruned(swin_branch, input_rgbt, orig_B,
         rel_s_t = s_t / s_avg
         rel_s_combined = torch.cat([rel_s_rgb, rel_s_t], dim=0)
         s_combined = torch.cat([s_rgb, s_t], dim=0)
-        hard_mask = f_hard_mask(s_combined, tau_hard=tau_hard)
+        hard_mask = f_hard_mask(s_combined, tau_hard=tau_hard) \
+            if use_hard_mask else torch.ones_like(s_combined)
 
         for j, block in enumerate(blocks):
             shift_size = block.attn.shift_size
             quality_bias = _quality_score_to_swin_bias(
-                rel_s_combined, window_size, shift_size, tau=tau, alpha=alpha)
+                rel_s_combined, window_size, shift_size, tau=tau, alpha=alpha) \
+                if use_quality else None
             x = block(x, (H, W), quality_bias=quality_bias)
 
         if i in swin_branch.out_indices:
@@ -382,17 +401,25 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
                                  training=True,
                                  force_all_keep=False, phase=3,
                                  tau=0.3, alpha=10.0, tau_hard=0.2,
-                                 clamp_min=0.0):
+                                 clamp_min=0.0,
+                                 use_quality=True, use_cascade=True,
+                                 use_hard_mask=True):
     """Quality-aware forward through a single Swin branch.
 
     Uses continuous quality score with piecewise modulation instead of
     hard gating. Cross-stage cascading suppression ensures low-quality
     regions detected in shallow stages are never "recovered" by deeper stages.
 
+    Ablation switches: see _forward_swin_common_dual_pruned.
+
     Returns:
         outs:        list of feature maps [B, C_i, H_i, W_i]
         all_s:       list of per-stage quality scores
     """
+    if not use_quality:
+        force_all_keep = True
+        use_cascade = False
+        use_hard_mask = False
     window_size = swin_branch.stages[0].blocks[0].attn.window_size
     outs, all_s = [], []
     cum_s = None
@@ -418,15 +445,18 @@ def _forward_swin_branch_pruned(swin_branch, img, predictor_list,
         if s is None:
             s = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
 
-        s, cum_s = cascade_quality_suppress(s, cum_s, H, W, clamp_min=clamp_min)
+        s, cum_s = cascade_quality_suppress(s, cum_s, H, W, clamp_min=clamp_min) \
+            if use_cascade else (s, cum_s)
 
         all_s.append(s)
-        hard_mask = f_hard_mask(s, tau_hard=tau_hard)
+        hard_mask = f_hard_mask(s, tau_hard=tau_hard) \
+            if use_hard_mask else torch.ones_like(s)
 
         for j, block in enumerate(blocks):
             shift_size = block.attn.shift_size
             quality_bias = _quality_score_to_swin_bias(
-                s, window_size, shift_size, tau=tau, alpha=alpha)
+                s, window_size, shift_size, tau=tau, alpha=alpha) \
+                if use_quality else None
             x = block(x, (H, W), quality_bias=quality_bias)
 
         if i in swin_branch.out_indices:
@@ -556,16 +586,40 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                  fuse_epsilon: float = 1e-3,
                  fuse_beta: float = 6.0,
                  skip_phases: bool = False,
+                 # ---- Ablation switches (all default True = full model) ----
+                 use_quality: bool = True,
+                 use_degradation: bool = True,
+                 use_private_branch: bool = True,
+                 use_cascade: bool = True,
+                 use_hard_mask: bool = True,
                  init_cfg: OptMultiConfig = None):
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
         if pretrained is not None:
             backbone['pretrained'] = pretrained
+
+        # ---- Ablation switches (resolve chained dependencies here so a
+        #      single config flag is enough; loss terms are force-disabled
+        #      below to keep every ablation logically consistent) ----
+        self.use_quality = use_quality
+        self.use_degradation = use_degradation
+        self.use_private_branch = use_private_branch
+        # Quality off implies cascade/hard-mask off (they consume quality scores)
+        self.use_cascade = use_cascade and use_quality
+        self.use_hard_mask = use_hard_mask and use_quality
+
         self.backbone = MODELS.build(backbone)
         _replace_swin_blocks_with_quality(self.backbone)
-        self.private_branch_rgb = MODELS.build(private_branch_rgb)
-        _replace_swin_blocks_with_quality(self.private_branch_rgb)
-        self.private_branch_t = MODELS.build(private_branch_t)
-        _replace_swin_blocks_with_quality(self.private_branch_t)
+        if self.use_private_branch:
+            self.private_branch_rgb = MODELS.build(private_branch_rgb)
+            _replace_swin_blocks_with_quality(self.private_branch_rgb)
+            self.private_branch_t = MODELS.build(private_branch_t)
+            _replace_swin_blocks_with_quality(self.private_branch_t)
+        else:
+            self.private_branch_rgb = None
+            self.private_branch_t = None
+            # private aux heads are meaningless without private branches
+            rgb_private_decode_head = None
+            t_private_decode_head = None
         if neck is not None:
             self.neck = MODELS.build(neck)
         self._init_decode_head(decode_head)
@@ -600,15 +654,30 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         self.local_deg_ratio = local_deg_ratio
         self.skip_phases = skip_phases
 
+        # ---- Force-disable loss terms that depend on a disabled switch ----
+        # M1 (no quality): retention/align/invariant all consume quality scores
+        if not self.use_quality:
+            self.retention_loss_weight = 0.0
+            self.loss_align_weight = 0.0
+            self.loss_invariant_weight = 0.0
+        # M2 (no degradation): distill & invariant compare clean-vs-degraded
+        if not self.use_degradation:
+            self.loss_distill_weight = 0.0
+            self.loss_invariant_weight = 0.0
+
     def _build_predictors(self):
         self.predictors_common_rgb = nn.ModuleList(
             [QualityPredictor(ch) for ch in self.embed_dims_list])
         self.predictors_common_t = nn.ModuleList(
             [QualityPredictor(ch) for ch in self.embed_dims_list])
-        self.predictors_priv_rgb = nn.ModuleList(
-            [QualityPredictor(ch) for ch in self.embed_dims_list])
-        self.predictors_priv_t = nn.ModuleList(
-            [QualityPredictor(ch) for ch in self.embed_dims_list])
+        if self.use_private_branch:
+            self.predictors_priv_rgb = nn.ModuleList(
+                [QualityPredictor(ch) for ch in self.embed_dims_list])
+            self.predictors_priv_t = nn.ModuleList(
+                [QualityPredictor(ch) for ch in self.embed_dims_list])
+        else:
+            self.predictors_priv_rgb = None
+            self.predictors_priv_t = None
 
     # ---- BaseSegmentor overrides ----
 
@@ -655,6 +724,7 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
         phase = self._get_training_phase(epoch)
         all_p = [self.predictors_common_rgb, self.predictors_common_t,
                  self.predictors_priv_rgb, self.predictors_priv_t]
+        all_p = [pl for pl in all_p if pl is not None]
         if phase == 1 or phase == 2:
             for pl in all_p:
                 for m in pl:
@@ -711,8 +781,10 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
 
     def init_weights(self):
         self.backbone.init_weights()
-        self.private_branch_rgb.init_weights()
-        self.private_branch_t.init_weights()
+        if self.private_branch_rgb is not None:
+            self.private_branch_rgb.init_weights()
+        if self.private_branch_t is not None:
+            self.private_branch_t.init_weights()
         if self.init_cfg: super().init_weights()
 
     def _extract_feat_single(self, rgb, t):
@@ -729,20 +801,42 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             predictors_t=self.predictors_common_t,
             training=self.training, force_all_keep=fa, phase=ph,
             tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard,
-            clamp_min=clamp_min)
+            clamp_min=clamp_min,
+            use_quality=self.use_quality, use_cascade=self.use_cascade,
+            use_hard_mask=self.use_hard_mask)
         zc_r = [f[:B] for f in zc_outs]; zc_t = [f[B:] for f in zc_outs]
+
+        # ---- M3: no private branch -> common-only fusion, bypass final_fusion ----
+        if not self.use_private_branch:
+            zf = []
+            for i in range(len(self.embed_dims_list)):
+                sri = s_r[i] if s_r[i] is not None else torch.ones(B,1,zc_r[i].shape[2],zc_r[i].shape[3],device=zc_r[i].device)
+                sti = s_t[i] if s_t[i] is not None else torch.ones(B,1,zc_t[i].shape[2],zc_t[i].shape[3],device=zc_t[i].device)
+                fused = self._quality_weighted_common_fusion(zc_r[i], zc_t[i], sri, sti)
+                zf_i = fused.permute(0,2,3,1).contiguous()
+                zf_i = F.layer_norm(zf_i, [zf_i.size(-1)])
+                zf_i = zf_i.permute(0,3,1,2).contiguous()
+                zf.append(zf_i)
+            none_list = [None] * len(self.embed_dims_list)
+            # ff == zf (common fusion is the final feature when no private branch)
+            return zc_r, zc_t, none_list, none_list, zf, none_list, none_list, \
+                zf, s_r, s_t, [s for sl in [s_r, s_t] for s in sl], none_list, none_list
 
         zp_r, spr = _forward_swin_branch_pruned(
             self.private_branch_rgb, rgb, self.predictors_priv_rgb,
             training=self.training, force_all_keep=fa, phase=ph,
             tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard,
-            clamp_min=clamp_min)
+            clamp_min=clamp_min,
+            use_quality=self.use_quality, use_cascade=self.use_cascade,
+            use_hard_mask=self.use_hard_mask)
 
         zp_t, spt = _forward_swin_branch_pruned(
             self.private_branch_t, t, self.predictors_priv_t,
             training=self.training, force_all_keep=fa, phase=ph,
             tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard,
-            clamp_min=clamp_min)
+            clamp_min=clamp_min,
+            use_quality=self.use_quality, use_cascade=self.use_cascade,
+            use_hard_mask=self.use_hard_mask)
 
         zf, re, te = [], [], []
         for i in range(len(self.embed_dims_list)):
@@ -852,7 +946,7 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
                     cnt += 1
             if cnt: losses['loss_align'] = (lc/cnt)*self.loss_align_weight
         if self.retention_loss_weight > 0: losses['loss_retention'] = self.retention_loss_weight*self._compute_retention_loss(all_s)
-        if self.training:
+        if self.training and self.use_degradation:
             (dzcr,dzct,dzpr,dzpt,dzf,drl,dtl,df,ds_r,ds_t,dall_s,dspr,dspt) = self._train_with_degradation(rgb,ir)
             if torch.isnan(df[0]).any():
                 import logging
@@ -978,14 +1072,20 @@ class QualityGatedSwinMask2Former(BaseSegmentor):
             fused_d = self.neck(ff_d) if self.with_neck else ff_d
 
         for i in range(len(zf)):
+            # private-branch tensors may be None (use_private_branch=False);
+            # skip them so visualization still works under that ablation.
+            if zc_r_d[i] is None or zc_r[i] is None:
+                continue
             if zc_r_d[i].shape[-2:] != zc_r[i].shape[-2:]:
                 zc_r_d[i] = F.interpolate(zc_r_d[i], size=zc_r[i].shape[-2:], mode='bilinear')
                 zc_t_d[i] = F.interpolate(zc_t_d[i], size=zc_t[i].shape[-2:], mode='bilinear')
                 zf_d[i] = F.interpolate(zf_d[i], size=zf[i].shape[-2:], mode='bilinear')
-                zp_r_d[i] = F.interpolate(zp_r_d[i], size=zp_r[i].shape[-2:], mode='bilinear')
-                zp_t_d[i] = F.interpolate(zp_t_d[i], size=zp_t[i].shape[-2:], mode='bilinear')
-                re_d[i] = F.interpolate(re_d[i], size=re[i].shape[-2:], mode='bilinear')
-                te_d[i] = F.interpolate(te_d[i], size=te[i].shape[-2:], mode='bilinear')
+                if zp_r_d[i] is not None and zp_r[i] is not None:
+                    zp_r_d[i] = F.interpolate(zp_r_d[i], size=zp_r[i].shape[-2:], mode='bilinear')
+                    zp_t_d[i] = F.interpolate(zp_t_d[i], size=zp_t[i].shape[-2:], mode='bilinear')
+                if re_d[i] is not None and re[i] is not None:
+                    re_d[i] = F.interpolate(re_d[i], size=re[i].shape[-2:], mode='bilinear')
+                    te_d[i] = F.interpolate(te_d[i], size=te[i].shape[-2:], mode='bilinear')
                 ff_d[i] = F.interpolate(ff_d[i], size=ff[i].shape[-2:], mode='bilinear')
 
         return dict(

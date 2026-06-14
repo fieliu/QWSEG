@@ -211,7 +211,11 @@ class QualitySwinBlock(SwinBlock):
 
         if self.with_cp and x.requires_grad:
             from torch.utils.checkpoint import checkpoint as cp
-            x = cp(_inner_forward, x)
+            # use_reentrant=False is required: the backbone runs twice per
+            # step (clean + degraded forward), and the reentrant checkpoint
+            # implementation raises "backward through the graph a second
+            # time" under that shared-graph pattern.
+            x = cp(_inner_forward, x, use_reentrant=False)
         else:
             x = _inner_forward(x)
         return x

@@ -1363,6 +1363,7 @@ class TrainVisHook(Hook):
             # clean target: RGB feats | T feats | fused feats. No quality.
             feat_rows = _build_feat_rows(
                 [feats['zc_rgb'], feats['zc_t'], feats['final_fused']])
+        elif model_type == 'v7_quality_adaptive':
             q_info = self._create_v9_quality_vis(feats, img_h=img_h, img_w=img_w)
             feat_rows = _build_feat_rows(
                 [feats['zc_rgb'], feats['zc_t'],

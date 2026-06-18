@@ -55,11 +55,24 @@ class QualityAttnWrapper(nn.Module):
         self.attn = attn          # original DINOv3ViTAttention (keeps weights)
         self._q_kv_bias = None     # [B, N] additive key bias, set per-call
 
+    def __getattr__(self, name):
+        # delegate missing attrs (num_heads, head_dim, scaling, ...) to the
+        # wrapped attention so EoMT's _attn (module.num_heads etc.) still works.
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(super().__getattr__('attn'), name)
+
     def set_bias(self, bias):
         self._q_kv_bias = bias
 
     def forward(self, hidden_states, attention_mask=None,
                 position_embeddings=None, **kwargs):
+        # No quality bias set (e.g. EoMT query-decode stage) -> behave EXACTLY
+        # like the original attention, so its native mask handling is preserved.
+        if self._q_kv_bias is None:
+            return self.attn(hidden_states, attention_mask=attention_mask,
+                             position_embeddings=position_embeddings, **kwargs)
         a = self.attn
         B, N, _ = hidden_states.size()
         q = a.q_proj(hidden_states).view(B, N, a.num_heads, a.head_dim).transpose(1, 2)

@@ -1,0 +1,270 @@
+"""Student model: same dual-branch SHARED-Swin Mask2Former as the teacher, PLUS
+the quality + cross-modal compensation modules and quality-aware attention bias.
+Trained on DEGRADED RGB-T with:
+  - segmentation loss (vs GT)
+  - feature distillation (per-stage fused feats vs frozen clean teacher, gated)
+  - output distillation (final seg logits vs frozen clean teacher)
+  - quality supervision (masked BCE + cross-modal ranking, using degrade masks)
+
+Attention bias: ported from swin_quality_mask2former (window-aligned, cyclic
+shift handled). Quality is predicted ONCE per stage (on stage-input tokens) and
+used BOTH as in-stage attention bias AND for cross-modal compensation at the
+stage output. No hard masking (continuous quality, fully differentiable).
+Degradation is applied INTERNALLY (Paradigm One, single forward on degraded).
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from mmseg.registry import MODELS
+from mmengine.runner import load_checkpoint
+from mmengine.logging import print_log
+from .quality_distill_teacher import QualityDistillTeacher
+from .quality_distill_modules import (
+    StageQuality, CrossModalCompensation, quality_to_swin_bias_convex)
+from .degradation import DegradationGenerator
+from .swin_quality_mask2former import _replace_swin_blocks_with_quality
+
+
+@MODELS.register_module()
+class QualityDistillStudent(QualityDistillTeacher):
+    def __init__(self, *args,
+                 teacher_cfg=None,
+                 teacher_ckpt=None,
+                 init_from_teacher=True,   # warm-start student backbone/fusion/head
+                 fusion_dims=(96, 192, 384, 768),
+                 use_quality=True,         # E2: full mechanism. False -> E0b/E1.
+                 quality_loss_weight=1.0,
+                 distill_loss_weight=1.0,
+                 output_distill_weight=1.0,
+                 bias_alpha=4.0,
+                 bias_gamma=3.0,
+                 degradation=None,
+                 **kwargs):
+        super().__init__(*args, fusion_dims=fusion_dims, **kwargs)
+        self.use_quality = use_quality
+
+        # quality-aware attention: replace Swin blocks so they accept quality_bias
+        _replace_swin_blocks_with_quality(self.backbone)
+        self.window_size = self.backbone.stages[0].blocks[0].attn.window_size
+
+        # per-stage quality predictor (shared across modalities) + compensation
+        self.quality = nn.ModuleList([StageQuality(c) for c in fusion_dims])
+        self.compensate = nn.ModuleList(
+            [CrossModalCompensation(c) for c in fusion_dims])
+
+        self.quality_loss_weight = quality_loss_weight
+        self.distill_loss_weight = distill_loss_weight
+        self.output_distill_weight = output_distill_weight
+        self.bias_alpha = bias_alpha
+        self.bias_gamma = bias_gamma
+        self.current_epoch = 0
+
+        deg = degradation or {}
+        self.degrader = DegradationGenerator(**deg)
+
+        # frozen teacher (same arch, clean input) for distillation
+        self.teacher = None
+        if teacher_cfg is not None:
+            self.teacher = MODELS.build(teacher_cfg)
+            if teacher_ckpt is not None:
+                load_checkpoint(self.teacher, teacher_ckpt, map_location='cpu')
+            # warm-start: copy the SHARED params (backbone / fuse_convs / neck /
+            # decode head) from the trained teacher into the student itself, as a
+            # TRAINABLE starting point. Student-only modules (quality / compensate
+            # / quality-aware block extras) keep their own init. strict=False so
+            # those non-matching keys are skipped, not errored.
+            if init_from_teacher and teacher_ckpt is not None:
+                # teacher.state_dict() keys (backbone.* / fuse_convs.* / neck.* /
+                # decode_head.*) match the student's own params and get loaded.
+                # Student-only modules (quality.* / compensate.*) and the frozen
+                # teacher.* copy appear in `missing` and keep their init.
+                missing, unexpected = self.load_state_dict(
+                    self.teacher.state_dict(), strict=False)
+                loaded = sum(1 for _ in self.teacher.state_dict())
+                student_only = [k for k in missing
+                                if not k.startswith('teacher.')]
+                print_log(
+                    f'QualityDistillStudent warm-start from teacher: '
+                    f'~{loaded} shared params loaded; '
+                    f'{len(student_only)} student-only params kept own init; '
+                    f'{len(unexpected)} unexpected.', logger='current')
+            self.teacher.eval()
+            for p in self.teacher.parameters():
+                p.requires_grad = False
+
+    def train(self, mode=True):
+        # keep the teacher in eval ALWAYS: nn.Module.train() is recursive and
+        # would otherwise re-enable the teacher's stochastic depth (drop_path),
+        # making the distillation targets random/noisy.
+        super().train(mode)
+        if self.teacher is not None:
+            self.teacher.eval()
+        return self
+
+    # quality-aware feature extraction with attention bias + compensation.
+    # Custom Swin forward: predict quality at each stage start (on stage-input
+    # tokens), inject it as window attention bias into every block of the stage,
+    # then reuse the SAME quality at the stage output for cross-modal compensation.
+    def extract_feat(self, inputs):
+        B = inputs.shape[0] // 2  # inputs = cat([rgb, t], dim=0), 2B total
+        bb = self.backbone
+
+        x, (H, W) = bb.patch_embed(inputs)
+        if bb.use_abs_pos_embed:
+            x = x + bb.absolute_pos_embed
+        x = bb.drop_after_pos(x)
+        B_tok = x.shape[0]
+
+        fused_feats, quality_scores = [], []
+        for i, stage in enumerate(bb.stages):
+            # quality from stage-input tokens (spatial res constant within stage)
+            x_2d = x.reshape(B_tok, H, W, -1).permute(0, 3, 1, 2)
+            x_rgb_in, x_t_in = x_2d[:B], x_2d[B:]
+            if self.use_quality:
+                s_rgb = self.quality[i](x_rgb_in, x_t_in)   # [B,1,H,W]
+                s_t = self.quality[i](x_t_in, x_rgb_in)
+                # relative (competitive) quality for the attention bias.
+                s_avg = (s_rgb + s_t) / 2 + 1e-8
+                rel = torch.cat([s_rgb / s_avg, s_t / s_avg], dim=0)
+                for block in stage.blocks:
+                    shift = block.attn.shift_size
+                    qbias = quality_to_swin_bias_convex(
+                        rel, self.window_size, shift,
+                        alpha=self.bias_alpha, gamma=self.bias_gamma)
+                    x = block(x, (H, W), quality_bias=qbias)
+            else:
+                # mechanism OFF (E0b/E1): no bias, quality forced to 1.
+                for block in stage.blocks:
+                    x = block(x, (H, W), quality_bias=None)
+                ones = x.new_ones(B, 1, H, W)
+                s_rgb = s_t = ones
+
+            # stage output feature -> split, compensate, fuse
+            if i in bb.out_indices:
+                norm_layer = getattr(bb, f'norm{i}', None)
+                out = norm_layer(x) if norm_layer is not None else x
+                out = out.view(B_tok, H, W, -1).permute(0, 3, 1, 2).contiguous()
+                x_rgb, x_t = out[:B], out[B:]
+                if self.use_quality:
+                    x_rgb_c = self.compensate[i](x_rgb, x_t, s_rgb)
+                    x_t_c = self.compensate[i](x_t, x_rgb, s_t)
+                    x_rgb, x_t = x_rgb_c, x_t_c
+                fused_feats.append(self._fuse_stage(i, x_rgb, x_t))
+                quality_scores.append((s_rgb, s_t))
+
+            if stage.downsample is not None:
+                x, (H, W) = stage.downsample(x, (H, W))
+
+        self._last_fused_feats = fused_feats
+        self._last_quality = quality_scores
+        feats = fused_feats
+        if self.with_neck:
+            feats = self.neck(fused_feats)
+        return feats
+
+    def predict_with_missing(self, inputs, data_samples=None,
+                             mask_rgb=False, mask_t=False):
+        """Predict with one modality zeroed (whole-modality missing).
+
+        RGB = channels 0:3, T = channels 3:6 (matches MissingModalityEvalHook).
+        Reuses the inherited predict() so postprocess is identical to the
+        clean path; extract_feat re-cats to the batch-doubled dual stream.
+        """
+        inputs = inputs.clone()
+        if mask_rgb:
+            inputs[:, :3] = 0
+        if mask_t:
+            inputs[:, 3:] = 0
+        return self.predict(inputs, data_samples)
+
+    # ---- quality supervision: 0/1 BCE (missing is binary -> zeroed=0, kept=1).
+    # No cross-modal ranking: "degraded" != "lower quality than the other
+    # modality" (the other modality's intrinsic quality is unknown), so a
+    # cross-modal ordering constraint can be wrong. Absolute per-modality BCE +
+    # the downstream seg loss handle "which modality to trust per location".
+    def _quality_losses(self, quality_scores, mask_rgb, mask_t):
+        bce_total = 0.0
+        n = 0
+        for (s_rgb, s_t) in quality_scores:
+            h, w = s_rgb.shape[-2:]
+            m_rgb = F.adaptive_max_pool2d(mask_rgb, (h, w))  # 1 = missing
+            m_t = F.adaptive_max_pool2d(mask_t, (h, w))
+            for s, m in ((s_rgb, m_rgb), (s_t, m_t)):
+                target = (m < 0.5).float()  # kept=1, missing=0
+                bce_total = bce_total + F.binary_cross_entropy(s, target)
+            n += 1
+        return bce_total / max(n, 1)
+
+    # ---- feature distillation: per-stage fused feats, quality-gated
+    def _feat_distill_loss(self, student_feats, teacher_feats, quality_scores):
+        total = 0.0
+        n = 0
+        for sf, tf, (s_rgb, s_t) in zip(student_feats, teacher_feats, quality_scores):
+            gate = torch.maximum(s_rgb, s_t)  # [B,1,H,W] high where any modality good
+            diff = (sf - tf.detach()) ** 2
+            total = total + (gate * diff).mean()
+            n += 1
+        return total / max(n, 1)
+
+    # ---- output distillation: PERMUTATION-INVARIANT per-pixel semantic map.
+    # NOTE: per-query mask logits can't be distilled directly -- Mask2Former's
+    # Hungarian matching makes query order arbitrary, so teacher query i != student
+    # query i. predict() returns the einsum'd per-pixel class map (in [0,1]),
+    # which IS permutation-invariant. We normalize it to a per-pixel class
+    # distribution and distill with quality-GATED KL (relax where both modalities
+    # missing, i.e. the target is unreachable).
+    def _output_distill_loss(self, s_prob, t_prob, gate, eps=1e-6):
+        s = s_prob / (s_prob.sum(1, keepdim=True) + eps)
+        t = t_prob / (t_prob.sum(1, keepdim=True) + eps)
+        kl = (t * ((t + eps).log() - (s + eps).log())).sum(1, keepdim=True)
+        return (gate * kl).mean()
+
+    def loss(self, inputs, data_samples):
+        # Paradigm One: degrade internally, single forward on degraded input
+        rgb, t = inputs[:, :3], inputs[:, 3:]
+        drgb, dir_, mask_rgb, mask_t = self.degrader(rgb, t, epoch=self.current_epoch)
+
+        rgbt = torch.cat([drgb, dir_], dim=0)
+        fused_feats = self.extract_feat(rgbt)
+        quality_scores = self._last_quality
+        student_fused = self._last_fused_feats
+
+        losses = dict()
+        losses.update(self._decode_head_forward_train(fused_feats, data_samples))
+
+        # quality supervision (0/1 BCE; ranking removed)
+        if self.use_quality and self.quality_loss_weight > 0:
+            bce = self._quality_losses(quality_scores, mask_rgb, mask_t)
+            losses['loss_quality_bce'] = self.quality_loss_weight * bce
+
+        # distillation vs frozen clean teacher (feature + output)
+        if self.teacher is not None and (
+                self.distill_loss_weight > 0 or self.output_distill_weight > 0):
+            clean_input = torch.cat([rgb, t], dim=1)
+            with torch.no_grad():
+                teacher_fused = self.teacher.extract_fused_for_distill(clean_input)
+            if self.distill_loss_weight > 0:
+                losses['loss_distill_feat'] = self.distill_loss_weight * \
+                    self._feat_distill_loss(student_fused, teacher_fused, quality_scores)
+            if self.output_distill_weight > 0:
+                bm = [d.metainfo for d in data_samples]
+                student_prob = self.decode_head.predict(
+                    fused_feats, bm, self.test_cfg)
+                with torch.no_grad():
+                    t_feats = teacher_fused
+                    if self.teacher.with_neck:
+                        t_feats = self.teacher.neck(teacher_fused)
+                    teacher_prob = self.teacher.decode_head.predict(
+                        t_feats, bm, self.teacher.test_cfg)
+                # quality gate at output resolution: relax where BOTH missing
+                s_rgb0, s_t0 = quality_scores[0]
+                gate = torch.maximum(s_rgb0, s_t0)
+                gate = F.interpolate(gate, size=student_prob.shape[-2:],
+                                     mode='bilinear', align_corners=False)
+                losses['loss_distill_out'] = self.output_distill_weight * \
+                    self._output_distill_loss(student_prob, teacher_prob, gate)
+
+        return losses
+
+

@@ -4,7 +4,7 @@ crop_size = (480, 640)
 train_pipeline = [
     dict(type='LoadRGBTImageFromFile',
          ir_replace_src='FMB_ALL/FMB', ir_replace_dst='FMB_ALL/FMB_T'),
-    dict(type='LoadAnnotations', reduce_zero_label=False),
+    dict(type='LoadAnnotations', reduce_zero_label=True),
     dict(
         type='RandomResize',
         scale=(640, 480),
@@ -17,7 +17,7 @@ train_pipeline = [
 test_pipeline = [
     dict(type='LoadRGBTImageFromFile',
          ir_replace_src='FMB_ALL/FMB', ir_replace_dst='FMB_ALL/FMB_T'),
-    dict(type='LoadAnnotations', reduce_zero_label=False),
+    dict(type='LoadAnnotations', reduce_zero_label=True),
     dict(type='PackSegInputs')
 ]
 train_dataloader = dict(

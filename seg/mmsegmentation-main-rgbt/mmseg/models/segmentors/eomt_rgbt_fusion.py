@@ -1,0 +1,178 @@
+"""Multimodal (RGB-T) EoMT with shared ViT + cross-attention fusion.
+
+Deliverable 2 (baseline, no quality):
+- RGB and Thermal share ONE DINOv3 ViT (Siamese / shared weights).
+- The two streams run in parallel through the early blocks; at several fusion
+  points (evenly distributed BEFORE the query-decode stage) they exchange
+  information via cross-attention, then keep propagating.
+- Just before EoMT inserts its learnable queries (block L - num_blocks), the
+  two streams are merged into a single N-token sequence (simple mean here),
+  after which the original EoMT query-decode logic is reused unchanged.
+
+Input is the project's 6-channel RGB-T tensor (RGB = first 3, T = last 3),
+already normalized by the mmseg data_preprocessor.
+"""
+import torch
+import torch.nn as nn
+
+from mmseg.registry import MODELS
+from .eomt_segmentor import EoMTSegmentor
+from .eomt_fusion_blocks import CrossAttnFusion
+
+
+@MODELS.register_module()
+class EoMTRGBTFusion(EoMTSegmentor):
+    def __init__(self, *args, num_fusion_points=3, fusion_heads=8, **kwargs):
+        super().__init__(*args, **kwargs)
+        net = self.network
+        num_layers = len(net.encoder.backbone.blocks)
+        self.decode_start = num_layers - net.num_blocks  # query inserted here
+
+        # Evenly place fusion points in the dual-stream stage [0, decode_start).
+        if num_fusion_points > 0 and self.decode_start > 0:
+            step = max(1, self.decode_start // (num_fusion_points + 1))
+            pts = [min((j + 1) * step, self.decode_start - 1)
+                   for j in range(num_fusion_points)]
+            self.fusion_points = sorted(set(pts))
+        else:
+            self.fusion_points = []
+
+        dim = net.encoder.backbone.embed_dim
+        # one cross-attn fusion module per fusion point (RGB and T share it both
+        # directions by calling it twice with swapped args).
+        self.fusions = nn.ModuleList(
+            [CrossAttnFusion(dim, num_heads=fusion_heads) for _ in self.fusion_points]
+        )
+
+    # -- split 6ch input into RGB and T (both 3ch) --
+    def _split(self, inputs):
+        return inputs[:, :3], inputs[:, 3:]
+
+    def _run_block(self, block, net, x, attn_mask, rope):
+        attn = block.attn if hasattr(block, "attn") else block.attention
+        attn_out = net._attn(attn, block.norm1(x), attn_mask, rope=rope)
+        if hasattr(block, "ls1"):
+            x = x + block.ls1(attn_out)
+        elif hasattr(block, "layer_scale1"):
+            x = x + block.layer_scale1(attn_out)
+        mlp_out = block.mlp(block.norm2(x))
+        if hasattr(block, "ls2"):
+            x = x + block.ls2(mlp_out)
+        elif hasattr(block, "layer_scale2"):
+            x = x + block.layer_scale2(mlp_out)
+        return x
+
+    def _merge(self, z_rgb, z_t, **kwargs):
+        """Baseline merge: simple mean of the two streams."""
+        return 0.5 * (z_rgb + z_t)
+
+    # -- dual-stream forward: shared ViT + cross-attn fusion, then EoMT decode --
+    def _dual_stream_forward(self, rgb, t, return_quality=False):
+        net = self.network
+        backbone = net.encoder.backbone
+        num_layers = len(backbone.blocks)
+
+        # patch embed + pos embed (shared weights, applied to each modality)
+        def embed(x):
+            r = backbone.rope_embeddings(x) if hasattr(backbone, "rope_embeddings") else None
+            x = backbone.patch_embed(x)
+            if hasattr(backbone, "_pos_embed"):
+                x = backbone._pos_embed(x)
+            return x, r
+
+        z_rgb, rope = embed(rgb)
+        z_t, _ = embed(t)
+
+        fp_to_idx = {p: i for i, p in enumerate(self.fusion_points)}
+        quality_info = []  # reserved for the quality subclass hook
+
+        # ---- dual-stream stage: blocks [0, decode_start) ----
+        for i in range(self.decode_start):
+            block = backbone.blocks[i]
+            if i in fp_to_idx:
+                z_rgb, z_t = self._fuse(fp_to_idx[i], z_rgb, z_t, quality_info)
+            z_rgb = self._run_block(block, net, z_rgb, None, rope)
+            z_t = self._run_block(block, net, z_t, None, rope)
+
+        # ---- merge into a single token sequence ----
+        z = self._merge(z_rgb, z_t, quality_info=quality_info)
+
+        # ---- EoMT query-decode stage: blocks [decode_start, num_layers) ----
+        attn_mask = None
+        mask_logits_per_layer, class_logits_per_layer = [], []
+        x = z
+        for i in range(self.decode_start, num_layers):
+            block = backbone.blocks[i]
+            if i == self.decode_start:
+                x = torch.cat(
+                    (net.q.weight[None, :, :].expand(x.shape[0], -1, -1), x), dim=1
+                )
+            if net.masked_attn_enabled:
+                ml, cl = net._predict(backbone.norm(x))
+                mask_logits_per_layer.append(ml)
+                class_logits_per_layer.append(cl)
+                attn_mask = net._attn_mask(x, ml, i)
+            x = self._run_block(block, net, x, attn_mask, rope)
+
+        ml, cl = net._predict(backbone.norm(x))
+        mask_logits_per_layer.append(ml)
+        class_logits_per_layer.append(cl)
+
+        if return_quality:
+            return mask_logits_per_layer, class_logits_per_layer, quality_info
+        return mask_logits_per_layer, class_logits_per_layer
+
+    def _fuse(self, fidx, z_rgb, z_t, quality_info):
+        """Baseline: symmetric cross-attention, no quality bias."""
+        fusion = self.fusions[fidx]
+        new_rgb = fusion(z_rgb, z_t, kv_bias=None)
+        new_t = fusion(z_t, z_rgb, kv_bias=None)
+        return new_rgb, new_t
+
+    # -- override the single-modal forward used by loss/predict/_forward --
+    def _network_forward(self, x):
+        # not used: RGB-T model overrides the callers below to pass both modalities
+        raise RuntimeError("EoMTRGBTFusion uses _dual_stream_forward")
+
+    def loss(self, inputs, data_samples):
+        import torch.nn.functional as F
+        from .eomt_utils import build_targets
+        rgb, t = self._split(inputs)
+        ml_layers, cl_layers = self._dual_stream_forward(rgb, t)
+        targets = build_targets(data_samples, self.num_classes, self.ignore_index)
+        losses = {}
+        for li, (ml, cl) in enumerate(zip(ml_layers, cl_layers)):
+            ml_up = F.interpolate(ml, size=self.img_size, mode="bilinear", align_corners=False)
+            for k, v in self.criterion(ml_up, targets, cl).items():
+                losses[f"l{li}.{k}"] = v
+        return losses
+
+    def encode_decode(self, inputs, batch_img_metas):
+        from .eomt_utils import mask_class_to_seg_logits, resize_seg_logits
+        rgb, t = self._split(inputs)
+        ml_layers, cl_layers = self._dual_stream_forward(rgb, t)
+        seg_logits = mask_class_to_seg_logits(ml_layers[-1], cl_layers[-1])
+        return resize_seg_logits(seg_logits, inputs.shape[2:])
+
+    def _forward(self, inputs, data_samples=None):
+        from .eomt_utils import mask_class_to_seg_logits
+        rgb, t = self._split(inputs)
+        ml_layers, cl_layers = self._dual_stream_forward(rgb, t)
+        return mask_class_to_seg_logits(ml_layers[-1], cl_layers[-1])
+
+    def predict_with_missing(self, inputs, data_samples=None,
+                             mask_rgb=False, mask_t=False):
+        """Predict with one modality zeroed out (whole-modality missing).
+
+        Zeroing matches the MissingModalityEvalHook protocol: RGB = channels
+        0:3, T = channels 3:6. Reuses predict() so postprocess (pad-crop,
+        flip, resize-to-ori) is identical to the clean path. Inherited by
+        EoMTRGBTQuality unchanged.
+        """
+        inputs = inputs.clone()
+        if mask_rgb:
+            inputs[:, :3] = 0
+        if mask_t:
+            inputs[:, 3:] = 0
+        return self.predict(inputs, data_samples)
+

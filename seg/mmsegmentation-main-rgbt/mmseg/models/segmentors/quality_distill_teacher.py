@@ -43,7 +43,22 @@ class QualityDistillTeacher(SwinMulV6Mask2Former):
         return fused_feats
 
     @torch.no_grad()
-    def extract_fused_for_distill(self, inputs):
+    def extract_feat_vis(self, inputs):
+        """Visualization hook entry. inputs: 6ch RGB-T OR batch-doubled cat.
+        Teacher is the clean target: RGB feats | T feats | fused feats. No
+        quality, no degradation."""
+        if inputs.shape[1] == 6:
+            rgb, t = inputs[:, :3], inputs[:, 3:]
+        else:
+            B = inputs.shape[0] // 2
+            rgb, t = inputs[:B], inputs[B:]
+        self.extract_feat(torch.cat([rgb, t], dim=0))
+        return dict(
+            zc_rgb=list(self._last_rgb_feats),
+            zc_t=list(self._last_t_feats),
+            final_fused=list(self._last_fused_feats),
+            clean_rgb_img=rgb, clean_t_img=t)
+
         """inputs: 6-channel RGB-T. Returns list of pre-neck fused stage feats."""
         input_rgb, input_ir = inputs[:, :3], inputs[:, 3:]
         rgbt = torch.cat([input_rgb, input_ir], dim=0)

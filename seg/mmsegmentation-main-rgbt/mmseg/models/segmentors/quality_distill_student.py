@@ -117,6 +117,7 @@ class QualityDistillStudent(QualityDistillTeacher):
         B_tok = x.shape[0]
 
         fused_feats, quality_scores = [], []
+        rgb_feats, t_feats = [], []  # per-modality (compensated) feats, for vis
         for i, stage in enumerate(bb.stages):
             # quality from stage-input tokens (spatial res constant within stage)
             x_2d = x.reshape(B_tok, H, W, -1).permute(0, 3, 1, 2)
@@ -152,16 +153,58 @@ class QualityDistillStudent(QualityDistillTeacher):
                     x_rgb, x_t = x_rgb_c, x_t_c
                 fused_feats.append(self._fuse_stage(i, x_rgb, x_t))
                 quality_scores.append((s_rgb, s_t))
+                rgb_feats.append(x_rgb)
+                t_feats.append(x_t)
 
             if stage.downsample is not None:
                 x, (H, W) = stage.downsample(x, (H, W))
 
         self._last_fused_feats = fused_feats
         self._last_quality = quality_scores
+        self._last_rgb_feats = rgb_feats
+        self._last_t_feats = t_feats
         feats = fused_feats
         if self.with_neck:
             feats = self.neck(fused_feats)
         return feats
+
+    @torch.no_grad()
+    def extract_feat_vis(self, inputs):
+        """Visualization hook entry. inputs: 6ch RGB-T OR batch-doubled cat.
+        Returns per-modality feats, final fused feats, quality maps -- for BOTH
+        the clean input and an internally-degraded copy. No private branch
+        (this model has none): just RGB feats | T feats | fused feats."""
+        if inputs.shape[1] == 6:
+            rgb, t = inputs[:, :3], inputs[:, 3:]
+        else:
+            B = inputs.shape[0] // 2
+            rgb, t = inputs[:B], inputs[B:]
+
+        def _run(r, x):
+            self.extract_feat(torch.cat([r, x], dim=0))
+            qs = self._last_quality
+            return (list(self._last_rgb_feats), list(self._last_t_feats),
+                    list(self._last_fused_feats),
+                    [q[0] for q in qs], [q[1] for q in qs])
+
+        zc_rgb, zc_t, fused, q_rgb, q_t = _run(rgb, t)
+
+        drgb, dt, _, _ = self.degrader(rgb, t, epoch=self.current_epoch)
+        (zc_rgb_d, zc_t_d, fused_d, q_rgb_d, q_t_d) = _run(drgb, dt)
+
+        out = dict(
+            zc_rgb=zc_rgb, zc_t=zc_t, final_fused=fused,
+            clean_rgb_img=rgb, clean_t_img=t,
+            zc_rgb_deg=zc_rgb_d, zc_t_deg=zc_t_d, final_fused_deg=fused_d,
+            deg_rgb_img=drgb, deg_t_img=dt,
+            deg_type_rgb='degraded', deg_type_t='degraded')
+        # quality is meaningful only when the mechanism is ON. With use_quality
+        # =False (E0b/E1) the scores are forced to 1 -> an all-red, info-less
+        # map. Omit the quality keys so the hook skips the quality grid.
+        if self.use_quality:
+            out.update(q_rgb_maps=q_rgb, q_t_maps=q_t,
+                       q_rgb_deg=q_rgb_d, q_t_deg=q_t_d)
+        return out
 
     def predict_with_missing(self, inputs, data_samples=None,
                              mask_rgb=False, mask_t=False):

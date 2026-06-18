@@ -41,7 +41,7 @@ model = dict(
 )
 
 custom_hooks = [
-    dict(type='TrainVisHook', interval=999999, num_samples=1),
+    dict(type='TrainVisHook', interval=5, num_samples=2),
     # RGB-missing / T-missing mIoU at every validation (whole-modality zeroed)
     dict(type='MissingModalityEvalHook', interval=1),
 ]

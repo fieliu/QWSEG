@@ -143,6 +143,10 @@ def _unwrap_model(model):
 
 def detect_model_type(model):
     type_name = type(model).__name__
+    if type_name == 'QualityDistillStudent':
+        return 'qd_student'
+    if type_name == 'QualityDistillTeacher':
+        return 'qd_teacher'
     if type_name == 'EncoderDecoder':
         return 'original'
     if type_name == 'RGBTv1Baseline':

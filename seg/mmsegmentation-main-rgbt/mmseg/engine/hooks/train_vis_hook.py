@@ -738,6 +738,11 @@ class TrainVisHook(Hook):
                 input_rgbt = torch.cat([input_rgb, input_ir], dim=0)
                 feats = model.extract_feat_vis(input_rgbt)
                 return feats
+            elif model_type in ('qd_student', 'qd_teacher'):
+                input_rgb = proc_inputs[:, :3, :, :]
+                input_ir = proc_inputs[:, 3:, :, :]
+                input_rgbt = torch.cat([input_rgb, input_ir], dim=0)
+                return model.extract_feat_vis(input_rgbt)
             elif model_type == 'v7_quality_adaptive':
                 input_rgb = proc_inputs[:, :3, :, :]
                 input_ir = proc_inputs[:, 3:, :, :]
@@ -1335,7 +1340,29 @@ class TrainVisHook(Hook):
                 q_info, rgb_vis=clean_rgb_cell, t_vis=clean_t_cell, aspect_ratio=aspect_ratio,
                 deg_q_info=deg_q_info, deg_rgb_vis=deg_rgb_vis, deg_t_vis=deg_t_vis)
             return feat_rows, q_grid, deg_feat_rows
-        elif model_type == 'v7_quality_adaptive':
+        elif model_type == 'qd_student':
+            # RGB feats | T feats | fused feats; clean block + degraded block.
+            feat_rows = _build_feat_rows(
+                [feats['zc_rgb'], feats['zc_t'], feats['final_fused']])
+            deg_feat_rows = _build_feat_rows(
+                [feats['zc_rgb_deg'], feats['zc_t_deg'], feats['final_fused_deg']])
+            # quality grid only when mechanism is ON (keys present, E2).
+            if feats.get('q_rgb_maps') is not None:
+                q_info = self._create_qd_quality_vis(feats, img_h=img_h, img_w=img_w)
+                deg_q_info = self._create_qd_deg_quality_vis(feats, img_h=img_h, img_w=img_w)
+                aspect_ratio = (img_w / max(img_h, 1)) if (img_h and img_w) else 1.0
+                clean_rgb_cell, clean_t_cell = self._render_clean_images(feats, runner.model)
+                deg_rgb_vis, deg_t_vis = self._render_degraded_images(
+                    feats, runner.model, raw_rgb=clean_rgb_cell, raw_t=clean_t_cell)
+                q_grid = self._compose_qd_quality_vis(
+                    q_info, rgb_vis=clean_rgb_cell, t_vis=clean_t_cell,
+                    aspect_ratio=aspect_ratio, deg_q_info=deg_q_info,
+                    deg_rgb_vis=deg_rgb_vis, deg_t_vis=deg_t_vis)
+            return feat_rows, q_grid, deg_feat_rows
+        elif model_type == 'qd_teacher':
+            # clean target: RGB feats | T feats | fused feats. No quality.
+            feat_rows = _build_feat_rows(
+                [feats['zc_rgb'], feats['zc_t'], feats['final_fused']])
             q_info = self._create_v9_quality_vis(feats, img_h=img_h, img_w=img_w)
             feat_rows = _build_feat_rows(
                 [feats['zc_rgb'], feats['zc_t'],
@@ -1653,6 +1680,79 @@ class TrainVisHook(Hook):
                 cell_h, cell_w, self.short_side, num_cols)
             rows.append(row)
         return np.concatenate(rows, axis=0)
+
+    def _create_qd_quality_vis(self, feats, img_h=None, img_w=None):
+        return self._qd_quality_info(feats.get('q_rgb_maps'),
+                                     feats.get('q_t_maps'), feats)
+
+    def _create_qd_deg_quality_vis(self, feats, img_h=None, img_w=None):
+        qr, qt = feats.get('q_rgb_deg'), feats.get('q_t_deg')
+        if qr is None or qt is None:
+            return None
+        return self._qd_quality_info(qr, qt, feats)
+
+    def _qd_quality_info(self, q_rgb, q_t, feats):
+        h, w = feats['zc_rgb'][0].shape[-2:]
+
+        def _np(t, i):
+            if t is None or t[i] is None:
+                return np.ones((h, w), dtype=np.float32)
+            return t[i][0, 0].detach().cpu().numpy()
+
+        stages = []
+        for i in range(len(q_rgb)):
+            stages.append(dict(
+                rgb_hm=_quality_to_rgb_heatmap(_np(q_rgb, i), h, w,
+                                               vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                t_hm=_quality_to_rgb_heatmap(_np(q_t, i), h, w,
+                                             vmin=0.0, vmax=1.0, cmap='rdBu_r'),
+                rgb_mask=(_np(q_rgb, i) >= self.mask_threshold).astype(np.float32),
+                t_mask=(_np(q_t, i) >= self.mask_threshold).astype(np.float32)))
+        return dict(stages=stages)
+
+    def _compose_qd_quality_vis(self, q_info, rgb_vis=None, t_vis=None,
+                                aspect_ratio=1.0, deg_q_info=None,
+                                deg_rgb_vis=None, deg_t_vis=None):
+        cell_h, cell_w = _compute_cell_size(self.short_side, aspect_ratio)
+        num_cols = 2
+        gap_s, block_gap = 5, 10
+        empty = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
+        total_w = cell_w * num_cols + (num_cols - 1) * gap_s
+
+        def _mask_vis(m):
+            m_r = cv2.resize(m, (cell_w, cell_h), interpolation=cv2.INTER_NEAREST)
+            v = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
+            v[:, :, 1] = (m_r * 255).astype(np.uint8)
+            return v
+
+        def _row(*cells):
+            r = _make_cell(cells[0] if cells[0] is not None else empty,
+                           cell_h, cell_w, self.short_side)
+            for c in cells[1:]:
+                r = np.concatenate([r, np.zeros((cell_h, gap_s, 3), dtype=np.uint8),
+                                    _make_cell(c if c is not None else empty,
+                                               cell_h, cell_w, self.short_side)], axis=1)
+            return r
+
+        def _block(info, rgb_c, t_c):
+            rr = []
+            rr.append(_row(rgb_c, t_c))
+            rr.append(np.zeros((gap_s, total_w, 3), dtype=np.uint8))
+            for s in info['stages']:
+                rr.append(_row(s['rgb_hm'], s['t_hm']))
+                rr.append(np.zeros((gap_s, total_w, 3), dtype=np.uint8))
+                rr.append(_row(_mask_vis(s['rgb_mask']), _mask_vis(s['t_mask'])))
+                rr.append(np.zeros((gap_s, total_w, 3), dtype=np.uint8))
+            return rr
+
+        def _cell(img):
+            return cv2.resize(img, (cell_w, cell_h)) if img is not None else empty.copy()
+
+        rows = _block(q_info, _cell(rgb_vis), _cell(t_vis))
+        if deg_q_info is not None:
+            rows.append(np.zeros((block_gap, total_w, 3), dtype=np.uint8))
+            rows.extend(_block(deg_q_info, _cell(deg_rgb_vis), _cell(deg_t_vis)))
+        return np.concatenate(rows, axis=0) if rows else empty
 
     def _create_v9_quality_vis(self, feats, img_h=None, img_w=None):
         q_rgb = feats['q_rgb_maps']

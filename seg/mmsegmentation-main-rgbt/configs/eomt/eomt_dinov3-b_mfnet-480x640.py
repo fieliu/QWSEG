@@ -25,10 +25,11 @@ data_preprocessor = dict(
     size=crop_size,
     test_cfg=dict(size_divisor=16))
 
-# Path to a locally-saved HuggingFace DINOv3 ViT-B/16 model dir.
-# Local HF model dir (downloaded to pretrain/) -> fully offline. Set None to
-# attempt online download from `backbone_name` instead.
-backbone_ckpt = 'pretrain/dinov3-vitb16'
+# DINOv3 ViT-B/16 weights. Either a locally-saved HuggingFace model DIR, or a
+# RAW Meta .pth (state_dict from facebookresearch/dinov3 / llamameta) -- the
+# backbone auto-detects a ".pth" path and remaps Meta->HF keys in code. Set
+# None to attempt online download from `backbone_name` instead.
+backbone_ckpt = 'pretrain/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth'
 
 model = dict(
     type='EoMTSegmentor',

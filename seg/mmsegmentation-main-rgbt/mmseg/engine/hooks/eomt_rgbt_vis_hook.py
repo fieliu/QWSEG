@@ -104,17 +104,20 @@ class EoMTRGBTVisHook(Hook):
         was_training = model.training
         model.eval()
         try:
-            # data_preprocessor -> normalized 6-ch tensor on the model device
-            proc = model.data_preprocessor(
-                {'inputs': raw_inputs, 'data_samples': data_samples}, False)
-            x = proc['inputs']
-            n = min(self.num_samples, x.shape[0])
+            # MFNet train aug yields per-sample sizes -> the data_preprocessor
+            # rejects a mixed-size batch. Visualize the FIRST sample only, fed
+            # as a length-1 batch so the size-consistency assert always holds.
+            n = min(self.num_samples, len(raw_inputs))
             grid = model.network.encoder.backbone.patch_embed.grid_size
 
             grids = []
             with torch.no_grad():
                 for bi in range(n):
-                    xi = x[bi:bi + 1]
+                    proc = model.data_preprocessor(
+                        {'inputs': [raw_inputs[bi]],
+                         'data_samples': [data_samples[bi]] if data_samples else None},
+                        False)
+                    xi = proc['inputs']
                     rgb, t = model._split(xi)
                     # degrade exactly like training (single forward), then read
                     # the quality/merged-feature side-channels the model stores.

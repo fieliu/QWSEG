@@ -108,6 +108,8 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
 
         fp_to_seg = {p: i + 1 for i, p in enumerate(self.fusion_points)}
         all_quality = []  # (s_rgb, s_t) per segment boundary, for vis/supervision
+        # per-segment feats for Swin-style 3-col vis: RGB / T (pre-merge) / fused
+        vis_rgb, vis_t, vis_fused = [], [], []
         self._fuse_call = 0
 
         # quality for segment 0 (from embedded tokens)
@@ -126,6 +128,12 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
                 seg = fp_to_seg[i]
                 s_rgb, s_t = self._eval_quality(seg, z_rgb, z_t)
                 all_quality.append((s_rgb, s_t))
+                # record this fusion stage: pre-merge streams + their merge
+                # (vis only -- skip during training to avoid extra merge cost)
+                if not self.training:
+                    vis_rgb.append(z_rgb)
+                    vis_t.append(z_t)
+                    vis_fused.append(self._merge_q(z_rgb, z_t, s_rgb, s_t, seg))
                 b_rgb = quality_score_to_token_bias(s_rgb, self.bias_alpha, self.bias_gamma)
                 b_t = quality_score_to_token_bias(s_t, self.bias_alpha, self.bias_gamma)
             # each stream suppresses ITS OWN low-quality tokens as keys:
@@ -138,6 +146,16 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         self._all_quality = all_quality
         self._last_quality = all_quality[-1]
         self._last_merged_feat = z          # [B,N,C], for visualization
+        # final stage feats for vis (last fusion's streams + the real merge)
+        if not self.training:
+            if not vis_rgb:            # no fusion point hit (single-segment): seed
+                vis_rgb.append(z_rgb)
+                vis_t.append(z_t)
+            else:
+                vis_fused[-1] = z      # replace last stage's merge with the real one
+            self._vis_rgb_feats = vis_rgb
+            self._vis_t_feats = vis_t
+            self._vis_fused_feats = vis_fused if vis_fused else [z]
 
         # ---- EoMT query-decode stage (unchanged; merged tokens are clean) ----
         attn_mask = None

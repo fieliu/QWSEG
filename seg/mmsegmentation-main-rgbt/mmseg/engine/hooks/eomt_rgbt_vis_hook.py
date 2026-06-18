@@ -123,11 +123,15 @@ class EoMTRGBTVisHook(Hook):
                     ml, cl = model._dual_stream_forward(drgb, dir_)
                     all_q = model._all_quality
                     merged = model._last_merged_feat
+                    stage_feats = (
+                        getattr(model, '_vis_rgb_feats', None),
+                        getattr(model, '_vis_t_feats', None),
+                        getattr(model, '_vis_fused_feats', None))
                     pred = self._predict(model, ml, cl, xi)
                     grids.append(self._compose(
                         drgb, dir_, all_q, merged, grid,
                         data_samples[bi] if data_samples else None,
-                        pred, palette))
+                        pred, palette, stage_feats))
             self._save(grids, epoch)
             runner.logger.info(
                 f'EoMTRGBTVisHook: epoch {epoch}, {n} samples -> {self._vis_dir}')
@@ -162,7 +166,8 @@ class EoMTRGBTVisHook(Hook):
                              cv2.COLOR_BGR2RGB)
         return self._cell(v, h, w)
 
-    def _compose(self, drgb, dir_, all_q, merged, grid, sample, pred, palette):
+    def _compose(self, drgb, dir_, all_q, merged, grid, sample, pred, palette,
+                 stage_feats=None):
         s = self.short_side
         cell = lambda im: self._cell(im, s, s)  # noqa: E731
 
@@ -192,6 +197,19 @@ class EoMTRGBTVisHook(Hook):
                 cell(_quality_to_red_blue(q_t, s, s)),
                 mcell,
                 np.zeros((s, s, 3), np.uint8)], axis=1))
+
+        # Swin-style per-stage feature block: pre-merge RGB | pre-merge T |
+        # fused. One row per fusion stage. 4th column blank to match width.
+        rgb_f, t_f, fused_f = stage_feats if stage_feats else (None, None, None)
+        if rgb_f:
+            blank = np.zeros((s, s, 3), np.uint8)
+            for si in range(len(rgb_f)):
+                def _ft(seq):
+                    if seq is None or si >= len(seq) or seq[si] is None:
+                        return blank
+                    return cell(_feat_top3_rgb(_seq_to_2d_feat(seq[si], grid)))
+                rows.append(np.concatenate([
+                    _ft(rgb_f), _ft(t_f), _ft(fused_f), blank], axis=1))
         return np.concatenate(rows, axis=0)
 
     def _save(self, grids, epoch):

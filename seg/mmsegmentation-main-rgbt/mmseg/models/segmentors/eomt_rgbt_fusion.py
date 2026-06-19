@@ -96,6 +96,7 @@ class EoMTRGBTFusion(EoMTSegmentor):
 
         # ---- merge into a single token sequence ----
         z = self._merge(z_rgb, z_t, quality_info=quality_info)
+        self._last_merged_feat = z  # [B,N,C], exposed as a distillation target
 
         # ---- EoMT query-decode stage: blocks [decode_start, num_layers) ----
         attn_mask = None
@@ -175,4 +176,21 @@ class EoMTRGBTFusion(EoMTSegmentor):
         if mask_t:
             inputs[:, 3:] = 0
         return self.predict(inputs, data_samples)
+
+    @torch.no_grad()
+    def forward_distill_targets(self, rgb, t):
+        """Clean-input distillation targets for the student (E1/E2).
+
+        Runs one clean dual-stream forward and returns:
+          - merged_feat [B, N, C]: the post-fusion merged token sequence
+            (feature-distillation target, matches the student's
+            self._last_merged_feat),
+          - class_map [B, num_classes, h, w]: the permutation-invariant
+            per-pixel class map (output-distillation target; the einsum result
+            sidesteps Mask2Former's arbitrary query order).
+        """
+        from .eomt_utils import mask_class_to_seg_logits
+        ml_layers, cl_layers = self._dual_stream_forward(rgb, t)
+        class_map = mask_class_to_seg_logits(ml_layers[-1], cl_layers[-1])
+        return self._last_merged_feat, class_map
 

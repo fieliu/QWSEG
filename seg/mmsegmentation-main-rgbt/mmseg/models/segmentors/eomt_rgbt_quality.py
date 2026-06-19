@@ -23,6 +23,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mmseg.registry import MODELS
+from mmengine.runner import load_checkpoint
+from mmengine.logging import print_log
 from .eomt_rgbt_fusion import EoMTRGBTFusion
 from .eomt_fusion_blocks import TokenQualityPredictor, TokenCrossModalCompensation
 from .degradation import DegradationGenerator
@@ -38,8 +40,14 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
                  fuse_tau=0.5,
                  bias_alpha=4.0,
                  bias_gamma=3.0,
+                 use_quality=True,
                  use_self_attn_bias=True,
                  use_compensation=True,
+                 teacher_cfg=None,
+                 teacher_ckpt=None,
+                 init_from_teacher=True,
+                 distill_loss_weight=1.0,
+                 output_distill_weight=1.0,
                  degradation=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
@@ -60,11 +68,53 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         self.fuse_tau = fuse_tau
         self.bias_alpha = bias_alpha
         self.bias_gamma = bias_gamma
-        self.use_self_attn_bias = use_self_attn_bias
-        self.use_compensation = use_compensation
+        # master switch: use_quality=False (E0b/E1) forces quality=1 everywhere,
+        # which makes the bias (-a*(1-1)^g=0), the merge (softmax([1,1])=mean) and
+        # the compensation (x*1+0=x) all collapse to the EoMTRGBTFusion baseline.
+        # The two fine-grained switches are slaved to it so they can't re-enable
+        # mechanism pieces when the master is off.
+        self.use_quality = use_quality
+        self.use_self_attn_bias = use_self_attn_bias and use_quality
+        self.use_compensation = use_compensation and use_quality
 
         # wrap each backbone block's attention so we can inject a pre-softmax
-        # quality key-bias into the modality-internal self-attention.
+        # quality key-bias into the modality-internal self-attention. Done AFTER
+        # the teacher warm-start below would change key names, so the warm-start
+        # must run first -> defer wrapping to the end of __init__.
+
+        self.distill_loss_weight = distill_loss_weight
+        self.output_distill_weight = output_distill_weight
+
+        # frozen clean teacher (same EoMTRGBTFusion arch) for distillation.
+        # Built BEFORE attention wrapping so the warm-start load_state_dict sees
+        # matching key names (network...blocks.{i}.attn.* on both sides).
+        self.teacher = None
+        if teacher_cfg is not None:
+            self.teacher = MODELS.build(teacher_cfg)
+            if teacher_ckpt is not None:
+                load_checkpoint(self.teacher, teacher_ckpt, map_location='cpu')
+            # warm-start: copy the SHARED params (backbone / fusions / q / norms)
+            # from the trained teacher into the student as a TRAINABLE start.
+            # Student-only modules (quality_predictors / compensate) and the
+            # frozen teacher.* copy fall into `missing` and keep their own init.
+            if init_from_teacher and teacher_ckpt is not None:
+                missing, unexpected = self.load_state_dict(
+                    self.teacher.state_dict(), strict=False)
+                loaded = sum(1 for _ in self.teacher.state_dict())
+                student_only = [k for k in missing
+                                if not k.startswith('teacher.')]
+                print_log(
+                    f'EoMTRGBTQuality warm-start from teacher: '
+                    f'~{loaded} shared params loaded; '
+                    f'{len(student_only)} student-only params kept own init; '
+                    f'{len(unexpected)} unexpected.', logger='current')
+            self.teacher.eval()
+            for p in self.teacher.parameters():
+                p.requires_grad = False
+
+        # NOW wrap attention (after warm-start). Wrapping renames attn -> attn.attn
+        # internally, but the wrapper delegates so EoMT's _attn still works, and
+        # the optimizer's 'network.encoder.backbone' prefix still matches.
         if self.use_self_attn_bias:
             self._attn_wrappers = wrap_backbone_attention(
                 self.network.encoder.backbone)
@@ -77,6 +127,15 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         self._last_quality = None
         self._all_quality = None
         self._last_merged_feat = None
+
+    def train(self, mode=True):
+        # keep the teacher in eval ALWAYS: nn.Module.train() is recursive and
+        # would otherwise re-enable the teacher's dropout, making distillation
+        # targets noisy.
+        super().train(mode)
+        if self.teacher is not None:
+            self.teacher.eval()
+        return self
 
     # ---- run one block on one stream, optionally injecting a self-attn bias ----
     def _run_block_q(self, block, net, x, rope, kv_bias):
@@ -181,6 +240,12 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         return ml_layers, cl_layers
 
     def _eval_quality(self, seg, z_rgb, z_t):
+        # mechanism OFF (E0b/E1): force quality to 1 so the bias collapses to 0,
+        # the merge to a plain mean, and compensation to identity -> exactly the
+        # EoMTRGBTFusion baseline, with no quality params on the grad path.
+        if not self.use_quality:
+            ones = z_rgb.new_ones(z_rgb.shape[0], z_rgb.shape[1], 1)
+            return ones, ones
         qp = self.quality_predictors[seg]
         return qp(z_rgb, z_t), qp(z_t, z_rgb)   # [B,N,1] each
 
@@ -253,11 +318,59 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
             for k, v in self.criterion(ml_up, targets, cl).items():
                 losses[f"l{li}.{k}"] = v
 
-        # quality supervision (masked BCE on token grid)
-        if self.quality_loss_weight > 0 and quality_info:
+        # quality supervision (masked BCE on token grid). Only when the
+        # mechanism is on -- with use_quality=False the scores are forced to 1
+        # and carry no learnable signal.
+        if self.use_quality and self.quality_loss_weight > 0 and quality_info:
             grid = self.network.encoder.backbone.patch_embed.grid_size
             m_rgb_tok = self._mask_to_token(mask_rgb, grid)
             m_t_tok = self._mask_to_token(mask_t, grid)
             losses["loss_quality"] = self.quality_loss_weight * self._quality_loss(
                 quality_info, m_rgb_tok, m_t_tok)
+
+        # distillation vs the frozen clean teacher (feature + output). The
+        # student's _dual_stream_forward already cached its merged feature; the
+        # teacher provides the clean-input targets. Gate by max(s_rgb, s_t): with
+        # use_quality=False the gate is 1 everywhere (ungated, plain distill).
+        if self.teacher is not None and (
+                self.distill_loss_weight > 0 or self.output_distill_weight > 0):
+            student_merged = self._last_merged_feat            # [B,N,C] (degraded)
+            with torch.no_grad():
+                t_merged, t_class_map = self.teacher.forward_distill_targets(rgb, t)
+            s_rgb, s_t = quality_info[-1]
+            gate_tok = torch.maximum(s_rgb, s_t)               # [B,N,1]
+            if self.distill_loss_weight > 0:
+                diff = (student_merged - t_merged.detach()) ** 2
+                losses["loss_distill_feat"] = self.distill_loss_weight * \
+                    (gate_tok * diff).mean()
+            if self.output_distill_weight > 0:
+                # student per-pixel class map (permutation-invariant einsum)
+                student_class_map = mask_class_to_seg_logits(
+                    ml_layers[-1], cl_layers[-1])
+                gate_grid = self._token_gate_to_grid(
+                    gate_tok, student_class_map.shape[-2:])
+                losses["loss_distill_out"] = self.output_distill_weight * \
+                    self._output_distill_loss(
+                        student_class_map, t_class_map.detach(), gate_grid)
         return losses
+
+    # ---- distillation helpers ----
+    def _token_gate_to_grid(self, gate_tok, out_hw):
+        """[B,N,1] token gate -> [B,1,h,w] at out_hw. Drops leading prefix
+        tokens (cls/register) if present, reshapes to the patch grid, and
+        bilinearly resizes to the class-map resolution."""
+        gh, gw = self.network.encoder.backbone.patch_embed.grid_size
+        g = gate_tok.squeeze(-1)                       # [B, N]
+        if g.shape[1] > gh * gw:                       # drop prefix tokens
+            g = g[:, g.shape[1] - gh * gw:]
+        g = g.view(g.shape[0], 1, gh, gw)
+        return F.interpolate(g, size=out_hw, mode="bilinear", align_corners=False)
+
+    def _output_distill_loss(self, s_logits, t_logits, gate, eps=1e-6):
+        """Permutation-invariant per-pixel KL between student and teacher class
+        maps (both in [0,1] from the einsum), normalized to per-pixel
+        distributions and quality-gated (relax where both modalities are weak)."""
+        s = s_logits / (s_logits.sum(1, keepdim=True) + eps)
+        t = t_logits / (t_logits.sum(1, keepdim=True) + eps)
+        kl = (t * ((t + eps).log() - (s + eps).log())).sum(1, keepdim=True)
+        return (gate * kl).mean()

@@ -42,6 +42,23 @@ class QualityDistillTeacher(SwinMulV6Mask2Former):
             fused_feats = self.neck(fused_feats)
         return fused_feats
 
+    def predict_with_missing(self, inputs, data_samples=None,
+                             mask_rgb=False, mask_t=False):
+        """Predict with one modality zeroed (whole-modality missing).
+
+        RGB = channels 0:3, T = channels 3:6 (matches MissingModalityEvalHook).
+        The teacher has NO quality mechanism, so this is a plain zero-input
+        baseline -- it quantifies how much a clean-trained fusion model
+        degrades under a missing modality, the contrast the student improves on.
+        Reuses the inherited predict() so postprocess matches the clean path.
+        """
+        inputs = inputs.clone()
+        if mask_rgb:
+            inputs[:, :3] = 0
+        if mask_t:
+            inputs[:, 3:] = 0
+        return self.predict(inputs, data_samples)
+
     @torch.no_grad()
     def extract_feat_vis(self, inputs):
         """Visualization hook entry. inputs: 6ch RGB-T OR batch-doubled cat.
@@ -59,7 +76,10 @@ class QualityDistillTeacher(SwinMulV6Mask2Former):
             final_fused=list(self._last_fused_feats),
             clean_rgb_img=rgb, clean_t_img=t)
 
-        """inputs: 6-channel RGB-T. Returns list of pre-neck fused stage feats."""
+    def extract_fused_for_distill(self, inputs):
+        """inputs: 6-channel RGB-T. Returns the list of PRE-neck fused stage
+        feats -- the per-stage distillation targets for QualityDistillStudent.
+        extract_feat sets self._last_fused_feats to the pre-neck fused feats."""
         input_rgb, input_ir = inputs[:, :3], inputs[:, 3:]
         rgbt = torch.cat([input_rgb, input_ir], dim=0)
         self.extract_feat(rgbt)

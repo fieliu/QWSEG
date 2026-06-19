@@ -35,3 +35,11 @@ default_hooks = dict(
     logger=dict(type='LoggerHook', interval=50, log_metric_by_epoch=True),
     checkpoint=dict(type='CheckpointHook', by_epoch=True, interval=5,
                     save_best='mIoU'))
+
+# teacher is the clean-trained, no-quality baseline -> also report its
+# missing-modality mIoU as the contrast the student is measured against.
+# (base V6 only ships TrainVisHook; append the eval hook, keep vis.)
+custom_hooks = [
+    dict(type='TrainVisHook', interval=5, num_samples=2),
+    dict(type='MissingModalityEvalHook', interval=5),
+]

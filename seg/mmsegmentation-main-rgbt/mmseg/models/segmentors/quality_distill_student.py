@@ -37,6 +37,7 @@ class QualityDistillStudent(QualityDistillTeacher):
                  quality_loss_weight=1.0,
                  distill_loss_weight=1.0,
                  output_distill_weight=1.0,
+                 distill_temperature=4.0,
                  bias_alpha=4.0,
                  bias_gamma=3.0,
                  degradation=None,
@@ -56,6 +57,7 @@ class QualityDistillStudent(QualityDistillTeacher):
         self.quality_loss_weight = quality_loss_weight
         self.distill_loss_weight = distill_loss_weight
         self.output_distill_weight = output_distill_weight
+        self.distill_temperature = distill_temperature
         self.bias_alpha = bias_alpha
         self.bias_gamma = bias_gamma
         self.current_epoch = 0
@@ -266,7 +268,11 @@ class QualityDistillStudent(QualityDistillTeacher):
         n = 0
         for sf, tf, (s_rgb, s_t) in zip(student_feats, teacher_feats, quality_scores):
             gate = torch.maximum(s_rgb, s_t)  # [B,1,H,W] high where any modality good
-            diff = (sf - tf.detach()) ** 2
+            # L2-normalize per-pixel feature vectors over channels (dim=1) before
+            # MSE -> direction (cosine-like) match, not dominated by scale.
+            sfn = F.normalize(sf, dim=1)
+            tfn = F.normalize(tf.detach(), dim=1)
+            diff = (sfn - tfn) ** 2
             total = total + (gate * diff).mean()
             n += 1
         return total / max(n, 1)
@@ -310,15 +316,20 @@ class QualityDistillStudent(QualityDistillTeacher):
         if t_prob.shape[-2:] != s_prob.shape[-2:]:
             t_prob = F.interpolate(t_prob, size=s_prob.shape[-2:],
                                    mode='bilinear', align_corners=False)
-        # normalize to proper distributions FIRST, then KL with log of the
-        # already-normalized probs (adding eps to normalized probs would break
-        # sum-to-1 and let KL go negative -- observed loss_distill_out < 0).
+        # normalize to proper distributions, temperature-soften via p^(1/T)
+        # (these are einsum prob maps, not logits, so softmax(logits/T) doesn't
+        # apply; p^(1/T) flattens the per-pixel distribution to surface dark
+        # knowledge), then KL scaled by T^2 (standard Hinton-KD correction).
+        T = self.distill_temperature
         s = s_prob.clamp_min(0) + eps
         t = t_prob.clamp_min(0) + eps
         s = s / s.sum(1, keepdim=True)
         t = t / t.sum(1, keepdim=True)
+        if T != 1.0:
+            s = s ** (1.0 / T); s = s / s.sum(1, keepdim=True)
+            t = t ** (1.0 / T); t = t / t.sum(1, keepdim=True)
         kl = (t * (t.log() - s.log())).sum(1, keepdim=True)  # >= 0
-        return (gate * kl.clamp_min(0)).mean()
+        return (T * T) * (gate * kl.clamp_min(0)).mean()
 
     def loss(self, inputs, data_samples):
         # E2 (use_quality=True): PAIRED multi-level degradation for quality

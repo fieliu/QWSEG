@@ -48,6 +48,7 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
                  init_from_teacher=True,
                  distill_loss_weight=1.0,
                  output_distill_weight=1.0,
+                 distill_temperature=4.0,
                  degradation=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
@@ -84,6 +85,7 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
 
         self.distill_loss_weight = distill_loss_weight
         self.output_distill_weight = output_distill_weight
+        self.distill_temperature = distill_temperature
 
         # frozen clean teacher (same EoMTRGBTFusion arch) for distillation.
         # Built BEFORE attention wrapping so the warm-start load_state_dict sees
@@ -416,7 +418,12 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         s_rgb, s_t = quality_info[-1]
         gate_tok = torch.maximum(s_rgb, s_t)               # [B,N,1]
         if self.distill_loss_weight > 0:
-            diff = (student_merged - t_merged.detach()) ** 2
+            # L2-normalize per-token feature vectors before MSE so the loss is a
+            # direction (cosine-like) match, not dominated by large-magnitude
+            # channels / overall scale differences (more standard than raw MSE).
+            sf = F.normalize(student_merged, dim=-1)
+            tf = F.normalize(t_merged.detach(), dim=-1)
+            diff = (sf - tf) ** 2
             losses["loss_distill_feat"] = self.distill_loss_weight * \
                 (gate_tok * diff).mean()
         if self.output_distill_weight > 0:
@@ -442,16 +449,28 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
 
     def _output_distill_loss(self, s_logits, t_logits, gate, eps=1e-6):
         """Permutation-invariant per-pixel KL between student and teacher class
-        maps (both in [0,1] from the einsum), normalized to per-pixel
-        distributions and quality-gated (relax where both modalities are weak).
+        maps (both in [0,1] from the einsum), TEMPERATURE-softened and
+        quality-gated (relax where both modalities are weak).
 
-        Normalize to proper distributions FIRST (clamp then renormalize so each
-        sums to 1), then KL with log of the already-normalized probs -- adding
-        eps only inside log for numerical safety, NOT to the normalized probs
-        (that would break the sum-to-1 property and let KL go negative)."""
+        These maps are already probability-like (einsum of cls.softmax x
+        mask.sigmoid), not raw logits, so standard softmax(logits/T) doesn't
+        apply. We temperature-soften the per-pixel distribution directly via
+        p^(1/T) renormalized (T>1 flattens it, amplifying the non-peak classes =
+        the 'dark knowledge' that makes distillation useful), then KL, scaled by
+        T^2 to keep the gradient magnitude comparable across temperatures (the
+        standard Hinton-KD T^2 correction).
+
+        NOTE: temperature only helps if the teacher carries knowledge the student
+        lacks. With same-backbone + warm-start (small teacher-student gap) the
+        gain may stay limited regardless of T -- a design limit, not an impl bug.
+        """
+        T = self.distill_temperature
         s = s_logits.clamp_min(0) + eps
         t = t_logits.clamp_min(0) + eps
         s = s / s.sum(1, keepdim=True)        # proper per-pixel distribution
         t = t / t.sum(1, keepdim=True)
+        if T != 1.0:                          # temperature-soften via p^(1/T)
+            s = s ** (1.0 / T); s = s / s.sum(1, keepdim=True)
+            t = t ** (1.0 / T); t = t / t.sum(1, keepdim=True)
         kl = (t * (t.log() - s.log())).sum(1, keepdim=True)  # >= 0
-        return (gate * kl.clamp_min(0)).mean()
+        return (T * T) * (gate * kl.clamp_min(0)).mean()

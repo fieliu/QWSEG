@@ -133,10 +133,15 @@ class EoMTRGBTVisHook(Hook):
             feat_grids, qual_grids = [], []
             with torch.no_grad():
                 for bi in range(n):
+                    # training=True so the preprocessor pads/crops to crop_size
+                    # (e.g. 480x640) -> token count matches the backbone's FIXED
+                    # patch_embed.grid_size. With training=False it keeps the
+                    # raw augmented size, the token count != grid_size, and
+                    # EoMT._predict's reshape to grid_size crashes.
                     proc = model.data_preprocessor(
                         {'inputs': [raw_inputs[bi]],
                          'data_samples': [data_samples[bi]] if data_samples else None},
-                        False)
+                        True)
                     xi = proc['inputs']
                     rgb, t = model._split(xi)
                     sample = data_samples[bi] if data_samples else None

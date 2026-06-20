@@ -443,8 +443,15 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
     def _output_distill_loss(self, s_logits, t_logits, gate, eps=1e-6):
         """Permutation-invariant per-pixel KL between student and teacher class
         maps (both in [0,1] from the einsum), normalized to per-pixel
-        distributions and quality-gated (relax where both modalities are weak)."""
-        s = s_logits / (s_logits.sum(1, keepdim=True) + eps)
-        t = t_logits / (t_logits.sum(1, keepdim=True) + eps)
-        kl = (t * ((t + eps).log() - (s + eps).log())).sum(1, keepdim=True)
-        return (gate * kl).mean()
+        distributions and quality-gated (relax where both modalities are weak).
+
+        Normalize to proper distributions FIRST (clamp then renormalize so each
+        sums to 1), then KL with log of the already-normalized probs -- adding
+        eps only inside log for numerical safety, NOT to the normalized probs
+        (that would break the sum-to-1 property and let KL go negative)."""
+        s = s_logits.clamp_min(0) + eps
+        t = t_logits.clamp_min(0) + eps
+        s = s / s.sum(1, keepdim=True)        # proper per-pixel distribution
+        t = t / t.sum(1, keepdim=True)
+        kl = (t * (t.log() - s.log())).sum(1, keepdim=True)  # >= 0
+        return (gate * kl.clamp_min(0)).mean()

@@ -310,10 +310,15 @@ class QualityDistillStudent(QualityDistillTeacher):
         if t_prob.shape[-2:] != s_prob.shape[-2:]:
             t_prob = F.interpolate(t_prob, size=s_prob.shape[-2:],
                                    mode='bilinear', align_corners=False)
-        s = s_prob / (s_prob.sum(1, keepdim=True) + eps)
-        t = t_prob / (t_prob.sum(1, keepdim=True) + eps)
-        kl = (t * ((t + eps).log() - (s + eps).log())).sum(1, keepdim=True)
-        return (gate * kl).mean()
+        # normalize to proper distributions FIRST, then KL with log of the
+        # already-normalized probs (adding eps to normalized probs would break
+        # sum-to-1 and let KL go negative -- observed loss_distill_out < 0).
+        s = s_prob.clamp_min(0) + eps
+        t = t_prob.clamp_min(0) + eps
+        s = s / s.sum(1, keepdim=True)
+        t = t / t.sum(1, keepdim=True)
+        kl = (t * (t.log() - s.log())).sum(1, keepdim=True)  # >= 0
+        return (gate * kl.clamp_min(0)).mean()
 
     def loss(self, inputs, data_samples):
         # E2 (use_quality=True): PAIRED multi-level degradation for quality

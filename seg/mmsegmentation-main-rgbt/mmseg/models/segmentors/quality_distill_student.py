@@ -253,11 +253,42 @@ class QualityDistillStudent(QualityDistillTeacher):
     # ---- output distillation: PERMUTATION-INVARIANT per-pixel semantic map.
     # NOTE: per-query mask logits can't be distilled directly -- Mask2Former's
     # Hungarian matching makes query order arbitrary, so teacher query i != student
-    # query i. predict() returns the einsum'd per-pixel class map (in [0,1]),
-    # which IS permutation-invariant. We normalize it to a per-pixel class
-    # distribution and distill with quality-GATED KL (relax where both modalities
-    # missing, i.e. the target is unreachable).
+    # query i. The einsum'd per-pixel class map (cls.softmax x mask.sigmoid) IS
+    # permutation-invariant. We build it from the TRAINING forward's raw query
+    # outputs (NOT decode_head.predict), normalize to a per-pixel class
+    # distribution, and distill with quality-GATED KL.
+    #
+    # IMPORTANT: do NOT use decode_head.predict() here. predict() re-runs the head
+    # AND resizes mask logits to batch_img_metas['pad_shape'] -- which at training
+    # time is the AUGMENTED random crop size. Distilling against that pulls the
+    # head toward a train-metainfo-specific solution that is mis-scaled at val
+    # time (observed: val aAcc ~1%, class indices scrambled, while train loss
+    # looks healthy). Building the class map from the head's own (cls, mask)
+    # forward outputs at their native feature resolution is metainfo-free and
+    # matches the DINOv3 EoMT path.
+    def _head_class_map(self, head, feats, data_samples):
+        """Permutation-invariant per-pixel class map from a Mask2Former head's
+        TRAINING forward. Returns [B, num_classes, h, w] at the mask logits'
+        native resolution.
+
+        Uses head(feats, data_samples) -- the SAME forward the training loss
+        uses -- NOT predict(). predict() resizes mask logits to
+        batch_img_metas['pad_shape'] (the augmented train crop size at train
+        time), which corrupts the distillation target and scrambles val-time
+        class indices (val aAcc ~1% while train loss looks fine). The raw
+        forward outputs are at the head's native mask resolution, metainfo only
+        affects the internal padding mask, not the output scale."""
+        all_cls, all_mask = head(feats, data_samples)
+        cls_score = all_cls[-1].float().softmax(dim=-1)[..., :-1]  # drop no-object
+        mask_pred = all_mask[-1].float().sigmoid()
+        return torch.einsum('bqc,bqhw->bchw', cls_score, mask_pred)
+
     def _output_distill_loss(self, s_prob, t_prob, gate, eps=1e-6):
+        # align teacher map to student resolution if they differ (both are at
+        # native mask resolution; same arch -> normally identical, guard anyway)
+        if t_prob.shape[-2:] != s_prob.shape[-2:]:
+            t_prob = F.interpolate(t_prob, size=s_prob.shape[-2:],
+                                   mode='bilinear', align_corners=False)
         s = s_prob / (s_prob.sum(1, keepdim=True) + eps)
         t = t_prob / (t_prob.sum(1, keepdim=True) + eps)
         kl = (t * ((t + eps).log() - (s + eps).log())).sum(1, keepdim=True)
@@ -291,16 +322,17 @@ class QualityDistillStudent(QualityDistillTeacher):
                 losses['loss_distill_feat'] = self.distill_loss_weight * \
                     self._feat_distill_loss(student_fused, teacher_fused, quality_scores)
             if self.output_distill_weight > 0:
-                bm = [d.metainfo for d in data_samples]
-                student_prob = self.decode_head.predict(
-                    fused_feats, bm, self.test_cfg)
+                # build per-pixel class maps from the TRAINING forward (no
+                # predict(), no pad_shape resize -- see _head_class_map).
+                student_prob = self._head_class_map(
+                    self.decode_head, fused_feats, data_samples)
                 with torch.no_grad():
                     t_feats = teacher_fused
                     if self.teacher.with_neck:
                         t_feats = self.teacher.neck(teacher_fused)
-                    teacher_prob = self.teacher.decode_head.predict(
-                        t_feats, bm, self.teacher.test_cfg)
-                # quality gate at output resolution: relax where BOTH missing
+                    teacher_prob = self._head_class_map(
+                        self.teacher.decode_head, t_feats, data_samples)
+                # quality gate at output (mask) resolution: relax where both weak
                 s_rgb0, s_t0 = quality_scores[0]
                 gate = torch.maximum(s_rgb0, s_t0)
                 gate = F.interpolate(gate, size=student_prob.shape[-2:],

@@ -300,6 +300,10 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         return total / max(z, 1)
 
     def _quality_loss(self, quality_info, mask_rgb_tok, mask_t_tok):
+        """DEPRECATED (not called). Old binary BCE quality supervision
+        (degraded->0, clean->1). Replaced by _rank_loss (paired light/heavy
+        ranking) because binary supervision collapsed the quality score to a
+        2-valued detector. Kept for a potential BCE-vs-rank ablation."""
         """For every fusion point's scores, supervise only the EXTREME-certain
         positions: degraded (any severity) -> target 0, clean -> target 1.
         Positions that are neither fully-clean nor degraded are ignored."""

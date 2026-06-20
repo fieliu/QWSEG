@@ -140,6 +140,10 @@ class QualityDistillStudent(QualityDistillTeacher):
                 # mechanism OFF (E0b/E1): no bias, quality forced to 1.
                 for block in stage.blocks:
                     x = block(x, (H, W), quality_bias=None)
+                # match the per-modality batch B (x_rgb_in/x_t_in are x_2d[:B]/
+                # [B:], each B). B == per-modality count for both the single path
+                # (B=B_orig) and the paired path (B=2*B_orig); use B, not B_tok
+                # (=2B, the full rgb+t stack), so s_rgb/s_t align with x_rgb_in.
                 ones = x.new_ones(B, 1, H, W)
                 s_rgb = s_t = ones
 
@@ -250,6 +254,10 @@ class QualityDistillStudent(QualityDistillTeacher):
     # cross-modal ordering constraint can be wrong. Absolute per-modality BCE +
     # the downstream seg loss handle "which modality to trust per location".
     def _quality_losses(self, quality_scores, mask_rgb, mask_t):
+        """DEPRECATED (not called). Old binary BCE quality supervision; replaced
+        by _rank_loss_spatial (paired light/heavy ranking) because binary
+        supervision collapsed the quality score to a 2-valued detector. Kept for
+        a potential BCE-vs-rank ablation."""
         bce_total = 0.0
         n = 0
         for (s_rgb, s_t) in quality_scores:

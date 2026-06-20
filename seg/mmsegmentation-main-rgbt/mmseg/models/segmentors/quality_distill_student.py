@@ -189,7 +189,17 @@ class QualityDistillStudent(QualityDistillTeacher):
 
         zc_rgb, zc_t, fused, q_rgb, q_t = _run(rgb, t)
 
-        drgb, dt, _, _ = self.degrader(rgb, t, epoch=self.current_epoch)
+        # Degraded copy: for E2 (use_quality) visualize the HEAVY version of the
+        # training-time paired degradation (matches what the model is trained
+        # on); for E0b/E1 fall back to the single-level degrader.
+        if self.use_quality and hasattr(self.degrader, 'make_paired'):
+            mean = self.data_preprocessor.mean.flatten()
+            std = self.data_preprocessor.std.flatten()
+            (_lr, _li, h_rgb, h_ir, _rr, _ri) = self.degrader.make_paired(
+                rgb, t, mean, std, epoch=self.current_epoch)
+            drgb, dt = h_rgb, h_ir
+        else:
+            drgb, dt, _, _ = self.degrader(rgb, t, epoch=self.current_epoch)
         (zc_rgb_d, zc_t_d, fused_d, q_rgb_d, q_t_d) = _run(drgb, dt)
 
         out = dict(
@@ -295,10 +305,46 @@ class QualityDistillStudent(QualityDistillTeacher):
         return (gate * kl).mean()
 
     def loss(self, inputs, data_samples):
-        # Paradigm One: degrade internally, single forward on degraded input
+        # E2 (use_quality=True): PAIRED multi-level degradation for quality
+        # ranking (mirrors DINOv3 EoMTRGBTQuality). E0b/E1 (use_quality=False):
+        # single-level path (unchanged).
+        if self.use_quality:
+            return self._loss_paired(inputs, data_samples)
+        return self._loss_single(inputs, data_samples)
+
+    def _add_distill(self, losses, rgb, t, fused_feats, student_fused,
+                     quality_scores, data_samples):
+        """Feature + output distillation vs frozen clean teacher. Shared by the
+        single and paired paths; all args here are the LIGHT (or only) version."""
+        if self.teacher is None or (
+                self.distill_loss_weight <= 0 and self.output_distill_weight <= 0):
+            return
+        clean_input = torch.cat([rgb, t], dim=1)
+        with torch.no_grad():
+            teacher_fused = self.teacher.extract_fused_for_distill(clean_input)
+        if self.distill_loss_weight > 0:
+            losses['loss_distill_feat'] = self.distill_loss_weight * \
+                self._feat_distill_loss(student_fused, teacher_fused, quality_scores)
+        if self.output_distill_weight > 0:
+            student_prob = self._head_class_map(
+                self.decode_head, fused_feats, data_samples)
+            with torch.no_grad():
+                t_feats = teacher_fused
+                if self.teacher.with_neck:
+                    t_feats = self.teacher.neck(teacher_fused)
+                teacher_prob = self._head_class_map(
+                    self.teacher.decode_head, t_feats, data_samples)
+            s_rgb0, s_t0 = quality_scores[0]
+            gate = torch.maximum(s_rgb0, s_t0)
+            gate = F.interpolate(gate, size=student_prob.shape[-2:],
+                                 mode='bilinear', align_corners=False)
+            losses['loss_distill_out'] = self.output_distill_weight * \
+                self._output_distill_loss(student_prob, teacher_prob, gate)
+
+    # ---- E0b/E1 path: single-level degradation, no quality ranking ----
+    def _loss_single(self, inputs, data_samples):
         rgb, t = inputs[:, :3], inputs[:, 3:]
         drgb, dir_, mask_rgb, mask_t = self.degrader(rgb, t, epoch=self.current_epoch)
-
         rgbt = torch.cat([drgb, dir_], dim=0)
         fused_feats = self.extract_feat(rgbt)
         quality_scores = self._last_quality
@@ -306,40 +352,68 @@ class QualityDistillStudent(QualityDistillTeacher):
 
         losses = dict()
         losses.update(self._decode_head_forward_train(fused_feats, data_samples))
-
-        # quality supervision (0/1 BCE; ranking removed)
-        if self.use_quality and self.quality_loss_weight > 0:
-            bce = self._quality_losses(quality_scores, mask_rgb, mask_t)
-            losses['loss_quality_bce'] = self.quality_loss_weight * bce
-
-        # distillation vs frozen clean teacher (feature + output)
-        if self.teacher is not None and (
-                self.distill_loss_weight > 0 or self.output_distill_weight > 0):
-            clean_input = torch.cat([rgb, t], dim=1)
-            with torch.no_grad():
-                teacher_fused = self.teacher.extract_fused_for_distill(clean_input)
-            if self.distill_loss_weight > 0:
-                losses['loss_distill_feat'] = self.distill_loss_weight * \
-                    self._feat_distill_loss(student_fused, teacher_fused, quality_scores)
-            if self.output_distill_weight > 0:
-                # build per-pixel class maps from the TRAINING forward (no
-                # predict(), no pad_shape resize -- see _head_class_map).
-                student_prob = self._head_class_map(
-                    self.decode_head, fused_feats, data_samples)
-                with torch.no_grad():
-                    t_feats = teacher_fused
-                    if self.teacher.with_neck:
-                        t_feats = self.teacher.neck(teacher_fused)
-                    teacher_prob = self._head_class_map(
-                        self.teacher.decode_head, t_feats, data_samples)
-                # quality gate at output (mask) resolution: relax where both weak
-                s_rgb0, s_t0 = quality_scores[0]
-                gate = torch.maximum(s_rgb0, s_t0)
-                gate = F.interpolate(gate, size=student_prob.shape[-2:],
-                                     mode='bilinear', align_corners=False)
-                losses['loss_distill_out'] = self.output_distill_weight * \
-                    self._output_distill_loss(student_prob, teacher_prob, gate)
-
+        self._add_distill(losses, rgb, t, fused_feats, student_fused,
+                          quality_scores, data_samples)
         return losses
+
+    # ---- E2 path: paired light/heavy degradation + spatial rank quality loss --
+    def _loss_paired(self, inputs, data_samples):
+        rgb, t = inputs[:, :3], inputs[:, 3:]
+        mean = self.data_preprocessor.mean.flatten()
+        std = self.data_preprocessor.std.flatten()
+        (l_rgb, l_ir, h_rgb, h_ir, region_rgb, region_ir) = self.degrader.make_paired(
+            rgb, t, mean, std, epoch=self.current_epoch)
+        B = rgb.shape[0]
+
+        # Swin extract_feat takes cat([rgb, t], 0). Pack light+heavy into batch:
+        # cat([l_rgb, h_rgb, l_ir, h_ir], 0) -> inside, B'=2B, x_rgb=[l;h]rgb,
+        # x_t=[l;h]ir. Quality scores come out [2B,1,H,W] -> [:B]=light, [B:]=heavy.
+        rgbt = torch.cat([l_rgb, h_rgb, l_ir, h_ir], dim=0)
+        fused_feats = self.extract_feat(rgbt)        # list of [2B,C,H,W] per stage
+        quality_scores = self._last_quality          # list of ([2B,1,H,W],[2B,1,H,W])
+        student_fused = self._last_fused_feats
+
+        # segmentation loss on BOTH versions: fused_feats are [2B,...]; the head
+        # consumes them with duplicated targets (light + heavy share GT).
+        targets2 = list(data_samples) + list(data_samples)
+        losses = dict()
+        losses.update(self._decode_head_forward_train(fused_feats, targets2))
+
+        # rank-only quality loss: in the degraded modality, s(light) > s(heavy)
+        if self.quality_loss_weight > 0:
+            losses['loss_quality'] = self.quality_loss_weight * \
+                self._rank_loss_spatial(quality_scores, region_rgb, region_ir, B)
+
+        # distillation: align the LIGHT version (slice [:B]) to the clean teacher
+        light_fused = [f[:B] for f in fused_feats]
+        light_student_fused = [f[:B] for f in student_fused]
+        light_q = [(sr[:B], st[:B]) for (sr, st) in quality_scores]
+        self._add_distill(losses, rgb, t, light_fused, light_student_fused,
+                          light_q, data_samples)
+        return losses
+
+    # ---- spatial rank quality loss (Swin: scores are [B,1,H,W] per stage) ----
+    def _rank_loss_spatial(self, quality_scores, region_rgb, region_ir, B,
+                           margin=0.35):
+        """For each stage and each modality, on the DEGRADED modality's region
+        push the LIGHT quality above the HEAVY quality by at least `margin`:
+            L = mean max(0, margin - (s_light - s_heavy)).
+        quality_scores entries are [2B,1,H,W] (light=0:B, heavy=B:2B). Large
+        margin prevents the scale-collapse a pure pairwise rank can suffer.
+        Only the degraded modality carries signal (the clean modality is
+        identical in both versions). No absolute anchor -> absolute level free,
+        shaped by the segmentation task. Mirrors DINOv3 _rank_loss."""
+        total = z = 0.0
+        for (s_rgb, s_t) in quality_scores:
+            h, w = s_rgb.shape[-2:]
+            for s, reg in ((s_rgb, region_rgb), (s_t, region_ir)):
+                reg_d = F.adaptive_max_pool2d(reg, (h, w))   # [B,1,h,w]
+                s_light, s_heavy = s[:B], s[B:]              # [B,1,h,w] each
+                gap = s_light - s_heavy
+                hinge = (margin - gap).clamp_min(0.0)
+                denom = reg_d.sum().clamp_min(1.0)
+                total = total + (hinge * reg_d).sum() / denom
+                z += 1
+        return total / max(z, 1)
 
 

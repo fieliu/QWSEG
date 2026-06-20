@@ -21,16 +21,16 @@ model = dict(
 # ---- Epoch-based schedule (aligned with the DINOv3 EoMT configs) ----
 # The V6 base is iter-based (80k iters) which logs a broken "Epoch [1][N/588]"
 # counter. Switch to a clean epoch-based loop. MFNet train = 588 iters/epoch
-# (batch 2), so 200 epochs = 117600 iters. The LR scheduler stays in ITER
+# (batch 2), so 100 epochs = 58800 iters. The LR scheduler stays in ITER
 # units (epoch-loop + iter-scheduler is what the DINOv3 configs use too), so
 # the warmup/decay curve is identical to the original.
 param_scheduler = [
     dict(type='LinearLR', start_factor=1e-6, by_epoch=False, begin=0, end=1500),
-    dict(type='PolyLR', eta_min=0.0, power=0.9, begin=1500, end=117600,
+    dict(type='PolyLR', eta_min=0.0, power=0.9, begin=1500, end=58800,
          by_epoch=False),
 ]
 train_cfg = dict(_delete_=True, type='EpochBasedTrainLoop',
-                 max_epochs=200, val_interval=5)
+                 max_epochs=100, val_interval=5)
 default_hooks = dict(
     logger=dict(type='LoggerHook', interval=50, log_metric_by_epoch=True),
     checkpoint=dict(type='CheckpointHook', by_epoch=True, interval=5,

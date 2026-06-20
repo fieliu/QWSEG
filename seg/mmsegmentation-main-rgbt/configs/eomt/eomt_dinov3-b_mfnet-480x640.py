@@ -66,11 +66,11 @@ optim_wrapper = dict(
 
 param_scheduler = [
     dict(type='LinearLR', start_factor=1e-6, by_epoch=False, begin=0, end=1500),
-    dict(type='PolyLR', eta_min=0.0, power=0.9, begin=1500, end=117600,
+    dict(type='PolyLR', eta_min=0.0, power=0.9, begin=1500, end=58800,
          by_epoch=False),
 ]
 
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=200, val_interval=5)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=100, val_interval=5)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 

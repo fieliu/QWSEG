@@ -1,11 +1,16 @@
-"""Lightweight training-time visualization for EoMTRGBTQuality (DINOv3 RGB-T).
+"""Training-time visualization for EoMTRGBTQuality (DINOv3 RGB-T).
 
-Dumps, every `interval` epochs, a composite PNG per sample:
-  row 0: degraded RGB | degraded T | GT seg | pred seg
-  row k: per-SEGMENT quality heatmap (RGB) | quality (T) | merged-feature top3 | (blank)
-Quality maps use the same red-blue convention as the project's other vis
-(red = high quality, blue = low). Self-contained: reads model._all_quality and
-model._last_merged_feat set during the forward pass.
+Every `interval` epochs, dumps TWO separate PNGs per visualized sample, on the
+SAME degraded inputs the model is actually trained on:
+  - epoch{N}_feature.png : input | RGB feat | T feat | fused feat | pred | GT
+  - epoch{N}_quality.png : per-segment RGB-quality | T-quality heatmaps
+The quality PNG is only written when the model's quality mechanism is on
+(use_quality=True); E0b/E1 (mechanism off) get only the feature PNG.
+
+For E2 (paired multi-level degradation) the hook reproduces the training-time
+`make_paired` and visualizes BOTH the light and heavy versions that the model
+actually sees, so the picture matches what is fed to the network.
+Quality maps use the red-blue convention (red = high quality, blue = low).
 """
 import os
 import os.path as osp
@@ -30,7 +35,7 @@ def _seq_to_2d_feat(z, grid):
 
 
 def _quality_seq_to_2d(s, grid):
-    """[B,N,1] or [B,N] quality -> [B,gh,gw] numpy (sample 0)."""
+    """[B,N,1] or [B,N] quality -> [gh,gw] numpy (sample 0)."""
     gh, gw = grid
     if s.dim() == 3:
         s = s.squeeze(-1)
@@ -42,7 +47,7 @@ def _quality_seq_to_2d(s, grid):
 
 @HOOKS.register_module()
 class EoMTRGBTVisHook(Hook):
-    """Per-segment quality + merged-feature visualization for EoMTRGBTQuality."""
+    """Feature + quality visualization for EoMTRGBTQuality, on real inputs."""
     priority = 'LOW'
 
     def __init__(self, interval=10, num_samples=1, short_side=240):
@@ -93,6 +98,24 @@ class EoMTRGBTVisHook(Hook):
             pass
         return None
 
+    # ---- build the actual degraded inputs the model is trained on ----
+    def _make_versions(self, model, rgb, t, epoch):
+        """Return a list of (tag, rgb, t) versions matching training.
+
+        E2 (use_quality + paired make_paired): light & heavy versions.
+        E0b/E1 (single-level degrader): one degraded version.
+        """
+        use_quality = getattr(model, 'use_quality', False)
+        has_paired = hasattr(model.degrader, 'make_paired')
+        if use_quality and has_paired:
+            mean = model.data_preprocessor.mean.flatten()
+            std = model.data_preprocessor.std.flatten()
+            (l_rgb, l_ir, h_rgb, h_ir, _rr, _ri) = model.degrader.make_paired(
+                rgb, t, mean, std, epoch=epoch)
+            return [('light', l_rgb, l_ir), ('heavy', h_rgb, h_ir)]
+        drgb, dir_, _mr, _mt = model.degrader(rgb, t, epoch=epoch)
+        return [('deg', drgb, dir_)]
+
     def _visualize(self, runner, model, epoch):
         batch = self._cached_batch
         raw_inputs = batch.get('inputs')
@@ -100,17 +123,14 @@ class EoMTRGBTVisHook(Hook):
         if raw_inputs is None:
             return
         palette = self._get_palette(runner)
+        use_quality = getattr(model, 'use_quality', False)
 
         was_training = model.training
         model.eval()
         try:
-            # MFNet train aug yields per-sample sizes -> the data_preprocessor
-            # rejects a mixed-size batch. Visualize the FIRST sample only, fed
-            # as a length-1 batch so the size-consistency assert always holds.
             n = min(self.num_samples, len(raw_inputs))
             grid = model.network.encoder.backbone.patch_embed.grid_size
-
-            grids = []
+            feat_grids, qual_grids = [], []
             with torch.no_grad():
                 for bi in range(n):
                     proc = model.data_preprocessor(
@@ -119,23 +139,26 @@ class EoMTRGBTVisHook(Hook):
                         False)
                     xi = proc['inputs']
                     rgb, t = model._split(xi)
-                    # degrade exactly like training (single forward), then read
-                    # the quality/merged-feature side-channels the model stores.
-                    drgb, dir_, m_rgb, m_t = model.degrader(
-                        rgb, t, epoch=epoch)
-                    ml, cl = model._dual_stream_forward(drgb, dir_)
-                    all_q = model._all_quality
-                    merged = model._last_merged_feat
-                    stage_feats = (
-                        getattr(model, '_vis_rgb_feats', None),
-                        getattr(model, '_vis_t_feats', None),
-                        getattr(model, '_vis_fused_feats', None))
-                    pred = self._predict(model, ml, cl, xi)
-                    grids.append(self._compose(
-                        drgb, dir_, all_q, merged, grid,
-                        data_samples[bi] if data_samples else None,
-                        pred, palette, stage_feats))
-            self._save(grids, epoch)
+                    sample = data_samples[bi] if data_samples else None
+                    # reproduce the training-time degraded version(s)
+                    for tag, drgb, dir_ in self._make_versions(model, rgb, t, epoch):
+                        ml, cl = model._dual_stream_forward(drgb, dir_)
+                        all_q = model._all_quality
+                        merged = model._last_merged_feat
+                        stage_feats = (
+                            getattr(model, '_vis_rgb_feats', None),
+                            getattr(model, '_vis_t_feats', None),
+                            getattr(model, '_vis_fused_feats', None))
+                        pred = self._predict(model, ml, cl, xi)
+                        feat_grids.append(self._compose_feature(
+                            tag, drgb, dir_, merged, grid, sample, pred,
+                            palette, stage_feats))
+                        if use_quality:
+                            qual_grids.append(
+                                self._compose_quality(tag, all_q, grid))
+            self._save(feat_grids, epoch, 'feature')
+            if use_quality:
+                self._save(qual_grids, epoch, 'quality')
             runner.logger.info(
                 f'EoMTRGBTVisHook: epoch {epoch}, {n} samples -> {self._vis_dir}')
         finally:
@@ -169,41 +192,30 @@ class EoMTRGBTVisHook(Hook):
                              cv2.COLOR_BGR2RGB)
         return self._cell(v, h, w)
 
-    def _compose(self, drgb, dir_, all_q, merged, grid, sample, pred, palette,
-                 stage_feats=None):
+    # ---- FEATURE png: input | RGB feat | T feat | fused feat | pred | GT ----
+    def _compose_feature(self, tag, drgb, dir_, merged, grid, sample, pred,
+                         palette, stage_feats=None):
         s = self.short_side
         cell = lambda im: self._cell(im, s, s)  # noqa: E731
 
-        # row 0: degraded inputs + GT + pred
         gt = None
         if sample is not None and hasattr(sample, 'gt_sem_seg') \
                 and sample.gt_sem_seg is not None:
             gt = sample.gt_sem_seg.data.squeeze().cpu().numpy().astype(np.uint8)
+
+        # row 0: degraded RGB | degraded T | pred | GT
         row0 = np.concatenate([
             cell(self._input_to_img(drgb)),
             cell(self._input_to_img(dir_)),
+            self._seg_vis(pred, palette, s, s),
             self._seg_vis(gt, palette, s, s) if gt is not None
-            else np.zeros((s, s, 3), np.uint8),
-            self._seg_vis(pred, palette, s, s)], axis=1)
-
-        # per-segment quality rows: RGB-q | T-q | merged-feat (last row only) | blank
+            else np.zeros((s, s, 3), np.uint8)], axis=1)
         rows = [row0]
+
+        # per-stage feature rows: pre-merge RGB | pre-merge T | fused | merged
+        rgb_f, t_f, fused_f = stage_feats if stage_feats else (None, None, None)
         merged_2d = _seq_to_2d_feat(merged, grid) if merged is not None else None
         merged_rgb = _feat_top3_rgb(merged_2d) if merged_2d is not None else None
-        for si, (s_rgb, s_t) in enumerate(all_q):
-            q_rgb = _quality_seq_to_2d(s_rgb, grid)
-            q_t = _quality_seq_to_2d(s_t, grid)
-            mcell = cell(merged_rgb) if si == len(all_q) - 1 and merged_rgb is not None \
-                else np.zeros((s, s, 3), np.uint8)
-            rows.append(np.concatenate([
-                cell(_quality_to_red_blue(q_rgb, s, s)),
-                cell(_quality_to_red_blue(q_t, s, s)),
-                mcell,
-                np.zeros((s, s, 3), np.uint8)], axis=1))
-
-        # Swin-style per-stage feature block: pre-merge RGB | pre-merge T |
-        # fused. One row per fusion stage. 4th column blank to match width.
-        rgb_f, t_f, fused_f = stage_feats if stage_feats else (None, None, None)
         if rgb_f:
             blank = np.zeros((s, s, 3), np.uint8)
             for si in range(len(rgb_f)):
@@ -211,18 +223,35 @@ class EoMTRGBTVisHook(Hook):
                     if seq is None or si >= len(seq) or seq[si] is None:
                         return blank
                     return cell(_feat_top3_rgb(_seq_to_2d_feat(seq[si], grid)))
+                mcell = cell(merged_rgb) if (si == len(rgb_f) - 1
+                                             and merged_rgb is not None) else blank
                 rows.append(np.concatenate([
-                    _ft(rgb_f), _ft(t_f), _ft(fused_f), blank], axis=1))
+                    _ft(rgb_f), _ft(t_f), _ft(fused_f), mcell], axis=1))
         return np.concatenate(rows, axis=0)
 
-    def _save(self, grids, epoch):
+    # ---- QUALITY png: per-segment RGB-quality | T-quality heatmaps ----
+    def _compose_quality(self, tag, all_q, grid):
+        s = self.short_side
+        cell = lambda im: self._cell(im, s, s)  # noqa: E731
+        rows = []
+        for (s_rgb, s_t) in all_q:
+            q_rgb = _quality_seq_to_2d(s_rgb, grid)
+            q_t = _quality_seq_to_2d(s_t, grid)
+            rows.append(np.concatenate([
+                cell(_quality_to_red_blue(q_rgb, s, s)),
+                cell(_quality_to_red_blue(q_t, s, s))], axis=1))
+        if not rows:
+            return np.zeros((s, s * 2, 3), np.uint8)
+        return np.concatenate(rows, axis=0)
+
+    def _save(self, grids, epoch, kind):
         if not grids:
             return
         max_w = max(g.shape[1] for g in grids)
         padded = [np.pad(g, ((0, 0), (0, max_w - g.shape[1]), (0, 0)))
                   for g in grids]
         out = np.concatenate(padded, axis=0)
-        path = osp.join(self._vis_dir, f'eomt_rgbt_quality_epoch{epoch}.png')
+        path = osp.join(self._vis_dir, f'epoch{epoch}_{kind}.png')
         cv2.imwrite(path, cv2.cvtColor(out, cv2.COLOR_RGB2BGR))
 
 

@@ -270,6 +270,33 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
 
 
     # ---- quality supervision (masked BCE) ----
+    def _rank_loss(self, quality_info, reg_rgb_tok, reg_t_tok, B, margin=0.35):
+        """Rank-only quality loss for the paired light/heavy path.
+
+        quality_info entries are [2B,N,1] (light=0:B, heavy=B:2B). For each
+        fusion point and each modality, on the DEGRADED tokens (region=1) push
+        the LIGHT score above the HEAVY score by at least `margin`:
+            L = mean max(0, margin - (s_light - s_heavy))
+        Large margin (0.35) forces the two apart, indirectly preventing the
+        scale-collapse a pure pairwise rank can suffer (all scores at ~0.5).
+        Only the degraded modality carries signal (the clean modality is
+        identical in both versions). No absolute anchor: the score's absolute
+        level is left free, shaped by the segmentation task."""
+        total = z = 0.0
+        for (s_rgb, s_t) in quality_info:
+            for s, reg in ((s_rgb, reg_rgb_tok), (s_t, reg_t_tok)):
+                s = s.squeeze(-1)                       # [2B, N]
+                # drop prefix tokens (cls/register) to align with patch grid
+                if s.shape[1] > reg.shape[1]:
+                    s = s[:, s.shape[1] - reg.shape[1]:]
+                s_light, s_heavy = s[:B], s[B:]         # [B, N] each
+                gap = s_light - s_heavy                 # want > margin
+                hinge = (margin - gap).clamp_min(0.0)   # [B, N]
+                denom = reg.sum().clamp_min(1.0)
+                total = total + (hinge * reg).sum() / denom
+                z += 1
+        return total / max(z, 1)
+
     def _quality_loss(self, quality_info, mask_rgb_tok, mask_t_tok):
         """For every fusion point's scores, supervise only the EXTREME-certain
         positions: degraded (any severity) -> target 0, clean -> target 1.
@@ -303,6 +330,23 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
 
     # ---- training: Paradigm One (internal degradation, single forward) ----
     def loss(self, inputs, data_samples):
+        # E2 (use_quality=True): PAIRED multi-level degradation for quality
+        # ranking. E0b/E1 (use_quality=False): single-level path (unchanged).
+        if self.use_quality:
+            return self._loss_paired(inputs, data_samples)
+        return self._loss_single(inputs, data_samples)
+
+    def _seg_losses(self, ml_layers, cl_layers, targets, prefix=""):
+        out = {}
+        for li, (ml, cl) in enumerate(zip(ml_layers, cl_layers)):
+            ml_up = F.interpolate(ml, size=self.img_size, mode="bilinear",
+                                  align_corners=False)
+            for k, v in self.criterion(ml_up, targets, cl).items():
+                out[f"{prefix}l{li}.{k}"] = v
+        return out
+
+    # ---- E0b/E1 path: single-level degradation, no quality ranking ----
+    def _loss_single(self, inputs, data_samples):
         rgb, t = self._split(inputs)
         epoch = getattr(self, "current_epoch", 0)
         drgb, dir_, mask_rgb, mask_t = self.degrader(rgb, t, epoch=epoch)
@@ -310,49 +354,79 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         ml_layers, cl_layers, quality_info = self._dual_stream_forward(
             drgb, dir_, return_quality=True)
 
-        # segmentation loss (deep supervision over all query-decode layers)
         targets = build_targets(data_samples, self.num_classes, self.ignore_index)
-        losses = {}
-        for li, (ml, cl) in enumerate(zip(ml_layers, cl_layers)):
-            ml_up = F.interpolate(ml, size=self.img_size, mode="bilinear", align_corners=False)
-            for k, v in self.criterion(ml_up, targets, cl).items():
-                losses[f"l{li}.{k}"] = v
-
-        # quality supervision (masked BCE on token grid). Only when the
-        # mechanism is on -- with use_quality=False the scores are forced to 1
-        # and carry no learnable signal.
-        if self.use_quality and self.quality_loss_weight > 0 and quality_info:
-            grid = self.network.encoder.backbone.patch_embed.grid_size
-            m_rgb_tok = self._mask_to_token(mask_rgb, grid)
-            m_t_tok = self._mask_to_token(mask_t, grid)
-            losses["loss_quality"] = self.quality_loss_weight * self._quality_loss(
-                quality_info, m_rgb_tok, m_t_tok)
-
-        # distillation vs the frozen clean teacher (feature + output). The
-        # student's _dual_stream_forward already cached its merged feature; the
-        # teacher provides the clean-input targets. Gate by max(s_rgb, s_t): with
-        # use_quality=False the gate is 1 everywhere (ungated, plain distill).
-        if self.teacher is not None and (
-                self.distill_loss_weight > 0 or self.output_distill_weight > 0):
-            student_merged = self._last_merged_feat            # [B,N,C] (degraded)
-            with torch.no_grad():
-                t_merged, t_class_map = self.teacher.forward_distill_targets(rgb, t)
-            s_rgb, s_t = quality_info[-1]
-            gate_tok = torch.maximum(s_rgb, s_t)               # [B,N,1]
-            if self.distill_loss_weight > 0:
-                diff = (student_merged - t_merged.detach()) ** 2
-                losses["loss_distill_feat"] = self.distill_loss_weight * \
-                    (gate_tok * diff).mean()
-            if self.output_distill_weight > 0:
-                # student per-pixel class map (permutation-invariant einsum)
-                student_class_map = mask_class_to_seg_logits(
-                    ml_layers[-1], cl_layers[-1])
-                gate_grid = self._token_gate_to_grid(
-                    gate_tok, student_class_map.shape[-2:])
-                losses["loss_distill_out"] = self.output_distill_weight * \
-                    self._output_distill_loss(
-                        student_class_map, t_class_map.detach(), gate_grid)
+        losses = self._seg_losses(ml_layers, cl_layers, targets)
+        self._add_distill_losses(losses, rgb, t, ml_layers, cl_layers,
+                                 quality_info)
         return losses
+
+    # ---- E2 path: paired light/heavy degradation + rank-only quality loss ----
+    def _loss_paired(self, inputs, data_samples):
+        rgb, t = self._split(inputs)
+        epoch = getattr(self, "current_epoch", 0)
+        mean = self.data_preprocessor.mean.flatten()
+        std = self.data_preprocessor.std.flatten()
+        (l_rgb, l_ir, h_rgb, h_ir, region_rgb, region_ir) = self.degrader.make_paired(
+            rgb, t, mean, std, epoch=epoch)
+        B = rgb.shape[0]
+
+        # batch-cat light(0:B) + heavy(B:2B), one forward
+        cat_rgb = torch.cat([l_rgb, h_rgb], dim=0)
+        cat_ir = torch.cat([l_ir, h_ir], dim=0)
+        ml_layers, cl_layers, quality_info = self._dual_stream_forward(
+            cat_rgb, cat_ir, return_quality=True)
+
+        # segmentation loss on BOTH versions (targets duplicated light+heavy)
+        targets = build_targets(data_samples, self.num_classes, self.ignore_index)
+        targets2 = targets + targets
+        losses = self._seg_losses(ml_layers, cl_layers, targets2)
+
+        # rank-only quality loss: in the degraded modality, s(light) > s(heavy)
+        if self.quality_loss_weight > 0 and quality_info:
+            grid = self.network.encoder.backbone.patch_embed.grid_size
+            reg_rgb_tok = self._mask_to_token(region_rgb, grid)  # [B,N]
+            reg_t_tok = self._mask_to_token(region_ir, grid)
+            losses["loss_quality"] = self.quality_loss_weight * self._rank_loss(
+                quality_info, reg_rgb_tok, reg_t_tok, B)
+
+        # distillation: align the LIGHT version (closer to the clean teacher) so
+        # the heavy version's lower quality is not forcibly pulled clean (which
+        # would wash out the ranking signal). Slice [:B] = light everywhere.
+        light_ml = [m[:B] for m in ml_layers]
+        light_cl = [c[:B] for c in cl_layers]
+        light_q = [(sr[:B], st[:B]) for (sr, st) in quality_info]
+        # _last_merged_feat is [2B,N,C]; keep light half for feature distill
+        full_merged = self._last_merged_feat
+        self._last_merged_feat = full_merged[:B]
+        self._add_distill_losses(losses, rgb, t, light_ml, light_cl, light_q)
+        self._last_merged_feat = full_merged  # restore (vis may read it)
+        return losses
+
+    def _add_distill_losses(self, losses, rgb, t, ml_layers, cl_layers,
+                            quality_info):
+        """Feature + output distillation vs the frozen clean teacher. Shared by
+        the single and paired paths. ml/cl/quality_info here are the LIGHT (or
+        only) version, sliced to batch B; teacher consumes the clean RGB-T."""
+        if self.teacher is None or (
+                self.distill_loss_weight <= 0 and self.output_distill_weight <= 0):
+            return
+        student_merged = self._last_merged_feat            # [B,N,C]
+        with torch.no_grad():
+            t_merged, t_class_map = self.teacher.forward_distill_targets(rgb, t)
+        s_rgb, s_t = quality_info[-1]
+        gate_tok = torch.maximum(s_rgb, s_t)               # [B,N,1]
+        if self.distill_loss_weight > 0:
+            diff = (student_merged - t_merged.detach()) ** 2
+            losses["loss_distill_feat"] = self.distill_loss_weight * \
+                (gate_tok * diff).mean()
+        if self.output_distill_weight > 0:
+            student_class_map = mask_class_to_seg_logits(
+                ml_layers[-1], cl_layers[-1])
+            gate_grid = self._token_gate_to_grid(
+                gate_tok, student_class_map.shape[-2:])
+            losses["loss_distill_out"] = self.output_distill_weight * \
+                self._output_distill_loss(
+                    student_class_map, t_class_map.detach(), gate_grid)
 
     # ---- distillation helpers ----
     def _token_gate_to_grid(self, gate_tok, out_hw):

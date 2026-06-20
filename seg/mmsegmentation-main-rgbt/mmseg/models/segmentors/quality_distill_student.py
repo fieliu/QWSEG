@@ -171,9 +171,16 @@ class QualityDistillStudent(QualityDistillTeacher):
     @torch.no_grad()
     def extract_feat_vis(self, inputs):
         """Visualization hook entry. inputs: 6ch RGB-T OR batch-doubled cat.
-        Returns per-modality feats, final fused feats, quality maps -- for BOTH
-        the clean input and an internally-degraded copy. No private branch
-        (this model has none): just RGB feats | T feats | fused feats."""
+
+        E2 (use_quality + make_paired): visualizes the TWO versions the model is
+        ACTUALLY trained on -- LIGHT (group 1) and HEAVY (group 2) of the paired
+        multi-level degradation. There is NO clean version in paired training,
+        so group 1 is the LIGHT degraded input (not the original image). The two
+        quality maps side by side show the rank effect (same location: light
+        quality > heavy quality).
+
+        E0b/E1 (use_quality=False): keeps the old clean-vs-single-degrade view.
+        No private branch: just RGB feats | T feats | fused feats."""
         if inputs.shape[1] == 6:
             rgb, t = inputs[:, :3], inputs[:, 3:]
         else:
@@ -187,27 +194,31 @@ class QualityDistillStudent(QualityDistillTeacher):
                     list(self._last_fused_feats),
                     [q[0] for q in qs], [q[1] for q in qs])
 
-        zc_rgb, zc_t, fused, q_rgb, q_t = _run(rgb, t)
-
-        # Degraded copy: for E2 (use_quality) visualize the HEAVY version of the
-        # training-time paired degradation (matches what the model is trained
-        # on); for E0b/E1 fall back to the single-level degrader.
         if self.use_quality and hasattr(self.degrader, 'make_paired'):
+            # paired training: group1 = LIGHT, group2 = HEAVY (both are real
+            # training inputs; no clean pass exists in this regime).
             mean = self.data_preprocessor.mean.flatten()
             std = self.data_preprocessor.std.flatten()
-            (_lr, _li, h_rgb, h_ir, _rr, _ri) = self.degrader.make_paired(
+            (l_rgb, l_ir, h_rgb, h_ir, _rr, _ri) = self.degrader.make_paired(
                 rgb, t, mean, std, epoch=self.current_epoch)
-            drgb, dt = h_rgb, h_ir
+            g1_rgb, g1_t = l_rgb, l_ir   # light
+            g2_rgb, g2_t = h_rgb, h_ir   # heavy
+            tag1, tag2 = 'light', 'heavy'
         else:
-            drgb, dt, _, _ = self.degrader(rgb, t, epoch=self.current_epoch)
-        (zc_rgb_d, zc_t_d, fused_d, q_rgb_d, q_t_d) = _run(drgb, dt)
+            # E0b/E1: group1 = clean original, group2 = single-level degraded.
+            g1_rgb, g1_t = rgb, t
+            g2_rgb, g2_t, _, _ = self.degrader(rgb, t, epoch=self.current_epoch)
+            tag1, tag2 = 'clean', 'degraded'
+
+        zc_rgb, zc_t, fused, q_rgb, q_t = _run(g1_rgb, g1_t)
+        (zc_rgb_d, zc_t_d, fused_d, q_rgb_d, q_t_d) = _run(g2_rgb, g2_t)
 
         out = dict(
             zc_rgb=zc_rgb, zc_t=zc_t, final_fused=fused,
-            clean_rgb_img=rgb, clean_t_img=t,
+            clean_rgb_img=g1_rgb, clean_t_img=g1_t,
             zc_rgb_deg=zc_rgb_d, zc_t_deg=zc_t_d, final_fused_deg=fused_d,
-            deg_rgb_img=drgb, deg_t_img=dt,
-            deg_type_rgb='degraded', deg_type_t='degraded')
+            deg_rgb_img=g2_rgb, deg_t_img=g2_t,
+            deg_type_rgb=tag1, deg_type_t=tag2)
         # quality is meaningful only when the mechanism is ON. With use_quality
         # =False (E0b/E1) the scores are forced to 1 -> an all-red, info-less
         # map. Omit the quality keys so the hook skips the quality grid.

@@ -38,6 +38,8 @@ class QualityDistillStudent(QualityDistillTeacher):
                  distill_loss_weight=1.0,
                  output_distill_weight=1.0,
                  distill_temperature=4.0,
+                 clean_floor_weight=0.1,
+                 clean_floor=0.5,
                  bias_alpha=4.0,
                  bias_gamma=3.0,
                  degradation=None,
@@ -58,6 +60,8 @@ class QualityDistillStudent(QualityDistillTeacher):
         self.distill_loss_weight = distill_loss_weight
         self.output_distill_weight = output_distill_weight
         self.distill_temperature = distill_temperature
+        self.clean_floor_weight = clean_floor_weight
+        self.clean_floor = clean_floor
         self.bias_alpha = bias_alpha
         self.bias_gamma = bias_gamma
         self.current_epoch = 0
@@ -418,6 +422,11 @@ class QualityDistillStudent(QualityDistillTeacher):
         if self.quality_loss_weight > 0:
             losses['loss_quality'] = self.quality_loss_weight * \
                 self._rank_loss_spatial(quality_scores, region_rgb, region_ir, B)
+            # clean-region soft floor (anti-collapse): non-degraded pixels keep
+            # quality >= clean_floor. Soft lower bound, not a hard push to 1.
+            if self.clean_floor_weight > 0:
+                losses['loss_clean_floor'] = self.clean_floor_weight * \
+                    self._clean_floor_spatial(quality_scores, region_rgb, region_ir, B)
 
         # distillation: align the LIGHT version (slice [:B]) to the clean teacher
         light_fused = [f[:B] for f in fused_feats]
@@ -448,6 +457,25 @@ class QualityDistillStudent(QualityDistillTeacher):
                 hinge = (margin - gap).clamp_min(0.0)
                 denom = reg_d.sum().clamp_min(1.0)
                 total = total + (hinge * reg_d).sum() / denom
+                z += 1
+        return total / max(z, 1)
+
+    def _clean_floor_spatial(self, quality_scores, region_rgb, region_ir, B):
+        """Anti-collapse soft floor on NON-degraded pixels (reg==0), spatial
+        version. Both light and heavy (full 2B) keep quality >= clean_floor
+        there. Soft lower bound relu(floor - s): only penalizes s<floor, leaves
+        [floor,1] free. Mirrors DINOv3 _clean_floor_loss."""
+        floor = self.clean_floor
+        total = z = 0.0
+        for (s_rgb, s_t) in quality_scores:
+            h, w = s_rgb.shape[-2:]
+            for s, reg in ((s_rgb, region_rgb), (s_t, region_ir)):
+                reg_d = F.adaptive_max_pool2d(reg, (h, w))   # [B,1,h,w]
+                clean = (reg_d < 0.5).float()                # non-degraded
+                clean = torch.cat([clean, clean], dim=0)     # [2B,1,h,w]
+                below = (floor - s).clamp_min(0.0)
+                denom = clean.sum().clamp_min(1.0)
+                total = total + (below * clean).sum() / denom
                 z += 1
         return total / max(z, 1)
 

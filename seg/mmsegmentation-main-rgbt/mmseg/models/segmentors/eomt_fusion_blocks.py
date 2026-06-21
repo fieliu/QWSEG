@@ -61,6 +61,11 @@ class TokenQualityPredictor(nn.Module):
             nn.Linear(dim // 2, dim // 4), nn.GELU(),
             nn.Linear(dim // 4, 1),
         )
+        # init the score head bias HIGH so the initial quality is ~sigmoid(2)=0.88
+        # (default bias~0 -> 0.5, dangerously close to the s->0 collapse point).
+        # Prior "trust all tokens unless proven bad" + far from the collapse
+        # attractor. Mirrors the old init_high_score / init_keep_bias design.
+        nn.init.constant_(self.mlp[-1].bias, 2.0)
 
     def forward(self, x_self, x_other):
         """x_self/x_other: [B, N, C]. Returns quality s in (0,1): [B, N, 1]."""

@@ -49,6 +49,8 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
                  distill_loss_weight=1.0,
                  output_distill_weight=1.0,
                  distill_temperature=4.0,
+                 clean_floor_weight=0.1,
+                 clean_floor=0.5,
                  degradation=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
@@ -86,6 +88,8 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         self.distill_loss_weight = distill_loss_weight
         self.output_distill_weight = output_distill_weight
         self.distill_temperature = distill_temperature
+        self.clean_floor_weight = clean_floor_weight
+        self.clean_floor = clean_floor
 
         # frozen clean teacher (same EoMTRGBTFusion arch) for distillation.
         # Built BEFORE attention wrapping so the warm-start load_state_dict sees
@@ -299,6 +303,28 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
                 z += 1
         return total / max(z, 1)
 
+    def _clean_floor_loss(self, quality_info, reg_rgb_tok, reg_t_tok, B):
+        """Anti-collapse soft floor on NON-degraded tokens (reg==0). Both light
+        and heavy versions (full 2B) should keep quality >= clean_floor there.
+        Soft lower bound relu(floor - s): only penalizes scores BELOW the floor,
+        leaving [floor, 1] free (no hard push to 1 -> clean-but-low-quality
+        regions are not forced to lie). reg is [B,N] (light/heavy share the same
+        degraded region), tiled to 2B."""
+        floor = self.clean_floor
+        total = z = 0.0
+        for (s_rgb, s_t) in quality_info:
+            for s, reg in ((s_rgb, reg_rgb_tok), (s_t, reg_t_tok)):
+                s = s.squeeze(-1)                       # [2B, N]
+                if s.shape[1] > reg.shape[1]:
+                    s = s[:, s.shape[1] - reg.shape[1]:]
+                clean = (reg < 0.5).float()             # [B,N] non-degraded
+                clean = torch.cat([clean, clean], dim=0)  # [2B,N] (light+heavy)
+                below = (floor - s).clamp_min(0.0)      # penalize s<floor only
+                denom = clean.sum().clamp_min(1.0)
+                total = total + (below * clean).sum() / denom
+                z += 1
+        return total / max(z, 1)
+
     def _quality_loss(self, quality_info, mask_rgb_tok, mask_t_tok):
         """DEPRECATED (not called). Old binary BCE quality supervision
         (degraded->0, clean->1). Replaced by _rank_loss (paired light/heavy
@@ -394,6 +420,14 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
             reg_t_tok = self._mask_to_token(region_ir, grid)
             losses["loss_quality"] = self.quality_loss_weight * self._rank_loss(
                 quality_info, reg_rgb_tok, reg_t_tok, B)
+            # clean-region soft floor: where NOT degraded (reg==0), quality
+            # should not drop below clean_floor (anti-collapse). Soft lower bound
+            # relu(floor - s), NOT a hard push to 1 -> clean-but-low-quality
+            # regions (e.g. night RGB shadows) are not forced to lie; in-region
+            # variation in [floor,1] is preserved.
+            if self.clean_floor_weight > 0:
+                losses["loss_clean_floor"] = self.clean_floor_weight * \
+                    self._clean_floor_loss(quality_info, reg_rgb_tok, reg_t_tok, B)
 
         # distillation: align the LIGHT version (closer to the clean teacher) so
         # the heavy version's lower quality is not forcibly pulled clean (which

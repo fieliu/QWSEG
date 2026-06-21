@@ -60,6 +60,10 @@ class StageQuality(nn.Module):
         self.reduce = nn.Conv2d(dim * 2 + dim, dim // 2, 1)
         self.act = nn.GELU()
         self.head = nn.Conv2d(dim // 2, 1, 1)
+        # init score head bias HIGH -> initial quality ~sigmoid(2)=0.88 (default
+        # ~0.5 is too close to the s->0 collapse point). "Trust all unless proven
+        # bad" prior + far from the collapse attractor.
+        nn.init.constant_(self.head.bias, 2.0)
 
     def forward(self, x_self, x_other):
         B, C, H, W = x_self.shape

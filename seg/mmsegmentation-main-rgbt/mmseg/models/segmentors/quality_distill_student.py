@@ -34,6 +34,7 @@ class QualityDistillStudent(QualityDistillTeacher):
                  init_from_teacher=True,   # warm-start student backbone/fusion/head
                  fusion_dims=(96, 192, 384, 768),
                  use_quality=True,         # E2: full mechanism. False -> E0b/E1.
+                 use_compensation=True,    # cross-modal compensation (slaved to use_quality)
                  quality_loss_weight=1.0,
                  distill_loss_weight=1.0,
                  output_distill_weight=1.0,
@@ -42,10 +43,15 @@ class QualityDistillStudent(QualityDistillTeacher):
                  clean_floor=0.5,
                  bias_alpha=4.0,
                  bias_gamma=3.0,
+                 freeze_backbone=False,
                  degradation=None,
                  **kwargs):
         super().__init__(*args, fusion_dims=fusion_dims, **kwargs)
         self.use_quality = use_quality
+        # compensation is slaved to use_quality (off when mechanism off), and can
+        # be turned off independently while keeping the attention bias on (the
+        # F1 "bias-only" ablation). Mirrors DINOv3 EoMTRGBTQuality.
+        self.use_compensation = use_compensation and use_quality
 
         # quality-aware attention: replace Swin blocks so they accept quality_bias
         _replace_swin_blocks_with_quality(self.backbone)
@@ -98,6 +104,22 @@ class QualityDistillStudent(QualityDistillTeacher):
             self.teacher.eval()
             for p in self.teacher.parameters():
                 p.requires_grad = False
+
+        # frozen-backbone experiment: freeze the ORIGINAL pretrained Swin
+        # backbone (incl. QualitySwinBlock weights copied from the original
+        # blocks), train only the increments (quality / compensation / fusion)
+        # and the task head. Validates the detachable-increment claim. The
+        # quality modules (self.quality / self.compensate) live under separate
+        # attributes and stay trainable.
+        if freeze_backbone:
+            n_frozen = 0
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+                n_frozen += 1
+            print_log(
+                f'QualityDistillStudent: freeze_backbone=True -> froze '
+                f'{n_frozen} backbone param tensors; quality/fusion/decode-head '
+                f'trainable.', logger='current')
 
     def train(self, mode=True):
         # keep the teacher in eval ALWAYS: nn.Module.train() is recursive and
@@ -157,7 +179,7 @@ class QualityDistillStudent(QualityDistillTeacher):
                 out = norm_layer(x) if norm_layer is not None else x
                 out = out.view(B_tok, H, W, -1).permute(0, 3, 1, 2).contiguous()
                 x_rgb, x_t = out[:B], out[B:]
-                if self.use_quality:
+                if self.use_compensation:
                     x_rgb_c = self.compensate[i](x_rgb, x_t, s_rgb)
                     x_t_c = self.compensate[i](x_t, x_rgb, s_t)
                     x_rgb, x_t = x_rgb_c, x_t_c

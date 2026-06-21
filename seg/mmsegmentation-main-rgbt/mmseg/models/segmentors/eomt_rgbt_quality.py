@@ -51,6 +51,7 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
                  distill_temperature=4.0,
                  clean_floor_weight=0.1,
                  clean_floor=0.5,
+                 freeze_backbone=False,
                  degradation=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
@@ -127,6 +128,22 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
 
         deg_cfg = degradation or {}
         self.degrader = DegradationGenerator(**deg_cfg)
+
+        # frozen-backbone experiment: keep the ORIGINAL pretrained backbone
+        # frozen, train only the increments (quality / compensation / fusion)
+        # and the task head. Validates the "detachable robustness increment"
+        # claim. QualityAttnWrapper has no params of its own, so freezing all of
+        # backbone.parameters() freezes exactly the original ViT weights; the
+        # quality modules live under separate attributes and stay trainable.
+        if freeze_backbone:
+            n_frozen = 0
+            for p in self.network.encoder.backbone.parameters():
+                p.requires_grad = False
+                n_frozen += 1
+            print_log(
+                f'EoMTRGBTQuality: freeze_backbone=True -> froze {n_frozen} '
+                f'backbone param tensors; quality/fusion/decode-head trainable.',
+                logger='current')
         # set by TrainVisHook (model.current_epoch = runner.epoch); default 0
         self.current_epoch = 0
         # filled per forward for visualization / merge / supervision

@@ -40,6 +40,13 @@ model = dict(
     ),
 )
 
+# Distillation adds dense output-level gradients that dominate the total
+# gradient norm under the standard Mask2Former clip_grad(max_norm=0.01),
+# starving the sparse seg gradients and collapsing query specialization.
+# Override to max_norm=10 (same as DINOv3 / standard Mask2Former large-backbone
+# configs) so both seg and distill gradients can flow through effectively.
+optim_wrapper = dict(clip_grad=dict(max_norm=10, norm_type=2))
+
 custom_hooks = [
     dict(type='TrainVisHook', interval=5, num_samples=2),
     # RGB-missing / T-missing mIoU at every validation (whole-modality zeroed)

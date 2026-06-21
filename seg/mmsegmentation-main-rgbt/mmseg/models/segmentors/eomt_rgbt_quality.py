@@ -528,4 +528,9 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
             s = s ** (1.0 / T); s = s / s.sum(1, keepdim=True)
             t = t ** (1.0 / T); t = t / t.sum(1, keepdim=True)
         kl = (t * (t.log() - s.log())).sum(1, keepdim=True)  # >= 0
-        return (T * T) * (gate * kl.clamp_min(0)).mean()
+        # NO T^2 scaling: T^2 is Hinton-KD's correction for LOGIT-level distill;
+        # here we distill PROBABILITY maps via p^(1/T), so T^2 just over-amplifies
+        # 16x (T=4). DINOv3 (max_norm=10) tolerated it, but it's wrong for prob
+        # maps and lets distill gradient dominate under tight grad-clip (Swin
+        # max_norm=0.01 collapsed). Drop it for correctness + cross-backbone symmetry.
+        return (gate * kl.clamp_min(0)).mean()

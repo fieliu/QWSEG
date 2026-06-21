@@ -363,7 +363,14 @@ class QualityDistillStudent(QualityDistillTeacher):
             s = s ** (1.0 / T); s = s / s.sum(1, keepdim=True)
             t = t ** (1.0 / T); t = t / t.sum(1, keepdim=True)
         kl = (t * (t.log() - s.log())).sum(1, keepdim=True)  # >= 0
-        return (T * T) * (gate * kl.clamp_min(0)).mean()
+        # NO T^2 scaling: T^2 is Hinton-KD's gradient correction for LOGIT-level
+        # distillation (softmax(logit/T) gradients shrink with T). Here we
+        # distill PROBABILITY maps via p^(1/T), so T^2 doesn't apply -- it just
+        # over-amplifies the loss 16x (T=4), which under Swin's aggressive
+        # clip_grad(max_norm=0.01) lets the diffuse distill gradient dominate the
+        # sparse Hungarian-matched seg gradient, destroying query specialization
+        # (train loss fine, val collapses to aAcc~2%). Drop it.
+        return (gate * kl.clamp_min(0)).mean()
 
     def loss(self, inputs, data_samples):
         # E2 (use_quality=True): PAIRED multi-level degradation for quality

@@ -31,6 +31,7 @@ from .degradation import DegradationGenerator
 from .eomt_utils import build_targets, mask_class_to_seg_logits, resize_seg_logits
 from .eomt_quality_attn import (
     wrap_backbone_attention, quality_score_to_token_bias)
+from .distill_utils import _query_distill_loss
 
 
 @MODELS.register_module()
@@ -489,62 +490,8 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
             # in background regions (all-fg-zero -> sum~0 -> exploded noise).
             s_cls, s_mask = cl_layers[-1], ml_layers[-1]   # [B,Q,C+1], [B,Q,h,w]
             losses["loss_distill_out"] = self.output_distill_weight * \
-                self._query_distill_loss(s_cls, s_mask,
-                                         t_cls.detach(), t_mask.detach())
-
-    # ---- DETRDistill-style query-matched output distillation ----
-    def _query_distill_loss(self, s_cls, s_mask, t_cls, t_mask, T=2.0, eps=1e-6):
-        """Hungarian-match student queries to teacher predictions (pseudo-GT),
-        then distill matched pairs at query level: temperature-KD on class
-        logits + BCE/dice on mask logits. No per-pixel normalization.
-
-        s_cls/t_cls: [B,Q,C+1]; s_mask/t_mask: [B,Q,h,w] (mask raw logits).
-        Teacher pseudo-GT = its 'confident foreground' queries (argmax over the
-        C+1 logits is NOT no-object). Matching reuses the criterion's
-        Mask2FormerHungarianMatcher with teacher preds as the labels."""
-        B, Q, Cp1 = s_cls.shape
-        matcher = self.criterion.matcher
-        # align teacher mask to student mask resolution if needed
-        if t_mask.shape[-2:] != s_mask.shape[-2:]:
-            t_mask = F.interpolate(t_mask, size=s_mask.shape[-2:],
-                                   mode="bilinear", align_corners=False)
-        no_obj = Cp1 - 1
-        total_cls = total_mask = 0.0
-        n = 0
-        for b in range(B):
-            tc = t_cls[b]                       # [Q, C+1]
-            tm = t_mask[b]                      # [Q, h, w]
-            t_lab = tc.argmax(-1)               # [Q]
-            keep = t_lab != no_obj              # teacher's confident-fg queries
-            if keep.sum() == 0:
-                continue
-            # pseudo-GT for this image: teacher fg queries
-            mask_labels = [(tm[keep].sigmoid() > 0.5).float()]   # [K,h,w] binary
-            class_labels = [t_lab[keep]]                          # [K]
-            idx = matcher(
-                masks_queries_logits=s_mask[b:b+1],
-                mask_labels=mask_labels,
-                class_queries_logits=s_cls[b:b+1],
-                class_labels=class_labels,
-            )
-            src, tgt = idx[0]                   # student query idx, pseudo-GT idx
-            if src.numel() == 0:
-                continue
-            tkeep_idx = torch.nonzero(keep, as_tuple=False).squeeze(1)
-            t_match = tkeep_idx[tgt]            # teacher query idx for each pair
-            # class KD (temperature) on matched pairs
-            s_logp = F.log_softmax(s_cls[b, src] / T, dim=-1)
-            t_p = F.softmax(t_cls[b, t_match] / T, dim=-1)
-            total_cls = total_cls + (T * T) * F.kl_div(
-                s_logp, t_p, reduction="batchmean")
-            # mask distill: BCE(student mask logits, teacher mask prob)
-            s_m = s_mask[b, src]               # [P,h,w]
-            t_m = t_mask[b, t_match].sigmoid()
-            total_mask = total_mask + F.binary_cross_entropy_with_logits(s_m, t_m)
-            n += 1
-        if n == 0:
-            return s_cls.sum() * 0.0           # keep graph, zero loss
-        return (total_cls + total_mask) / n
+                _query_distill_loss(s_cls, s_mask,
+                                    t_cls.detach(), t_mask.detach())
 
     # ---- distillation helpers ----
     def _token_gate_to_grid(self, gate_tok, out_hw):

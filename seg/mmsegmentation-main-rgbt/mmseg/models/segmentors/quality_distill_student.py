@@ -24,6 +24,7 @@ from .quality_distill_modules import (
     StageQuality, CrossModalCompensation, quality_to_swin_bias_convex)
 from .degradation import DegradationGenerator
 from .swin_quality_mask2former import _replace_swin_blocks_with_quality
+from .distill_utils import _query_distill_loss
 
 
 @MODELS.register_module()
@@ -393,20 +394,28 @@ class QualityDistillStudent(QualityDistillTeacher):
             losses['loss_distill_feat'] = self.distill_loss_weight * \
                 self._feat_distill_loss(student_fused, teacher_fused, quality_scores)
         if self.output_distill_weight > 0:
-            student_prob = self._head_class_map(
+            # DETRDistill-style query-matched distillation (replaces the per-pixel
+            # einsum-map KL whose /sum normalization degenerated in background
+            # regions -> background learned wrong -> val aAcc collapse). Get raw
+            # query logits from both heads' TRAINING forward, Hungarian-match
+            # student queries to teacher predictions (pseudo-GT), distill matched
+            # pairs at query level (class temp-KD + mask BCE).
+            s_cls, s_mask = self._head_query_logits(
                 self.decode_head, fused_feats, data_samples)
             with torch.no_grad():
                 t_feats = teacher_fused
                 if self.teacher.with_neck:
                     t_feats = self.teacher.neck(teacher_fused)
-                teacher_prob = self._head_class_map(
+                t_cls, t_mask = self._head_query_logits(
                     self.teacher.decode_head, t_feats, data_samples)
-            s_rgb0, s_t0 = quality_scores[0]
-            gate = torch.maximum(s_rgb0, s_t0)
-            gate = F.interpolate(gate, size=student_prob.shape[-2:],
-                                 mode='bilinear', align_corners=False)
             losses['loss_distill_out'] = self.output_distill_weight * \
-                self._output_distill_loss(student_prob, teacher_prob, gate)
+                _query_distill_loss(s_cls, s_mask, t_cls.detach(), t_mask.detach())
+
+    def _head_query_logits(self, head, feats, data_samples):
+        """Mask2Former head TRAINING forward -> last-layer query logits.
+        Returns cls [B,Q,C+1], mask [B,Q,h,w] (raw logits)."""
+        all_cls, all_mask = head(feats, data_samples)
+        return all_cls[-1], all_mask[-1]
 
     # ---- E0b/E1 path: single-level degradation, no quality ranking ----
     def _loss_single(self, inputs, data_samples):

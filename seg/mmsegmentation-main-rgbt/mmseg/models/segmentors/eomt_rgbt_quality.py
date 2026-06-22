@@ -31,7 +31,7 @@ from .degradation import DegradationGenerator
 from .eomt_utils import build_targets, mask_class_to_seg_logits, resize_seg_logits
 from .eomt_quality_attn import (
     wrap_backbone_attention, quality_score_to_token_bias)
-from .distill_utils import _query_distill_loss
+from .distill_utils import prepare_ssl_outputs
 
 
 @MODELS.register_module()
@@ -483,15 +483,16 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
             losses["loss_distill_feat"] = self.distill_loss_weight * \
                 (gate_tok * diff).mean()
         if self.output_distill_weight > 0:
-            # DETRDistill-style query-matched distillation: treat teacher's
-            # per-query predictions as pseudo-GT, Hungarian-match student queries
-            # to them, distill matched pairs at the QUERY level (class KD + mask).
-            # Avoids the per-pixel einsum-map /sum normalization that degenerates
-            # in background regions (all-fg-zero -> sum~0 -> exploded noise).
+            # Standard Mask2Former distillation (GuidedDistillation): turn the
+            # teacher's confident-foreground queries into pseudo-GT, then feed
+            # them to the model's OWN criterion (Hungarian match + class CE +
+            # mask BCE + dice, point-sampled). Reuses the exact standard loss —
+            # no hand-rolled matching / full-image BCE (which collapsed fg mIoU).
             s_cls, s_mask = cl_layers[-1], ml_layers[-1]   # [B,Q,C+1], [B,Q,h,w]
-            losses["loss_distill_out"] = self.output_distill_weight * \
-                _query_distill_loss(s_cls, s_mask,
-                                    t_cls.detach(), t_mask.detach())
+            pseudo = prepare_ssl_outputs(t_cls.detach(), t_mask.detach())
+            d = self.criterion(s_mask, pseudo, s_cls)
+            losses["loss_distill_out"] = self.output_distill_weight * sum(
+                v for v in d.values())
 
     # ---- distillation helpers ----
     def _token_gate_to_grid(self, gate_tok, out_hw):

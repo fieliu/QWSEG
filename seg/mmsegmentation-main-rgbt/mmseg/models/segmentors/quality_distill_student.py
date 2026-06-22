@@ -24,7 +24,7 @@ from .quality_distill_modules import (
     StageQuality, CrossModalCompensation, quality_to_swin_bias_convex)
 from .degradation import DegradationGenerator
 from .swin_quality_mask2former import _replace_swin_blocks_with_quality
-from .distill_utils import _query_distill_loss
+from .distill_utils import prepare_ssl_outputs
 
 
 @MODELS.register_module()
@@ -394,28 +394,40 @@ class QualityDistillStudent(QualityDistillTeacher):
             losses['loss_distill_feat'] = self.distill_loss_weight * \
                 self._feat_distill_loss(student_fused, teacher_fused, quality_scores)
         if self.output_distill_weight > 0:
-            # DETRDistill-style query-matched distillation (replaces the per-pixel
-            # einsum-map KL whose /sum normalization degenerated in background
-            # regions -> background learned wrong -> val aAcc collapse). Get raw
-            # query logits from both heads' TRAINING forward, Hungarian-match
-            # student queries to teacher predictions (pseudo-GT), distill matched
-            # pairs at query level (class temp-KD + mask BCE).
-            s_cls, s_mask = self._head_query_logits(
-                self.decode_head, fused_feats, data_samples)
+            # Standard Mask2Former distillation (GuidedDistillation): teacher's
+            # confident-foreground queries -> pseudo-GT instances, fed to the
+            # head's OWN standard loss (Hungarian match + class CE + mask BCE +
+            # dice). Reuses the exact standard loss — no hand-rolled matching /
+            # full-image BCE (which collapsed foreground mIoU).
+            all_cls, all_mask = self.decode_head(fused_feats, data_samples)
             with torch.no_grad():
                 t_feats = teacher_fused
                 if self.teacher.with_neck:
                     t_feats = self.teacher.neck(teacher_fused)
-                t_cls, t_mask = self._head_query_logits(
-                    self.teacher.decode_head, t_feats, data_samples)
-            losses['loss_distill_out'] = self.output_distill_weight * \
-                _query_distill_loss(s_cls, s_mask, t_cls.detach(), t_mask.detach())
+                t_all_cls, t_all_mask = self.teacher.decode_head(
+                    t_feats, data_samples)
+                pseudo = prepare_ssl_outputs(
+                    t_all_cls[-1].detach(), t_all_mask[-1].detach())
+            batch_gt, batch_metas = self._pseudo_to_instances(
+                pseudo, data_samples)
+            d = self.decode_head.loss_by_feat(
+                all_cls, all_mask, batch_gt, batch_metas)
+            losses['loss_distill_out'] = self.output_distill_weight * sum(
+                v for v in d.values())
 
-    def _head_query_logits(self, head, feats, data_samples):
-        """Mask2Former head TRAINING forward -> last-layer query logits.
-        Returns cls [B,Q,C+1], mask [B,Q,h,w] (raw logits)."""
-        all_cls, all_mask = head(feats, data_samples)
-        return all_cls[-1], all_mask[-1]
+    def _pseudo_to_instances(self, pseudo, data_samples):
+        """pseudo [{labels,masks}] -> mmdet (batch_gt_instances, batch_img_metas)
+        for decode_head.loss_by_feat. masks are bool [K,h,w] at mask resolution;
+        mmdet's loss point-samples them, so resolution need not match input."""
+        from mmengine.structures import InstanceData
+        batch_gt, batch_metas = [], []
+        for i, p in enumerate(pseudo):
+            inst = InstanceData()
+            inst.labels = p['labels'].long()
+            inst.masks = p['masks'].float()
+            batch_gt.append(inst)
+            batch_metas.append(data_samples[i].metainfo)
+        return batch_gt, batch_metas
 
     # ---- E0b/E1 path: single-level degradation, no quality ranking ----
     def _loss_single(self, inputs, data_samples):

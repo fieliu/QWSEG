@@ -353,7 +353,7 @@ class QualityDistillStudent(QualityDistillTeacher):
         # normalize to proper distributions, temperature-soften via p^(1/T)
         # (these are einsum prob maps, not logits, so softmax(logits/T) doesn't
         # apply; p^(1/T) flattens the per-pixel distribution to surface dark
-        # knowledge), then KL scaled by T^2 (standard Hinton-KD correction).
+        # knowledge), then KL (NO T^2 scaling -- see below).
         T = self.distill_temperature
         s = s_prob.clamp_min(0) + eps
         t = t_prob.clamp_min(0) + eps
@@ -363,13 +363,13 @@ class QualityDistillStudent(QualityDistillTeacher):
             s = s ** (1.0 / T); s = s / s.sum(1, keepdim=True)
             t = t ** (1.0 / T); t = t / t.sum(1, keepdim=True)
         kl = (t * (t.log() - s.log())).sum(1, keepdim=True)  # >= 0
-        # T^2 scaling (standard Hinton-KD gradient correction): temperature
-        # softening via p^(1/T) shrinks gradients by ~1/T, so T^2 restores the
-        # correct magnitude. Previously dropped as a workaround for the now-fixed
-        # clip_grad(max_norm=0.01) bug (which let dense distill gradients dominate
-        # sparse seg gradients, destroying query specialization). With max_norm=10
-        # the gradient budget is sufficient for both losses to coexist.
-        return T * T * (gate * kl.clamp_min(0)).mean()
+        # NO T^2 scaling: these are PROBABILITY maps (einsum of cls.softmax x
+        # mask.sigmoid), not raw logits. p^(1/T) softening does shrink gradients
+        # by ~1/T, but T^2 over-corrects 16x (T=4) and lets the dense per-pixel
+        # distill gradient dominate the sparse seg gradient, destroying query
+        # specialization (E1 collapse: unlabeled IoU=0, aAcc=5.5%). DINOv3
+        # never used T^2 here and works fine. Drop it for cross-backbone parity.
+        return (gate * kl.clamp_min(0)).mean()
 
     def loss(self, inputs, data_samples):
         # E2 (use_quality=True): PAIRED multi-level degradation for quality

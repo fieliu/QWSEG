@@ -29,8 +29,9 @@ model = dict(
     teacher_cfg=teacher_cfg,
     teacher_ckpt=teacher_ckpt,
     quality_loss_weight=1.0,
-    distill_loss_weight=1.0,      # feature distillation (merged token seq)
-    output_distill_weight=1.0,    # output distillation (gated per-pixel KL)
+    distill_loss_weight=0.0,      # 蒸馏禁用:师生同骨干同warm-start起点,无知识落差可蒸,
+    output_distill_weight=0.0,    # 且干净teacher对缺失场景目标不可达(实测E1<E0b)。主线=退化+质量机制。
+                                  # teacher_cfg保留仅用于warm-start起点;将来上更大teacher可重开蒸馏。
     fuse_tau=0.5,
     bias_alpha=4.0,
     bias_gamma=3.0,

@@ -26,8 +26,8 @@ model = dict(
     teacher_cfg=teacher_cfg,
     teacher_ckpt=teacher_ckpt,
     quality_loss_weight=1.0,
-    distill_loss_weight=1.0,      # feature distillation (per-stage fused feats)
-    output_distill_weight=1.0,    # output distillation (gated per-pixel KL)
+    distill_loss_weight=0.0,      # 蒸馏禁用:师生同骨干同warm-start无落差+干净teacher对缺失目标不可达(实测E1<E0b)
+    output_distill_weight=0.0,    # 主线=退化+质量机制。teacher_cfg留作warm-start起点,将来大teacher可重开
     bias_alpha=4.0,               # max attention-bias magnitude (convex)
     bias_gamma=3.0,               # convexity: concentrate penalty on low quality
     degradation=dict(

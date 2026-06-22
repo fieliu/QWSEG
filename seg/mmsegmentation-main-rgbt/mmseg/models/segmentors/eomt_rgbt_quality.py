@@ -469,7 +469,7 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
             return
         student_merged = self._last_merged_feat            # [B,N,C]
         with torch.no_grad():
-            t_merged, t_class_map = self.teacher.forward_distill_targets(rgb, t)
+            t_merged, t_mask, t_cls = self.teacher.forward_distill_targets(rgb, t)
         s_rgb, s_t = quality_info[-1]
         gate_tok = torch.maximum(s_rgb, s_t)               # [B,N,1]
         if self.distill_loss_weight > 0:
@@ -482,13 +482,69 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
             losses["loss_distill_feat"] = self.distill_loss_weight * \
                 (gate_tok * diff).mean()
         if self.output_distill_weight > 0:
-            student_class_map = mask_class_to_seg_logits(
-                ml_layers[-1], cl_layers[-1])
-            gate_grid = self._token_gate_to_grid(
-                gate_tok, student_class_map.shape[-2:])
+            # DETRDistill-style query-matched distillation: treat teacher's
+            # per-query predictions as pseudo-GT, Hungarian-match student queries
+            # to them, distill matched pairs at the QUERY level (class KD + mask).
+            # Avoids the per-pixel einsum-map /sum normalization that degenerates
+            # in background regions (all-fg-zero -> sum~0 -> exploded noise).
+            s_cls, s_mask = cl_layers[-1], ml_layers[-1]   # [B,Q,C+1], [B,Q,h,w]
             losses["loss_distill_out"] = self.output_distill_weight * \
-                self._output_distill_loss(
-                    student_class_map, t_class_map.detach(), gate_grid)
+                self._query_distill_loss(s_cls, s_mask,
+                                         t_cls.detach(), t_mask.detach())
+
+    # ---- DETRDistill-style query-matched output distillation ----
+    def _query_distill_loss(self, s_cls, s_mask, t_cls, t_mask, T=2.0, eps=1e-6):
+        """Hungarian-match student queries to teacher predictions (pseudo-GT),
+        then distill matched pairs at query level: temperature-KD on class
+        logits + BCE/dice on mask logits. No per-pixel normalization.
+
+        s_cls/t_cls: [B,Q,C+1]; s_mask/t_mask: [B,Q,h,w] (mask raw logits).
+        Teacher pseudo-GT = its 'confident foreground' queries (argmax over the
+        C+1 logits is NOT no-object). Matching reuses the criterion's
+        Mask2FormerHungarianMatcher with teacher preds as the labels."""
+        B, Q, Cp1 = s_cls.shape
+        matcher = self.criterion.matcher
+        # align teacher mask to student mask resolution if needed
+        if t_mask.shape[-2:] != s_mask.shape[-2:]:
+            t_mask = F.interpolate(t_mask, size=s_mask.shape[-2:],
+                                   mode="bilinear", align_corners=False)
+        no_obj = Cp1 - 1
+        total_cls = total_mask = 0.0
+        n = 0
+        for b in range(B):
+            tc = t_cls[b]                       # [Q, C+1]
+            tm = t_mask[b]                      # [Q, h, w]
+            t_lab = tc.argmax(-1)               # [Q]
+            keep = t_lab != no_obj              # teacher's confident-fg queries
+            if keep.sum() == 0:
+                continue
+            # pseudo-GT for this image: teacher fg queries
+            mask_labels = [(tm[keep].sigmoid() > 0.5).float()]   # [K,h,w] binary
+            class_labels = [t_lab[keep]]                          # [K]
+            idx = matcher(
+                masks_queries_logits=s_mask[b:b+1],
+                mask_labels=mask_labels,
+                class_queries_logits=s_cls[b:b+1],
+                class_labels=class_labels,
+            )
+            src, tgt = idx[0]                   # student query idx, pseudo-GT idx
+            if src.numel() == 0:
+                continue
+            tkeep_idx = torch.nonzero(keep, as_tuple=False).squeeze(1)
+            t_match = tkeep_idx[tgt]            # teacher query idx for each pair
+            # class KD (temperature) on matched pairs
+            s_logp = F.log_softmax(s_cls[b, src] / T, dim=-1)
+            t_p = F.softmax(t_cls[b, t_match] / T, dim=-1)
+            total_cls = total_cls + (T * T) * F.kl_div(
+                s_logp, t_p, reduction="batchmean")
+            # mask distill: BCE(student mask logits, teacher mask prob)
+            s_m = s_mask[b, src]               # [P,h,w]
+            t_m = t_mask[b, t_match].sigmoid()
+            total_mask = total_mask + F.binary_cross_entropy_with_logits(s_m, t_m)
+            n += 1
+        if n == 0:
+            return s_cls.sum() * 0.0           # keep graph, zero loss
+        return (total_cls + total_mask) / n
 
     # ---- distillation helpers ----
     def _token_gate_to_grid(self, gate_tok, out_hw):

@@ -185,12 +185,13 @@ class EoMTRGBTFusion(EoMTSegmentor):
           - merged_feat [B, N, C]: the post-fusion merged token sequence
             (feature-distillation target, matches the student's
             self._last_merged_feat),
-          - class_map [B, num_classes, h, w]: the permutation-invariant
-            per-pixel class map (output-distillation target; the einsum result
-            sidesteps Mask2Former's arbitrary query order).
+          - mask_t [B, Q, h, w]: teacher per-query mask logits (raw, pre-sigmoid)
+          - cls_t  [B, Q, num_classes+1]: teacher per-query class logits (raw)
+        The query-level logits are used for DETRDistill-style query-matched
+        distillation (Hungarian-match student queries to teacher predictions as
+        pseudo-GT), which avoids the per-pixel einsum-map normalization that
+        degenerates in background regions.
         """
-        from .eomt_utils import mask_class_to_seg_logits
         ml_layers, cl_layers = self._dual_stream_forward(rgb, t)
-        class_map = mask_class_to_seg_logits(ml_layers[-1], cl_layers[-1])
-        return self._last_merged_feat, class_map
+        return self._last_merged_feat, ml_layers[-1], cl_layers[-1]
 

@@ -45,6 +45,7 @@ class QualityDistillStudent(QualityDistillTeacher):
                  bias_alpha=4.0,
                  bias_gamma=3.0,
                  freeze_backbone=False,
+                 freeze_neck_head=False,
                  degradation=None,
                  **kwargs):
         super().__init__(*args, fusion_dims=fusion_dims, **kwargs)
@@ -121,6 +122,24 @@ class QualityDistillStudent(QualityDistillTeacher):
                 f'QualityDistillStudent: freeze_backbone=True -> froze '
                 f'{n_frozen} backbone param tensors; quality/fusion/decode-head '
                 f'trainable.', logger='current')
+        # PURE-PLUGIN (Fp): also freeze fusion (fuse_convs) + neck + decode head,
+        # leaving ONLY the quality predictors + compensation as trainable
+        # increment. True LoRA-style plugin: host model fully frozen, isolates
+        # the quality mechanism's value.
+        if freeze_neck_head:
+            n_fnh = 0
+            mods = [self.fuse_convs, self.decode_head]
+            if getattr(self, 'neck', None) is not None:
+                mods.append(self.neck)
+            for m in mods:
+                for p in m.parameters():
+                    p.requires_grad = False
+                    n_fnh += 1
+            print_log(
+                f'QualityDistillStudent: freeze_neck_head=True -> additionally '
+                f'froze {n_fnh} fuse/neck/decode-head param tensors; ONLY '
+                f'quality/compensation trainable (pure-plugin Fp).',
+                logger='current')
 
     def train(self, mode=True):
         # keep the teacher in eval ALWAYS: nn.Module.train() is recursive and

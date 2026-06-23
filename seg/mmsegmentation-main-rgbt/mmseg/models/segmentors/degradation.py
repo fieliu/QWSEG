@@ -38,6 +38,7 @@ class DegradationGenerator:
         self.kinds = list(kinds)
         self.kind_probs = list(kind_probs)
         self.degrade_prob = degrade_prob
+        self.level_probs = kwargs.get('level_probs', [0.1, 0.15, 0.2, 0.25, 0.3])
         self.curriculum = curriculum
         self.total_epochs = total_epochs
 
@@ -135,12 +136,29 @@ class DegradationGenerator:
             types = _QUALITY_RGB_DEG_TYPES if mod == "rgb" else _QUALITY_T_DEG_TYPES
             deg_type = random.choice(types)
 
-            # two distinct levels, light < heavy. 'missing' only zeroes at L5.
+            # random LOCAL region (area from small patch to full-image, covering
+            # both local and global degradation via area=1.0). Hard 0/1 edges.
+            _REGION_AREAS = [0.2, 0.4, 0.6, 0.8, 1.0]
+            area = random.choice(_REGION_AREAS)
+            rh = max(1, int(H * (area ** 0.5)))
+            rw = max(1, int(W * (area ** 0.5)))
+            y0 = random.randint(0, max(0, H - rh))
+            x0 = random.randint(0, max(0, W - rw))
+            sm = torch.zeros(1, 1, H, W, device=dev, dtype=rgb.dtype)
+            sm[:, :, y0:y0 + rh, x0:x0 + rw] = 1.0
+
+            # level selection via level_probs (L1=clean, higher levels more
+            # likely). 'missing' only zeroes at L5; light=clean(L1).
+            level_probs = getattr(self, 'level_probs',
+                                  [0.1, 0.15, 0.2, 0.25, 0.3])
             if deg_type == "missing":
                 lvl_hi = 5
-                lvl_lo = random.randint(1, 4)
+                lvl_lo = 1  # missing light = clean (it has no continuous levels)
             else:
-                lo, hi = sorted(random.sample([1, 2, 3, 4, 5], 2))
+                lo, hi = sorted(random.choices([1, 2, 3, 4, 5],
+                                               weights=level_probs, k=2))
+                if lo == hi:
+                    lo = max(1, lo - 1)
                 lvl_lo, lvl_hi = lo, hi
 
             apply = (apply_quality_degradation_rgb if mod == "rgb"
@@ -148,19 +166,19 @@ class DegradationGenerator:
             mm, ss = (m_rgb, s_rgb) if mod == "rgb" else (m_t, s_t)
             src = (rgb if mod == "rgb" else ir)[b:b + 1]
             src01 = denorm(src, mm, ss)
-            light01 = apply(src01.clone(), deg_type, lvl_lo, spatial_mask=None)
-            heavy01 = apply(src01.clone(), deg_type, lvl_hi, spatial_mask=None)
+            light01 = apply(src01.clone(), deg_type, lvl_lo, spatial_mask=sm)
+            heavy01 = apply(src01.clone(), deg_type, lvl_hi, spatial_mask=sm)
             light_n = renorm(light01, mm, ss)
             heavy_n = renorm(heavy01, mm, ss)
 
             if mod == "rgb":
                 light_rgb[b:b + 1] = light_n
                 heavy_rgb[b:b + 1] = heavy_n
-                region_rgb[b:b + 1] = 1.0
+                region_rgb[b:b + 1] = sm.squeeze(0)
             else:
                 light_ir[b:b + 1] = light_n
                 heavy_ir[b:b + 1] = heavy_n
-                region_ir[b:b + 1] = 1.0
+                region_ir[b:b + 1] = sm.squeeze(0)
 
         return (light_rgb, light_ir, heavy_rgb, heavy_ir,
                 region_rgb, region_ir)

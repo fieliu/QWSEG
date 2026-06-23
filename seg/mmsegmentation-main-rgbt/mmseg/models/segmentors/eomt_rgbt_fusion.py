@@ -23,8 +23,12 @@ from .eomt_fusion_blocks import CrossAttnFusion
 @MODELS.register_module()
 class EoMTRGBTFusion(EoMTSegmentor):
     def __init__(self, *args, num_fusion_points=3, fusion_heads=8,
-                 fusion_points=None, **kwargs):
-        super().__init__(*args, **kwargs)
+                 fusion_points=None,
+                 use_contrast=False, contrast_weight=0.1,
+                 contrast_layer=None, contrast_samples=15,
+                 contrast_tau=0.1, patch_size=16, **kwargs):
+        super().__init__(*args, patch_size=patch_size, **kwargs)
+        self.patch_size = patch_size
         net = self.network
         num_layers = len(net.encoder.backbone.blocks)
         self.decode_start = num_layers - net.num_blocks  # query inserted here
@@ -53,6 +57,24 @@ class EoMTRGBTFusion(EoMTSegmentor):
         self.fusions = nn.ModuleList(
             [CrossAttnFusion(dim, num_heads=fusion_heads) for _ in self.fusion_points]
         )
+
+        # ---- 跨模态对比学习 (可控开关) ----
+        # 在指定层的融合前双流特征上做 CLIP 风格双向 InfoNCE,
+        # 让 T 向 RGB 对齐, 缓解 RGB 缺失时性能下降.
+        # contrast_layer=None 时默认用最后一个融合点 (深层, 语义最强).
+        self.use_contrast = use_contrast
+        self.contrast_weight = contrast_weight
+        self.contrast_samples = contrast_samples
+        self.contrast_tau = contrast_tau
+        if contrast_layer is None:
+            # 默认: 最后一个融合点 (深层, 语义最强, 融合前双流独立)
+            self.contrast_layer = self.fusion_points[-1] if self.fusion_points else (self.decode_start - 1)
+        else:
+            self.contrast_layer = min(int(contrast_layer), self.decode_start - 1)
+        # token grid (h_tok, w_tok), 用于把像素级标签下采样到 token 分辨率
+        h_tok = self.img_size[0] // self.patch_size
+        w_tok = self.img_size[1] // self.patch_size
+        self._token_grid = (h_tok, w_tok)
 
     # -- split 6ch input into RGB and T (both 3ch) --
     def _split(self, inputs):
@@ -95,12 +117,17 @@ class EoMTRGBTFusion(EoMTSegmentor):
 
         fp_to_idx = {p: i for i, p in enumerate(self.fusion_points)}
         quality_info = []  # reserved for the quality subclass hook
+        # 保存对比层融合前的双流特征 (供 loss 计算对比损失)
+        self._contrast_feat = None
 
         # ---- dual-stream stage: blocks [0, decode_start) ----
         for i in range(self.decode_start):
             block = backbone.blocks[i]
             if i in fp_to_idx:
                 z_rgb, z_t = self._fuse(fp_to_idx[i], z_rgb, z_t, quality_info)
+            # 在对比层保存融合前的双流特征 (block 前的特征, 语义已成熟)
+            if self.use_contrast and i == self.contrast_layer:
+                self._contrast_feat = (z_rgb, z_t)
             z_rgb = self._run_block(block, net, z_rgb, None, rope)
             z_t = self._run_block(block, net, z_t, None, rope)
 
@@ -156,6 +183,26 @@ class EoMTRGBTFusion(EoMTSegmentor):
             ml_up = F.interpolate(ml, size=self.img_size, mode="bilinear", align_corners=False)
             for k, v in self.criterion(ml_up, targets, cl).items():
                 losses[f"l{li}.{k}"] = v
+
+        # ---- 跨模态对比损失 (可选) ----
+        if self.use_contrast and self._contrast_feat is not None:
+            from .cross_modal_contrast import (
+                cross_modal_contrast_loss,
+                _downsample_labels_to_token,
+            )
+            # 从 data_samples 取像素级标签 [B, H, W]
+            labels_hw = torch.stack(
+                [ds.gt_sem_seg.data.squeeze(0) for ds in data_samples], dim=0
+            )  # [B, H, W]
+            z_rgb_c, z_t_c = self._contrast_feat  # [B, N, C]
+            labels_tok = _downsample_labels_to_token(labels_hw, self._token_grid)
+            loss_c = cross_modal_contrast_loss(
+                z_rgb_c, z_t_c, labels_tok,
+                samples_per_class=self.contrast_samples,
+                tau=self.contrast_tau,
+                ignore_index=self.ignore_index,
+            )
+            losses["loss_contrast"] = loss_c * self.contrast_weight
         return losses
 
     def encode_decode(self, inputs, batch_img_metas):

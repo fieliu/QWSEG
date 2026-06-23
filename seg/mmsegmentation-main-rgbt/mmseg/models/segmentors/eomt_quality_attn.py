@@ -29,10 +29,66 @@ def f_attn_convex(s, alpha=4.0, gamma=3.0):
 
 
 def quality_score_to_token_bias(s, alpha=4.0, gamma=3.0):
-    """[B,N,1] or [B,N] quality -> [B,N] additive key bias (log-free, convex)."""
+    """[B,N,1] or [B,N] quality -> [B,N] additive key bias (log-free, convex).
+
+    DEPRECATED (soft convex bias, too blunt to fire: gamma=3 gives s=0.5->-0.5).
+    Kept for reference; the live mechanism uses quality_mask_to_bias on a hard
+    keep-mask instead."""
     if s.dim() == 3:
         s = s.squeeze(-1)
     return f_attn_convex(s, alpha=alpha, gamma=gamma)
+
+
+def quality_mask_to_bias(D, suppress=-20.0):
+    """Hard keep-mask D (STE) -> additive KEY bias [B,N].
+
+    D=1 (keep) -> 0 (key untouched); D=0 (prune) -> `suppress` (-20) so the
+    key's softmax weight -> ~0: the token becomes invisible AS A KEY (source-
+    blocking: it cannot propagate its corruption to other tokens) while still
+    acting as a QUERY (it still observes kept tokens and self-repairs). The STE
+    in D routes the downstream (seg) loss gradient back to the quality score s.
+    D: [B,N,1] or [B,N]."""
+    if D.dim() == 3:
+        D = D.squeeze(-1)
+    return (1.0 - D) * suppress
+
+
+def hard_mask_ste(s, tau=0.5):
+    """Hard keep-mask from score s via Straight-Through Estimator.
+
+    Forward: D = (s >= tau) hard 0/1 (keep=1, prune=0).
+    Backward: the (s >= tau) comparison has no gradient, so the STE term
+    `s - s.detach()` carries a unit gradient to s. [B,N,1] -> [B,N,1]."""
+    D = (s >= tau).float()
+    return D + s - s.detach()
+
+
+def complementary_fix_tokens(D_rgb, D_t, s_rgb, s_t):
+    """Guarantee >=1 modality keeps each position as a visible key.
+
+    Where BOTH modalities prune a position (D<0.5 both), the token would be
+    invisible as a key in BOTH streams -> its own signal is replaced by a
+    neighbor-average (costly if the shallow predictor was WRONG; the error then
+    cascades as the averaged feature is re-scored). Force the higher-s (less-
+    bad) modality to KEEP it (D=1) and the other to DROP (D=0).
+
+    STE wrapper: forward = corrected hard mask, backward = gradient through the
+    raw (pre-fix) mask -> the predictor still learns. Only triggers in the
+    both-prune case; elsewhere D passes through unchanged (already STE)."""
+    both_prune = (D_rgb < 0.5) & (D_t < 0.5)
+    if not both_prune.any():
+        return D_rgb, D_t
+    rgb_better = s_rgb >= s_t
+    fix_rgb = both_prune & rgb_better      # keep rgb, drop t at these positions
+    fix_t = both_prune & (~rgb_better)     # keep t, drop rgb
+    D_rgb_f = torch.where(fix_rgb, torch.ones_like(D_rgb), D_rgb)
+    D_t_f   = torch.where(fix_rgb, torch.zeros_like(D_t),   D_t)
+    D_rgb_f = torch.where(fix_t,  torch.zeros_like(D_rgb_f), D_rgb_f)
+    D_t_f   = torch.where(fix_t,  torch.ones_like(D_t),     D_t_f)
+    # forward = D_*_f (corrected), backward = unit grad through raw D (-> s)
+    D_rgb_out = D_rgb_f.detach() + D_rgb - D_rgb.detach()
+    D_t_out   = D_t_f.detach()   + D_t   - D_t.detach()
+    return D_rgb_out, D_t_out
 
 
 def _get_rope_fn():

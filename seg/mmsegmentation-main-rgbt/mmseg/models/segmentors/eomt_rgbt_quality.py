@@ -26,11 +26,12 @@ from mmseg.registry import MODELS
 from mmengine.runner import load_checkpoint
 from mmengine.logging import print_log
 from .eomt_rgbt_fusion import EoMTRGBTFusion
-from .eomt_fusion_blocks import TokenQualityPredictor, TokenCrossModalCompensation
+from .eomt_fusion_blocks import TokenQualityPredictor
 from .degradation import DegradationGenerator
 from .eomt_utils import build_targets, mask_class_to_seg_logits, resize_seg_logits
 from .eomt_quality_attn import (
-    wrap_backbone_attention, quality_score_to_token_bias)
+    wrap_backbone_attention, quality_mask_to_bias,
+    hard_mask_ste, complementary_fix_tokens)
 from .distill_utils import prepare_ssl_outputs
 
 
@@ -39,6 +40,9 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
     def __init__(self, *args,
                  quality_loss_weight=1.0,
                  fuse_tau=0.5,
+                 quality_tau=0.5,
+                 suppress_value=-20.0,
+                 deg_ceiling_weight=1.0,
                  bias_alpha=4.0,
                  bias_gamma=3.0,
                  use_quality=True,
@@ -60,28 +64,33 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         dim = self.network.encoder.backbone.embed_dim
 
         # Quality is evaluated at SEGMENT boundaries: after embedding (segment 0)
-        # and after each fusion point. One predictor per segment boundary.
+        # and after each fusion point. One predictor per segment boundary. The
+        # sigmoid score s is thresholded into a hard keep-mask D (STE) + complementary
+        # fix; D drives attention/fusion KEY-side suppression (source-blocking).
         self.num_segments = len(self.fusion_points) + 1
         self.quality_predictors = nn.ModuleList(
             [TokenQualityPredictor(dim) for _ in range(self.num_segments)]
         )
-        # cross-modal compensation, one per segment boundary (applied before merge
-        # uses the last; intermediate ones repair tokens entering the next segment)
-        self.compensate = nn.ModuleList(
-            [TokenCrossModalCompensation(dim) for _ in range(self.num_segments)]
-        )
         self.quality_loss_weight = quality_loss_weight
         self.fuse_tau = fuse_tau
+        self.quality_tau = quality_tau
+        self.suppress_value = suppress_value
+        self.deg_ceiling_weight = deg_ceiling_weight
+        # bias_alpha / bias_gamma / use_compensation are accepted for config
+        # backward-compat but DORMANT: the convex soft bias and the cross-modal
+        # compensation module were replaced by the hard-mask + cross-attn repair
+        # design (low-quality tokens are key-suppressed and repaired by attending
+        # to the other modality's kept tokens, not zeroed / soft-blended).
         self.bias_alpha = bias_alpha
         self.bias_gamma = bias_gamma
-        # master switch: use_quality=False (E0b/E1) forces quality=1 everywhere,
-        # which makes the bias (-a*(1-1)^g=0), the merge (softmax([1,1])=mean) and
-        # the compensation (x*1+0=x) all collapse to the EoMTRGBTFusion baseline.
-        # The two fine-grained switches are slaved to it so they can't re-enable
-        # mechanism pieces when the master is off.
+        # master switch: use_quality=False (E0b/E1) forces s=1 -> D=1 everywhere,
+        # so the key-bias ((1-1)*suppress=0), complementary_fix (no both-prune)
+        # and the merge (softmax([1,1]/tau)=mean) all collapse to the
+        # EoMTRGBTFusion baseline. use_self_attn_bias is slaved to it so attention
+        # wrapping can't re-enable the mechanism when the master is off.
         self.use_quality = use_quality
         self.use_self_attn_bias = use_self_attn_bias and use_quality
-        self.use_compensation = use_compensation and use_quality
+        self.use_compensation = use_compensation and use_quality  # dormant
 
         # wrap each backbone block's attention so we can inject a pre-softmax
         # quality key-bias into the modality-internal self-attention. Done AFTER
@@ -217,34 +226,35 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
 
         # quality for segment 0 (from embedded tokens)
         seg = 0
-        s_rgb, s_t = self._eval_quality(seg, z_rgb, z_t)
-        all_quality.append((s_rgb, s_t))
-        b_rgb = quality_score_to_token_bias(s_rgb, self.bias_alpha, self.bias_gamma)
-        b_t = quality_score_to_token_bias(s_t, self.bias_alpha, self.bias_gamma)
+        (D_rgb, s_rgb), (D_t, s_t) = self._eval_quality(seg, z_rgb, z_t)
+        all_quality.append((s_rgb, s_t))   # store soft scores for vis + losses
+        b_rgb = quality_mask_to_bias(D_rgb, self.suppress_value)
+        b_t = quality_mask_to_bias(D_t, self.suppress_value)
 
         for i in range(self.decode_start):
             block = backbone.blocks[i]
             if i in fp_to_seg:
-                # fuse (cross-attn with convex quality bias), then re-evaluate
-                # quality for the NEW segment on the fused tokens.
-                z_rgb, z_t = self._fuse_q(z_rgb, z_t, s_rgb, s_t)
+                # fuse (cross-attn: each modality perceives the other's KEPT
+                # tokens; low-quality keys suppressed), then re-evaluate quality
+                # for the NEW segment on the (repaired) fused tokens.
+                z_rgb, z_t = self._fuse_q(z_rgb, z_t, D_rgb, D_t)
                 seg = fp_to_seg[i]
-                s_rgb, s_t = self._eval_quality(seg, z_rgb, z_t)
+                (D_rgb, s_rgb), (D_t, s_t) = self._eval_quality(seg, z_rgb, z_t)
                 all_quality.append((s_rgb, s_t))
                 # record this fusion stage: pre-merge streams + their merge
                 # (vis only -- skip during training to avoid extra merge cost)
                 if not self.training:
                     vis_rgb.append(z_rgb)
                     vis_t.append(z_t)
-                    vis_fused.append(self._merge_q(z_rgb, z_t, s_rgb, s_t, seg))
-                b_rgb = quality_score_to_token_bias(s_rgb, self.bias_alpha, self.bias_gamma)
-                b_t = quality_score_to_token_bias(s_t, self.bias_alpha, self.bias_gamma)
+                    vis_fused.append(self._merge_q(z_rgb, z_t, s_rgb, s_t))
+                b_rgb = quality_mask_to_bias(D_rgb, self.suppress_value)
+                b_t = quality_mask_to_bias(D_t, self.suppress_value)
             # each stream suppresses ITS OWN low-quality tokens as keys:
             z_rgb = self._run_block_q(block, net, z_rgb, rope, b_rgb)
             z_t = self._run_block_q(block, net, z_t, rope, b_t)
 
-        # compensation on the final segment, then quality-weighted merge
-        z = self._merge_q(z_rgb, z_t, s_rgb, s_t, seg)
+        # quality-weighted merge of the two (repaired) streams
+        z = self._merge_q(z_rgb, z_t, s_rgb, s_t)
 
         self._all_quality = all_quality
         self._last_quality = all_quality[-1]
@@ -284,31 +294,45 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         return ml_layers, cl_layers
 
     def _eval_quality(self, seg, z_rgb, z_t):
-        # mechanism OFF (E0b/E1): force quality to 1 so the bias collapses to 0,
-        # the merge to a plain mean, and compensation to identity -> exactly the
-        # EoMTRGBTFusion baseline, with no quality params on the grad path.
+        # Returns ((D_rgb, s_rgb), (D_t, s_t)):
+        #   s = soft sigmoid score [B,N,1] (for supervision + vis, stored in
+        #      all_quality; rank/clean_floor/deg_ceiling/gate all consume s).
+        #   D = complementary-fixed HARD keep-mask (STE) [B,N,1] (for attention /
+        #      fusion key-suppression / nothing else). D=1 keep, D=0 prune.
+        # use_quality=False -> D=s=1 everywhere -> key-bias=0, complementary_fix
+        # no-op, merge=mean -> exactly the EoMTRGBTFusion baseline.
         if not self.use_quality:
             ones = z_rgb.new_ones(z_rgb.shape[0], z_rgb.shape[1], 1)
-            return ones, ones
+            return (ones, ones), (ones, ones)
         qp = self.quality_predictors[seg]
-        return qp(z_rgb, z_t), qp(z_t, z_rgb)   # [B,N,1] each
+        s_rgb = qp(z_rgb, z_t)               # [B,N,1]
+        s_t = qp(z_t, z_rgb)
+        D_rgb = hard_mask_ste(s_rgb, self.quality_tau)
+        D_t = hard_mask_ste(s_t, self.quality_tau)
+        D_rgb, D_t = complementary_fix_tokens(D_rgb, D_t, s_rgb, s_t)
+        return (D_rgb, s_rgb), (D_t, s_t)
 
-    def _fuse_q(self, z_rgb, z_t, s_rgb, s_t):
-        """Cross-attn fusion with CONVEX quality bias on the key modality."""
-        bias_t = quality_score_to_token_bias(s_t, self.bias_alpha, self.bias_gamma)
-        bias_rgb = quality_score_to_token_bias(s_rgb, self.bias_alpha, self.bias_gamma)
+    def _fuse_q(self, z_rgb, z_t, D_rgb, D_t):
+        """Cross-attn fusion: each modality perceives the OTHER's high-quality
+        tokens. Low-quality tokens of the key modality are key-suppressed
+        (invisible as keys) via the hard keep-mask D -> RGB attends only to T's
+        kept tokens and vice versa; each modality's own low-quality tokens act
+        as queries and are repaired by aggregating the other's good tokens
+        (residual add in CrossAttnFusion)."""
+        bias_t = quality_mask_to_bias(D_t, self.suppress_value)
+        bias_rgb = quality_mask_to_bias(D_rgb, self.suppress_value)
         fusion = self.fusions[self._fuse_call]
         new_rgb = fusion(z_rgb, z_t, kv_bias=bias_t)   # RGB attends to T; low-q T keys suppressed
         new_t = fusion(z_t, z_rgb, kv_bias=bias_rgb)
         self._fuse_call += 1
         return new_rgb, new_t
 
-    def _merge_q(self, z_rgb, z_t, s_rgb, s_t, seg):
-        if self.use_compensation:
-            comp = self.compensate[seg]
-            z_rgb_c = comp(z_rgb, z_t, s_rgb)
-            z_t_c = comp(z_t, z_rgb, s_t)
-            z_rgb, z_t = z_rgb_c, z_t_c
+    def _merge_q(self, z_rgb, z_t, s_rgb, s_t):
+        # quality-weighted mean of the two (repaired) streams. s=1 (E0b /
+        # use_quality=False) -> softmax([1,1]/tau) = 0.5/0.5 -> plain mean =
+        # EoMTRGBTFusion baseline. No hard zeroing: features are never deleted
+        # (only key-suppressed + repaired upstream), so no position is lost and
+        # no complementary fix is needed at merge.
         w = torch.softmax(torch.cat([s_rgb, s_t], dim=-1) / self.fuse_tau, dim=-1)
         return w[..., 0:1] * z_rgb + w[..., 1:2] * z_t
 
@@ -360,6 +384,30 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
                 below = (floor - s).clamp_min(0.0)      # penalize s<floor only
                 denom = clean.sum().clamp_min(1.0)
                 total = total + (below * clean).sum() / denom
+                z += 1
+        return total / max(z, 1)
+
+    def _deg_ceiling_loss(self, quality_info, reg_rgb_tok, reg_t_tok, B):
+        """One-sided ceiling on the HEAVY-degraded version's score: where the
+        token is degraded (reg==1), push s_heavy BELOW tau so the hard mask
+        actually prunes it. relu(s_heavy - tau): penalizes only scores ABOVE tau,
+        leaving [0, tau] free -> one-sided, NOT a hard-0 target, so it does not
+        re-introduce the binary collapse the old BCE suffered. Without this the
+        mask may never fire: rank is relative (s_light>s_heavy) and clean_floor
+        only pushes clean UP, so nothing forces degraded tokens past the
+        threshold. reg is [B,N] (light/heavy share one degraded region); the
+        heavy version is s[B:]."""
+        tau = self.quality_tau
+        total = z = 0.0
+        for (s_rgb, s_t) in quality_info:
+            for s, reg in ((s_rgb, reg_rgb_tok), (s_t, reg_t_tok)):
+                s = s.squeeze(-1)                       # [2B, N]
+                if s.shape[1] > reg.shape[1]:
+                    s = s[:, s.shape[1] - reg.shape[1]:]
+                s_heavy = s[B:]                         # [B, N] heavy version
+                above = (s_heavy - tau).clamp_min(0.0)  # 0 where s_heavy<=tau
+                denom = reg.sum().clamp_min(1.0)
+                total = total + (above * reg).sum() / denom
                 z += 1
         return total / max(z, 1)
 
@@ -466,6 +514,13 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
             if self.clean_floor_weight > 0:
                 losses["loss_clean_floor"] = self.clean_floor_weight * \
                     self._clean_floor_loss(quality_info, reg_rgb_tok, reg_t_tok, B)
+            # degraded-side ceiling: push the HEAVY-degraded version's s BELOW tau
+            # so the hard mask actually prunes it. Without this the mask may never
+            # fire (rank is relative, clean_floor only pushes clean UP). One-sided
+            # relu -> no hard-0 target -> no binary collapse.
+            if self.deg_ceiling_weight > 0:
+                losses["loss_deg_ceiling"] = self.deg_ceiling_weight * \
+                    self._deg_ceiling_loss(quality_info, reg_rgb_tok, reg_t_tok, B)
 
         # distillation: align the LIGHT version (closer to the clean teacher) so
         # the heavy version's lower quality is not forcibly pulled clean (which

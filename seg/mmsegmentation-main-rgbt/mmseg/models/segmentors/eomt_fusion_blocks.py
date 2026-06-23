@@ -2,9 +2,13 @@
 
 Each modality attends to the other (query=self, key/value=other), the attended
 result is added back as residual, so each stream is enriched by the other and
-then continues to propagate. Supports an optional additive key/value bias
-derived from a quality score (used by the quality-aware model; the baseline
-passes bias=None).
+then continues to propagate. Supports an optional multiplicative key-side
+keep-mask derived from a quality score (used by the quality-aware model; the
+baseline passes keep_mask=None).
+
+Design: multiplicative key-gate (probability space), NOT additive bias. See
+eomt_quality_attn.py for the rationale (softmax exponentially amplifies an
+additive bias, destroying proportional suppression for mid-quality tokens).
 """
 import torch
 import torch.nn as nn
@@ -25,9 +29,13 @@ class CrossAttnFusion(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x_self, x_other, kv_bias=None):
-        """x_self/x_other: [B, N, C]. kv_bias: [B, N] additive bias on the
-        key tokens (log-space), broadcast over query positions and heads."""
+    def forward(self, x_self, x_other, keep_mask=None):
+        """x_self/x_other: [B, N, C]. keep_mask: [B, N] multiplicative key
+        keep-mask D in (0,1), applied AFTER softmax in probability space
+        (D=1 -> key visible; D=0 -> key invisible; D=0.8 -> key weight x0.8).
+        Broadcast over query positions and heads. Renormalized to sum=1 so
+        the output magnitude is stable regardless of how many keys are
+        suppressed."""
         B, N, C = x_self.shape
         q = self.q(self.norm_q(x_self))
         kv = self.kv(self.norm_kv(x_other))
@@ -35,10 +43,13 @@ class CrossAttnFusion(nn.Module):
         k, v = kv.reshape(B, N, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4).unbind(0)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, heads, Nq, Nk]
-        if kv_bias is not None:
-            # kv_bias: [B, Nk] -> [B, 1, 1, Nk]
-            attn = attn + kv_bias[:, None, None, :]
         attn = attn.softmax(dim=-1)
+        if keep_mask is not None:
+            # Multiplicative key-gate: D=1 keep, D=0 suppress, D=0.8 -> x0.8.
+            # keep_mask: [B, Nk] -> [B, 1, 1, Nk]
+            attn = attn * keep_mask[:, None, None, :]
+            # Renormalize so weights sum to 1 (stable output magnitude).
+            attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-6)
         attn = self.attn_drop(attn)
         out = (attn @ v).transpose(1, 2).reshape(B, N, C)
         out = self.proj_drop(self.proj(out))

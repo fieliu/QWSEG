@@ -26,6 +26,15 @@ model = dict(
     type='EoMTRGBTQuality',
     num_fusion_points=3,
     fusion_heads=8,
+    # Non-uniform fusion points: cover deeper layers for better cross-modal
+    # semantic alignment. DINOv3-B has 12 blocks, decode_start=8 (blocks 0-7
+    # dual-stream, 8-11 decode). [2,5,7] places fusion at shallow/mid/deep:
+    #   block 2: low-level feature alignment (edges/textures differ across modalities)
+    #   block 5: mid-level part/shape alignment
+    #   block 7: high-level semantic consensus right before merge (no gap to decode)
+    # Unlike the old even spacing [2,4,6] which left block 7 unfused, this
+    # ensures the last dual-stream block is cross-aligned before merge.
+    fusion_points=[2, 5, 7],
     teacher_cfg=teacher_cfg,
     teacher_ckpt=teacher_ckpt,
     quality_loss_weight=1.0,
@@ -33,15 +42,28 @@ model = dict(
     output_distill_weight=0.0,    # 且干净teacher对缺失场景目标不可达(实测E1<E0b)。主线=退化+质量机制。
                                   # teacher_cfg保留仅用于warm-start起点;将来上更大teacher可重开蒸馏。
     fuse_tau=0.5,
-    bias_alpha=4.0,
-    bias_gamma=3.0,
+    mask_temperature=0.1,         # soft mask sharpness: sigmoid((s-0.5)/0.1)
+                                  # s=0.99→D=0.99(barely suppressed),
+                                  # s=0.01→D=0.01(near-full suppress)
+                                  # Multiplicative key-gate: D=0.8 -> weight x0.8
+                                  # (true proportional suppression, unlike
+                                  # additive bias which softmax amplifies)
+    # Endpoint anchoring: pin s to [deg_ceiling, clean_floor] = [0.2, 0.9]
+    # so D=sigmoid((s-0.5)/0.1) ranges [0.001, 0.999] (gate effective).
+    # Without anchoring, s drifts upward (all ~0.8) and the gate is ineffective.
+    clean_floor=0.9,              # upper anchor: clean token s >= 0.9
+    clean_floor_weight=0.1,
+    deg_ceiling=0.2,              # lower anchor: heavy-degraded token s <= 0.2
+    deg_ceiling_weight=0.1,       # re-enabled: anchors lower end for soft mask
     use_quality=True,             # full mechanism ON
     use_self_attn_bias=True,
     use_compensation=True,
     degradation=dict(
-        # MISSING-only: clean 20% / whole-modality missing 40% / local missing 40%
-        kinds=('missing', 'local_missing'),
-        kind_probs=(0.5, 0.5),
+        # Local degradation with 3 core types (noise + blur + missing) and
+        # level-area coupling (higher level -> larger area). See
+        # degradation.py make_paired for the full scheme. degrade_prob=0.8
+        # means 20% clean + 80% degraded (of which 15% are level-1 clean),
+        # total clean ~32%.
         degrade_prob=0.8,
         curriculum=False,
         total_epochs=200,

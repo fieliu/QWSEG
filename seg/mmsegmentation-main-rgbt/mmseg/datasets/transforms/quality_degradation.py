@@ -118,10 +118,10 @@ _QUALITY_LEVEL_CONFIGS = {
         5: {'ratio': 0.50},
     },
     'missing': {
-        1: {'ratio': 0.0},
-        2: {'ratio': 0.0},
-        3: {'ratio': 0.0},
-        4: {'ratio': 0.0},
+        1: {'ratio': 0.0},    # clean (no missing)
+        2: {'ratio': 1.0},    # full missing (severity = area size, not ratio)
+        3: {'ratio': 1.0},
+        4: {'ratio': 1.0},
         5: {'ratio': 1.0},
     },
 }
@@ -241,14 +241,16 @@ def apply_quality_degradation_rgb(img_tensor, deg_type, level, spatial_mask=None
         img_tensor = img_tensor * (mask >= ratio_map).float()
 
     elif deg_type == 'missing':
+        ratio = params['ratio']
+        if ratio <= 0:
+            return img_tensor  # L1: clean, no change
+        # L2-L5: ratio=1.0, zero out the entire spatial_mask region.
+        # Severity is encoded by AREA size (level-area coupling in
+        # degradation.py), not by ratio. Missing is binary by nature.
         if not uniform:
             img_tensor = img_tensor * (1 - spatial_mask.expand(B, C, H, W))
         else:
-            ratio = params['ratio']
-            if ratio <= 0:
-                return img_tensor
-            zero_mask = (torch.rand(B, 1, H, W, device=img_tensor.device) < ratio).float()
-            img_tensor = img_tensor * (1 - zero_mask)
+            img_tensor = torch.zeros_like(img_tensor)
 
     return img_tensor
 
@@ -368,14 +370,14 @@ def apply_quality_degradation_t(img_tensor, deg_type, level, spatial_mask=None):
         img_tensor = img_tensor * (mask >= ratio_map).float()
 
     elif deg_type == 'missing':
+        ratio = params['ratio']
+        if ratio <= 0:
+            return img_tensor  # L1: clean, no change
+        # L2-L5: ratio=1.0, zero out the entire spatial_mask region.
         if not uniform:
             img_tensor = img_tensor * (1 - spatial_mask.expand(B, C, H, W))
         else:
-            ratio = params['ratio']
-            if ratio <= 0:
-                return img_tensor
-            zero_mask = (torch.rand(B, 1, H, W, device=img_tensor.device) < ratio).float()
-            img_tensor = img_tensor * (1 - zero_mask)
+            img_tensor = torch.zeros_like(img_tensor)
 
     return img_tensor
 

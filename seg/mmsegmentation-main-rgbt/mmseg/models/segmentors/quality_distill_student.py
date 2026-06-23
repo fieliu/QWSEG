@@ -251,8 +251,10 @@ class QualityDistillStudent(QualityDistillTeacher):
             # training inputs; no clean pass exists in this regime).
             mean = self.data_preprocessor.mean.flatten()
             std = self.data_preprocessor.std.flatten()
-            (l_rgb, l_ir, h_rgb, h_ir, _rr, _ri) = self.degrader.make_paired(
-                rgb, t, mean, std, epoch=self.current_epoch)
+            (l_rgb, l_ir, h_rgb, h_ir,
+             _llr, _lli, _hlr, _hli, _rm, _lg) = \
+                self.degrader.make_paired(
+                    rgb, t, mean, std, epoch=self.current_epoch)
             g1_rgb, g1_t = l_rgb, l_ir   # light
             g2_rgb, g2_t = h_rgb, h_ir   # heavy
             tag1, tag2 = 'light', 'heavy'
@@ -468,8 +470,12 @@ class QualityDistillStudent(QualityDistillTeacher):
         rgb, t = inputs[:, :3], inputs[:, 3:]
         mean = self.data_preprocessor.mean.flatten()
         std = self.data_preprocessor.std.flatten()
-        (l_rgb, l_ir, h_rgb, h_ir, region_rgb, region_ir) = self.degrader.make_paired(
-            rgb, t, mean, std, epoch=self.current_epoch)
+        (l_rgb, l_ir, h_rgb, h_ir,
+         lvl_light_rgb, lvl_light_ir,
+         lvl_heavy_rgb, lvl_heavy_ir,
+         _rank_mask, _level_gap) = \
+            self.degrader.make_paired(
+                rgb, t, mean, std, epoch=self.current_epoch)
         B = rgb.shape[0]
 
         # Swin extract_feat takes cat([rgb, t], 0). Pack light+heavy into batch:
@@ -489,12 +495,18 @@ class QualityDistillStudent(QualityDistillTeacher):
         # rank-only quality loss: in the degraded modality, s(light) > s(heavy)
         if self.quality_loss_weight > 0:
             losses['loss_quality'] = self.quality_loss_weight * \
-                self._rank_loss_spatial(quality_scores, region_rgb, region_ir, B)
-            # clean-region soft floor (anti-collapse): non-degraded pixels keep
+                self._rank_loss_spatial(
+                    quality_scores,
+                    lvl_light_rgb, lvl_light_ir,
+                    lvl_heavy_rgb, lvl_heavy_ir, B)
+            # clean-region soft floor (anti-collapse): L1 (clean) pixels keep
             # quality >= clean_floor. Soft lower bound, not a hard push to 1.
             if self.clean_floor_weight > 0:
                 losses['loss_clean_floor'] = self.clean_floor_weight * \
-                    self._clean_floor_spatial(quality_scores, region_rgb, region_ir, B)
+                    self._clean_floor_spatial(
+                        quality_scores,
+                        lvl_light_rgb, lvl_light_ir,
+                        lvl_heavy_rgb, lvl_heavy_ir, B)
 
         # distillation: align the LIGHT version (slice [:B]) to the clean teacher
         light_fused = [f[:B] for f in fused_feats]
@@ -505,42 +517,62 @@ class QualityDistillStudent(QualityDistillTeacher):
         return losses
 
     # ---- spatial rank quality loss (Swin: scores are [B,1,H,W] per stage) ----
-    def _rank_loss_spatial(self, quality_scores, region_rgb, region_ir, B,
-                           margin=0.35):
-        """For each stage and each modality, on the DEGRADED modality's region
-        push the LIGHT quality above the HEAVY quality by at least `margin`:
-            L = mean max(0, margin - (s_light - s_heavy)).
-        quality_scores entries are [2B,1,H,W] (light=0:B, heavy=B:2B). Large
-        margin prevents the scale-collapse a pure pairwise rank can suffer.
-        Only the degraded modality carries signal (the clean modality is
-        identical in both versions). No absolute anchor -> absolute level free,
-        shaped by the segmentation task. Mirrors DINOv3 _rank_loss."""
+    def _rank_loss_spatial(self, quality_scores,
+                           lvl_light_rgb, lvl_light_ir,
+                           lvl_heavy_rgb, lvl_heavy_ir, B,
+                           margin=0.20):
+        """For each stage and each modality, on the DEGRADED region push the
+        LIGHT quality above the HEAVY quality by a FIXED margin:
+            L = mean max(0, margin - (s_light - s_heavy))
+        The level gap is already reflected in the IMAGE (higher level = stronger
+        degradation), so the score separation naturally grows with gap. The rank
+        loss only enforces MONOTONICITY, not a proportional separation.
+
+        margin=0.20: with clean_floor=0.9 and deg_ceiling=0.2, the usable score
+        range is ~0.7. 0.20 gives clear separation without exceeding the range.
+
+        Level masks: L1=clean, L2-L5=degradation level. Tokens where
+        lvl_heavy == lvl_light (equal levels) have no rank signal -> excluded.
+
+        quality_scores entries are [2B,1,H,W] (light=0:B, heavy=B:2B).
+        lvl_light_*, lvl_heavy_*: [B,1,H,W] long, level labels."""
         total = z = 0.0
         for (s_rgb, s_t) in quality_scores:
             h, w = s_rgb.shape[-2:]
-            for s, reg in ((s_rgb, region_rgb), (s_t, region_ir)):
-                reg_d = F.adaptive_max_pool2d(reg, (h, w))   # [B,1,h,w]
+            for s, lvl_l, lvl_h in (
+                    (s_rgb, lvl_light_rgb, lvl_heavy_rgb),
+                    (s_t, lvl_light_ir, lvl_heavy_ir)):
+                lvl_l_d = F.adaptive_max_pool2d(lvl_l.float(), (h, w)).long()
+                lvl_h_d = F.adaptive_max_pool2d(lvl_h.float(), (h, w)).long()
                 s_light, s_heavy = s[:B], s[B:]              # [B,1,h,w] each
-                gap = s_light - s_heavy
-                hinge = (margin - gap).clamp_min(0.0)
-                denom = reg_d.sum().clamp_min(1.0)
-                total = total + (hinge * reg_d).sum() / denom
+                diff = s_light - s_heavy
+                hinge = (margin - diff).clamp_min(0.0)
+                reg = ((lvl_h_d > 1) & (lvl_l_d < lvl_h_d)).float()
+                denom = reg.sum().clamp_min(1.0)
+                total = total + (hinge * reg).sum() / denom
                 z += 1
         return total / max(z, 1)
 
-    def _clean_floor_spatial(self, quality_scores, region_rgb, region_ir, B):
-        """Anti-collapse soft floor on NON-degraded pixels (reg==0), spatial
+    def _clean_floor_spatial(self, quality_scores,
+                             lvl_light_rgb, lvl_light_ir,
+                             lvl_heavy_rgb, lvl_heavy_ir, B):
+        """Anti-collapse soft floor on CLEAN pixels (level == L1), spatial
         version. Both light and heavy (full 2B) keep quality >= clean_floor
         there. Soft lower bound relu(floor - s): only penalizes s<floor, leaves
-        [floor,1] free. Mirrors DINOv3 _clean_floor_loss."""
+        [floor,1] free.
+
+        lvl_light_*, lvl_heavy_*: [B,1,H,W] long, level labels."""
         floor = self.clean_floor
         total = z = 0.0
         for (s_rgb, s_t) in quality_scores:
             h, w = s_rgb.shape[-2:]
-            for s, reg in ((s_rgb, region_rgb), (s_t, region_ir)):
-                reg_d = F.adaptive_max_pool2d(reg, (h, w))   # [B,1,h,w]
-                clean = (reg_d < 0.5).float()                # non-degraded
-                clean = torch.cat([clean, clean], dim=0)     # [2B,1,h,w]
+            for s, lvl_l, lvl_h in (
+                    (s_rgb, lvl_light_rgb, lvl_heavy_rgb),
+                    (s_t, lvl_light_ir, lvl_heavy_ir)):
+                lvl_l_d = F.adaptive_max_pool2d(lvl_l.float(), (h, w)).long()
+                lvl_h_d = F.adaptive_max_pool2d(lvl_h.float(), (h, w)).long()
+                lvl_all = torch.cat([lvl_l_d, lvl_h_d], dim=0)  # [2B,1,h,w]
+                clean = (lvl_all == 1).float()
                 below = (floor - s).clamp_min(0.0)
                 denom = clean.sum().clamp_min(1.0)
                 total = total + (below * clean).sum() / denom

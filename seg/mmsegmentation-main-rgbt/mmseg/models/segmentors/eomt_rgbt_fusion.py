@@ -22,14 +22,24 @@ from .eomt_fusion_blocks import CrossAttnFusion
 
 @MODELS.register_module()
 class EoMTRGBTFusion(EoMTSegmentor):
-    def __init__(self, *args, num_fusion_points=3, fusion_heads=8, **kwargs):
+    def __init__(self, *args, num_fusion_points=3, fusion_heads=8,
+                 fusion_points=None, **kwargs):
         super().__init__(*args, **kwargs)
         net = self.network
         num_layers = len(net.encoder.backbone.blocks)
         self.decode_start = num_layers - net.num_blocks  # query inserted here
 
-        # Evenly place fusion points in the dual-stream stage [0, decode_start).
-        if num_fusion_points > 0 and self.decode_start > 0:
+        # Fusion points: either explicitly specified or evenly placed in the
+        # dual-stream stage [0, decode_start). Explicit specification allows
+        # non-uniform placement (e.g. denser in deeper layers for better
+        # cross-modal semantic alignment, following the hierarchical-ViT
+        # principle that deep layers need more fusion). Points are clamped to
+        # [1, decode_start-1] and sorted/deduped.
+        if fusion_points is not None:
+            pts = sorted({min(max(int(p), 1), self.decode_start - 1)
+                          for p in fusion_points})
+            self.fusion_points = pts
+        elif num_fusion_points > 0 and self.decode_start > 0:
             step = max(1, self.decode_start // (num_fusion_points + 1))
             pts = [min((j + 1) * step, self.decode_start - 1)
                    for j in range(num_fusion_points)]
@@ -124,10 +134,10 @@ class EoMTRGBTFusion(EoMTSegmentor):
         return mask_logits_per_layer, class_logits_per_layer
 
     def _fuse(self, fidx, z_rgb, z_t, quality_info):
-        """Baseline: symmetric cross-attention, no quality bias."""
+        """Baseline: symmetric cross-attention, no quality mask."""
         fusion = self.fusions[fidx]
-        new_rgb = fusion(z_rgb, z_t, kv_bias=None)
-        new_t = fusion(z_t, z_rgb, kv_bias=None)
+        new_rgb = fusion(z_rgb, z_t, keep_mask=None)
+        new_t = fusion(z_t, z_rgb, keep_mask=None)
         return new_rgb, new_t
 
     # -- override the single-modal forward used by loss/predict/_forward --

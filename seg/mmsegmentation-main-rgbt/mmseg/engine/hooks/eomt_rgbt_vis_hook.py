@@ -413,8 +413,14 @@ class EoMTRGBTVisHook(Hook):
         fig.tight_layout()
         # render to numpy
         fig.canvas.draw()
-        buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-        buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        # matplotlib >=3.8 移除了 tostring_rgb(), 用 buffer_rgba() 替代
+        try:
+            buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+            buf = buf.reshape(
+                fig.canvas.get_width_height()[::-1] + (4,))[:, :, :3]
+        except AttributeError:
+            buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+            buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (3,))
         plt.close(fig)
         return buf
 

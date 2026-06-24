@@ -578,11 +578,11 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
 
     # ---- training: Paradigm One (internal degradation, single forward) ----
     def loss(self, inputs, data_samples):
-        # E2 (use_quality=True): PAIRED multi-level degradation for quality
-        # ranking. E0b/E1 (use_quality=False): single-level path (unchanged).
-        if self.use_quality:
-            return self._loss_paired(inputs, data_samples)
-        return self._loss_single(inputs, data_samples)
+        # 统一走 paired 路径 (RGBT-C 13 种退化, make_paired), 保证 F0/F1
+        # 退化一致, F1-F0 增益纯粹反映质量机制 (而非退化丰富度差异).
+        # use_quality=False 时 s=1/D=1 (质量门控禁用), quality_loss_weight=0
+        # 时无质量监督 -> F0 只做退化下的分割训练, 不学质量.
+        return self._loss_paired(inputs, data_samples)
 
     def _seg_losses(self, ml_layers, cl_layers, targets, prefix=""):
         out = {}
@@ -593,22 +593,7 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
                 out[f"{prefix}l{li}.{k}"] = v
         return out
 
-    # ---- E0b/E1 path: single-level degradation, no quality ranking ----
-    def _loss_single(self, inputs, data_samples):
-        rgb, t = self._split(inputs)
-        epoch = getattr(self, "current_epoch", 0)
-        drgb, dir_, mask_rgb, mask_t = self.degrader(rgb, t, epoch=epoch)
-
-        ml_layers, cl_layers, quality_info = self._dual_stream_forward(
-            drgb, dir_, return_quality=True)
-
-        targets = build_targets(data_samples, self.num_classes, self.ignore_index)
-        losses = self._seg_losses(ml_layers, cl_layers, targets)
-        self._add_distill_losses(losses, rgb, t, ml_layers, cl_layers,
-                                 quality_info)
-        return losses
-
-    # ---- E2 path: paired light/heavy degradation + rank-only quality loss ----
+    # ---- paired light/heavy degradation + rank-only quality loss ----
     def _loss_paired(self, inputs, data_samples):
         rgb, t = self._split(inputs)
         epoch = getattr(self, "current_epoch", 0)

@@ -118,8 +118,10 @@ class DegradationGenerator:
         import sys
         import os
         # 添加 QWSEG 根目录到 path, 以便 import rgbt_c
+        # degradation.py 在 mmseg/models/segmentors/ 下, 需上溯 5 级到 QWSEG 根:
+        #   segmentors -> models -> mmseg -> mmsegmentation-main-rgbt -> seg -> QWSEG
         qwseg_root = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
+            os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', '..'))
         if qwseg_root not in sys.path:
             sys.path.insert(0, qwseg_root)
         from rgbt_c import get_corruption, RGB_CORRUPTIONS, T_CORRUPTIONS

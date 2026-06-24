@@ -57,6 +57,7 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
                  clean_floor_weight=0.1,
                  clean_floor=0.9,
                  freeze_backbone=False,
+                 freeze_fusion=False,
                  freeze_neck_head=False,
                  degradation=None,
                  # Dormant params (accepted for config backward-compat, unused)
@@ -133,18 +134,18 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         self.clean_floor_weight = clean_floor_weight
         self.clean_floor = clean_floor
 
-        # frozen clean teacher (same EoMTRGBTFusion arch) for distillation.
-        # Built BEFORE attention wrapping so the warm-start load_state_dict sees
-        # matching key names (network...blocks.{i}.attn.* on both sides).
+        # ---- warm-start from clean teacher checkpoint ----
+        # 蒸馏启用: 构建完整 teacher 模型 (驻留显存, 用于前向提供蒸馏目标)
+        # 蒸馏禁用: 不构建 teacher, 直接把 checkpoint 权重加载到 student
+        #   (teacher_cfg 仅用于 warm-start, 不实例化, 省显存+省构建时间)
         self.teacher = None
-        if teacher_cfg is not None:
+        distill_enabled = (self.distill_loss_weight > 0 or
+                           self.output_distill_weight > 0)
+        if teacher_cfg is not None and distill_enabled:
+            # 蒸馏模式: 构建 teacher 并驻留
             self.teacher = MODELS.build(teacher_cfg)
             if teacher_ckpt is not None:
                 load_checkpoint(self.teacher, teacher_ckpt, map_location='cpu')
-            # warm-start: copy the SHARED params (backbone / fusions / q / norms)
-            # from the trained teacher into the student as a TRAINABLE start.
-            # Student-only modules (quality_predictors / compensate) and the
-            # frozen teacher.* copy fall into `missing` and keep their own init.
             if init_from_teacher and teacher_ckpt is not None:
                 missing, unexpected = self.load_state_dict(
                     self.teacher.state_dict(), strict=False)
@@ -159,6 +160,26 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
             self.teacher.eval()
             for p in self.teacher.parameters():
                 p.requires_grad = False
+        elif teacher_ckpt is not None and init_from_teacher:
+            # 禁用蒸馏模式: 不构建 teacher, 直接加载 checkpoint 到 student
+            # checkpoint 是 EoMTRGBTFusion 的权重, key 与 student 共享部分
+            # (network.encoder.backbone / fusions / network.q / class_head /
+            #  mask_head / upscale) 匹配, student-only 模块 (quality_predictors
+            #  / compensate) 在 missing 中保持自身初始化.
+            from mmengine.runner import CheckpointLoader
+            ckpt = CheckpointLoader.load_checkpoint(
+                teacher_ckpt, map_location='cpu')
+            state_dict = ckpt.get('state_dict', ckpt)
+            missing, unexpected = self.load_state_dict(
+                state_dict, strict=False)
+            student_only = [k for k in missing
+                            if not k.startswith('teacher.')]
+            loaded = len(state_dict) - len(unexpected)
+            print_log(
+                f'EoMTRGBTQuality warm-start (no-teacher mode): '
+                f'~{loaded} params loaded from checkpoint; '
+                f'{len(student_only)} student-only params kept own init; '
+                f'{len(unexpected)} unexpected.', logger='current')
 
         # NOW wrap attention (after warm-start). Wrapping renames attn -> attn.attn
         # internally, but the wrapper delegates so EoMT's _attn still works, and
@@ -184,6 +205,18 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
             print_log(
                 f'EoMTRGBTQuality: freeze_backbone=True -> froze {n_frozen} '
                 f'backbone param tensors; quality/fusion/decode-head trainable.',
+                logger='current')
+        # F0: 只冻结交叉注意力融合模块 (增量部分), 保留解码头可训练.
+        # F0 = 冻骨干 + 冻融合 + 禁质量 -> 只有解码头 (q/class_head/mask_head/
+        # upscale) 可训练. F1-F0 增益 = 融合 + 质量机制的增量贡献.
+        if freeze_fusion:
+            n_ff = 0
+            for p in self.fusions.parameters():
+                p.requires_grad = False
+                n_ff += 1
+            print_log(
+                f'EoMTRGBTQuality: freeze_fusion=True -> froze {n_ff} '
+                f'fusion param tensors; ONLY decode-head trainable.',
                 logger='current')
         # PURE-PLUGIN (Fp): on top of freeze_backbone, also freeze fusion +
         # decode head (q / class_head / mask_head / upscale), leaving ONLY the

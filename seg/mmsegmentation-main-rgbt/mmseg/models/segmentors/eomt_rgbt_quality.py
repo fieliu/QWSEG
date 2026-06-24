@@ -426,7 +426,7 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
     def _rank_loss(self, quality_info, lvl_light_rgb_tok, lvl_light_t_tok,
                    lvl_heavy_rgb_tok, lvl_heavy_t_tok, B,
                    margin=0.20, rank_mask=None, level_gap=None):
-        """Rank quality loss using LEVEL masks (L1-L5).
+        """Rank quality loss using LEVEL masks (0=clean, 1-5=degraded).
 
         For each token in the degraded region, push s_light > s_heavy by a
         FIXED margin (not scaled by level gap):
@@ -441,10 +441,10 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         range is ~0.7. 0.20 gives clear separation without exceeding the range.
 
         The level masks encode the ACTUAL degradation level per token:
-          - L1 = clean (outside region, or lvl_lo=1 inside)
-          - L2-L5 = degradation level (inside region)
+          - 0 = clean (outside region, or lvl_lo=0 inside)
+          - 1-5 = degradation level (inside region)
         Tokens where lvl_heavy == lvl_light (equal levels) have no rank signal
-        (identical images) -> excluded by reg mask (lvl_h > 1 AND lvl_l < lvl_h).
+        (identical images) -> excluded by reg mask (lvl_h > 0 AND lvl_l < lvl_h).
 
         Args:
             quality_info: list of (s_rgb, s_t), each [2B,N,1] (light=0:B,
@@ -471,7 +471,8 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
                 hinge = (margin - gap).clamp_min(0.0)   # [B, N]
                 # Region mask: only where heavy is degraded AND light < heavy
                 # (valid rank pair). Equal levels -> identical images -> skip.
-                reg = ((lvl_h > 1) & (lvl_l < lvl_h)).float()  # [B, N]
+                # 0=clean, 1-5=degraded: reg where lvl_h > 0 AND lvl_l < lvl_h
+                reg = ((lvl_h > 0) & (lvl_l < lvl_h)).float()  # [B, N]
                 # Apply sample-level rank_mask (skip equal-level pairs)
                 if rank_mask is not None:
                     hinge = hinge * rank_mask.view(B, 1)
@@ -482,9 +483,9 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         return total / max(z, 1)
 
     def _clean_floor_loss(self, quality_info, lvl_light_tok, lvl_heavy_tok, B):
-        """Anti-collapse soft floor on CLEAN tokens (level == L1). Both light
+        """Anti-collapse soft floor on CLEAN tokens (level == 0). Both light
         and heavy versions (full 2B) should keep quality >= clean_floor where
-        the level is L1 (clean). Soft lower bound relu(floor - s): only
+        the level is 0 (clean). Soft lower bound relu(floor - s): only
         penalizes scores BELOW the floor, leaving [floor, 1] free.
 
         lvl_light_tok, lvl_heavy_tok: [B,N] long, level labels for light/heavy.
@@ -498,9 +499,9 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
                 s = s.squeeze(-1)                       # [2B, N]
                 if s.shape[1] > lvl_l.shape[1]:
                     s = s[:, s.shape[1] - lvl_l.shape[1]:]
-                # Clean tokens: level == 1 (L1). Tile light+heavy levels.
+                # Clean tokens: level == 0. Tile light+heavy levels.
                 lvl_all = torch.cat([lvl_l, lvl_h], dim=0)  # [2B, N]
-                clean = (lvl_all == 1).float()              # [2B, N]
+                clean = (lvl_all == 0).float()              # [2B, N]
                 below = (floor - s).clamp_min(0.0)          # penalize s<floor
                 denom = clean.sum().clamp_min(1.0)
                 total = total + (below * clean).sum() / denom
@@ -509,11 +510,11 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
 
     def _deg_ceiling_loss(self, quality_info, lvl_light_tok, lvl_heavy_tok, B):
         """Lower-end anchor: on the HEAVY version's DEGRADED tokens (level >=
-        L2), push s_heavy BELOW deg_ceiling. The ceiling scales with level:
+        1), push s_heavy BELOW deg_ceiling. The ceiling scales with level:
         higher level -> lower ceiling (stronger suppression target).
-            ceiling(lvl) = deg_ceiling * (6 - lvl) / 5  # L2->0.16, L5->0.04
-        This gives a CONTINUOUS anchor: L5 (worst) -> s<=0.04, L2 (mild) ->
-        s<=0.16. Combined with clean_floor=0.9 (L1), the score range is pinned
+            ceiling(lvl) = deg_ceiling * (6 - lvl) / 5  # L1->base, L5->0.2*base
+        This gives a CONTINUOUS anchor: L5 (worst) -> s<=0.04, L1 (mild) ->
+        s<=0.20. Combined with clean_floor=0.9 (L0), the score range is pinned
         to [0.04, 0.9], monotonically decreasing with level.
 
         lvl_heavy_tok: [B,N] long, level labels for heavy version."""
@@ -527,12 +528,12 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
                 if s.shape[1] > lvl_h.shape[1]:
                     s = s[:, s.shape[1] - lvl_h.shape[1]:]
                 s_heavy = s[B:]                         # [B, N] heavy version
-                # Level-dependent ceiling: L2->0.8*base, L5->0.2*base
-                # ceiling = base * (6 - lvl) / 5
+                # Level-dependent ceiling: L1->base, L5->0.2*base
+                # ceiling = base * (6 - lvl) / 5  (lvl in 1-5)
                 lvl_f = lvl_h.float()
                 ceiling = base_ceiling * (6.0 - lvl_f) / 5.0  # [B, N]
                 above = (s_heavy - ceiling).clamp_min(0.0)     # 0 where s<=ceiling
-                reg = (lvl_h > 1).float()                      # degraded region
+                reg = (lvl_h > 0).float()                      # degraded region
                 denom = reg.sum().clamp_min(1.0)
                 total = total + (above * reg).sum() / denom
                 z += 1

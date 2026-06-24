@@ -87,79 +87,63 @@ class DegradationGenerator:
 
     @torch.no_grad()
     def make_paired(self, rgb, ir, mean, std, epoch=0):
-        """Continuous multi-level PAIRED degradation for quality ranking (E2).
+        """Continuous multi-level PAIRED degradation for quality ranking.
 
-        For each sample: pick ONE modality + ONE degradation type, apply it
-        at TWO independently-sampled levels (light lvl_lo <= heavy lvl_hi)
-        on the SAME spatial region. The OTHER modality stays clean in both
-        versions (honoring "at least one modality usable").
+        对齐 RGBT-C 标准 (rgbt_c/corruptions.py), 直接调用 rgbt_c 库的退化函数.
+        训练时在 [0,1] 空间施加退化 (与测试集生成一致), 然后反归一化回模型空间.
 
-        Key design:
-          - ALL samples are degraded (no whole-sample clean). Clean tokens
-            come from OUTSIDE the local degraded region, providing the
-            upper-anchor for quality supervision naturally.
-          - Light/heavy levels are sampled INDEPENDENTLY from _LEVEL_PROBS,
-            then assigned by magnitude. This produces diverse severity gaps
-            (L1vsL5, L2vsL4, L3vsL5, ...) instead of a fixed gap.
-          - _LEVEL_PROBS is tilted towards HEAVY levels (L5=0.30 > L1=0.10)
-            to strengthen robustness under severe degradation.
-          - Light and heavy SHARE the same spatial mask (sm). The area is
-            sampled from _LEVEL_AREA[lvl_hi] (coupled to the HEAVY level),
-            so both versions degrade the exact same region -> rank loss can
-            compare s_light vs s_heavy at the same positions.
-
-        Degradation types:
-          - gaussian_noise / motion_blur / stripe_noise: continuous severity
-            (level controls noise sigma / blur kernel), same region.
-          - missing: discrete (ratio=1.0 in region, 0 outside). Severity =
-            area size (L2=small region .. L5=large region). light/heavy
-            differ by area size (level-area coupling).
+        流程 (每个样本):
+          1. 随机选一个模态 (rgb / ir)
+          2. 从该模态的退化类型列表中随机选一种 (全部 13 种, 见 _RGB_TYPES/_T_TYPES)
+          3. 从 0-5 级中独立采样两个级别 (lvl_lo <= lvl_hi):
+               0 级 = 干净 (无退化)
+               1-5 级 = rgbt_c 的 severity 1-5
+             级别概率权重 _LEVEL_PROBS = [10, 10, 15, 20, 25, 30]
+             (0 级占 ~9%, 5 级占 ~27%, 高级别比例更大)
+          4. 根据 lvl_hi 采样局部区域 (level-area coupling)
+          5. 在同一区域上施加 light(lvl_lo) 和 heavy(lvl_hi) 两个版本
+          6. 区域外保持干净 (level=0)
 
         Args:
             rgb, ir: [B,3,H,W] NORMALIZED tensors (data_preprocessor output).
-            mean, std: 6-channel mean/std lists/tensors (RGB=0:3, T=3:6); used to
-                denorm to [0,1] for the degradation bank, then renorm back.
+            mean, std: 6-channel mean/std (RGB=0:3, T=3:6).
         Returns:
             light_rgb, light_ir, heavy_rgb, heavy_ir: [B,3,H,W] normalized.
-            level_light_rgb, level_light_ir: [B,1,H,W] long; L1=clean
-                (outside region OR lvl_lo=1 inside), L2-L5=degradation level
-                (inside region, =lvl_lo). Label for the LIGHT version.
-            level_heavy_rgb, level_heavy_ir: [B,1,H,W] long; same but =lvl_hi
-                inside region. Label for the HEAVY version.
-            Used directly by quality supervision:
-              - anchor: lvl=1 -> s>=clean_floor; lvl=5 -> s<=deg_ceiling
-              - rank: s_light - s_heavy >= margin * level_gap (in region)
-            rank_mask: [B] float in {0,1}; 1 if lvl_hi > lvl_lo (valid rank
-                pair), 0 if equal (skip rank loss for this sample).
-            level_gap: [B] float; lvl_hi - lvl_lo (adaptive margin for rank
-                loss: larger gap -> larger required margin).
+            level_light_rgb/ir: [B,1,H,W] long; 0=clean(outside region or
+                lvl_lo=0), 1-5=degradation level (inside region, =lvl_lo).
+            level_heavy_rgb/ir: [B,1,H,W] long; same but =lvl_hi inside.
+            rank_mask: [B] float; 1 if lvl_hi > lvl_lo (valid rank pair).
+            level_gap: [B] float; lvl_hi - lvl_lo.
         """
-        from mmseg.datasets.transforms.quality_degradation import (
-            apply_quality_degradation_rgb, apply_quality_degradation_t)
+        import sys
+        import os
+        # 添加 QWSEG 根目录到 path, 以便 import rgbt_c
+        qwseg_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
+        if qwseg_root not in sys.path:
+            sys.path.insert(0, qwseg_root)
+        from rgbt_c import get_corruption, RGB_CORRUPTIONS, T_CORRUPTIONS
 
-        # Core degradation types (3 per modality): continuous (noise/blur) +
-        # modality-specific (motion_blur/stripe_noise) + discrete (missing).
-        # Rationale: enough variety for the quality predictor to learn
-        # continuous quality scores, without the 8-type complexity that
-        # dilutes per-type training signal. All LOCAL (spatial mask).
-        _RGB_CORE_TYPES = ['gaussian_noise', 'motion_blur', 'missing']
-        _T_CORE_TYPES = ['gaussian_noise', 'stripe_noise', 'missing']
+        # 全部 13 种退化类型 (与 rgbt_c/corruptions.py 一致)
+        _RGB_TYPES = RGB_CORRUPTIONS  # 7 种: gaussian_noise, shot_noise,
+                                       #       motion_blur, defocus_blur,
+                                       #       fog, low_light, rgb_missing
+        _T_TYPES = T_CORRUPTIONS       # 6 种: t_gaussian_noise, stripe_noise,
+                                       #       t_motion_blur, t_defocus_blur,
+                                       #       t_missing, t_quantization
 
-        # Level-area coupling: higher level -> larger degraded area.
-        # Physical rationale: severe degradation (heavy noise/blur/missing)
-        # typically affects a larger spatial extent. Level 1 = clean (area 0).
-        _LEVEL_AREA = {
-            1: [0.0],                         # clean, no degradation
-            2: [0.1, 0.15, 0.2],              # mild, small area
-            3: [0.2, 0.3, 0.4],               # moderate
-            4: [0.3, 0.5, 0.7],               # heavy, larger area
-            5: [0.5, 0.7, 0.9, 1.0],          # severe, large area to full
-        }
-        # Level probabilities: TILTED TOWARDS HEAVY degradation to strengthen
-        # robustness under severe conditions. L5 (worst) gets the highest
-        # probability. L1 (clean) kept low (0.10) since clean tokens are
-        # already abundant OUTSIDE the degraded region (local degradation).
-        _LEVEL_PROBS = [0.10, 0.15, 0.20, 0.25, 0.30]
+        # 级别概率权重: 0级(干净)=10, 1-5级逐渐增加, 5级最多=30
+        # 归一化后: 0级~9%, 1级~9%, 2级~14%, 3级~18%, 4级~23%, 5级~27%
+        _LEVEL_CHOICES = [0, 1, 2, 3, 4, 5]
+        _LEVEL_PROBS = [10, 10, 15, 20, 25, 30]
+
+        # 区域大小: 固定范围采样, 与级别解耦.
+        # 级别控制退化强度 (0-5), 区域控制退化空间范围, 两者独立.
+        # 固定 [0.2, 0.8] (参考 CutMix [Yun et al. ICCV 2019] 标准范围,
+        # 覆盖中度遮挡主要区间 30-70% [COCO-Occ, 目标检测遮挡定义]):
+        #   - 下限 0.2: 与 CutMix 默认 min 一致, 退化区域有足够语义内容
+        #   - 上限 0.8: 与 CutMix 默认 max 一致, 保留 20% 干净上下文供融合补偿
+        _AREA_RANGE = (0.2, 0.8)
 
         B, _, H, W = rgb.shape
         dev = rgb.device
@@ -174,78 +158,61 @@ class DegradationGenerator:
         def renorm(x01, mm, ss):  # [0,1] -> normalized
             return (x01 * 255.0 - mm) / ss
 
+        def apply_rgbt_c_corruption(img01_np, corruption_name, severity):
+            """调用 rgbt_c 库施加退化.
+            Args:
+                img01_np: [H,W,C] float32 in [0,1] -> 转 uint8 [0,255]
+                corruption_name: rgbt_c 注册的退化名称
+                severity: 1-5 (0 = 不退化, 直接返回)
+            Returns:
+                [H,W,C] float32 in [0,1]
+            """
+            if severity == 0:
+                return img01_np
+            # rgbt_c 接受 uint8 [0,255]
+            img_uint8 = np.clip(img01_np * 255.0, 0, 255).astype(np.uint8)
+            corr = get_corruption(corruption_name)
+            out_uint8 = corr(img_uint8, severity=severity)
+            return out_uint8.astype(np.float32) / 255.0
+
         light_rgb, light_ir = rgb.clone(), ir.clone()
         heavy_rgb, heavy_ir = rgb.clone(), ir.clone()
-        # Level masks: L1=clean (outside region, or L1 applied inside),
-        # L2-L5=degradation level (inside region). The ENTIRE image defaults
-        # to L1 (no degradation = L1 = original image). Inside the region,
-        # light version has lvl_lo, heavy version has lvl_hi.
-        # Two masks returned: level_light (for light version) and level_heavy
-        # (for heavy version), since light and heavy may have different levels
-        # in the region.
-        # Used directly by quality supervision:
-        #   - anchor: lvl=1 -> s>=clean_floor; lvl=5 -> s<=deg_ceiling
-        #   - rank:    s_light - s_heavy >= margin * (lvl_hi - lvl_lo)
-        level_light_rgb = torch.ones(B, 1, H, W, device=dev, dtype=torch.long)
-        level_light_ir = torch.ones(B, 1, H, W, device=dev, dtype=torch.long)
-        level_heavy_rgb = torch.ones(B, 1, H, W, device=dev, dtype=torch.long)
-        level_heavy_ir = torch.ones(B, 1, H, W, device=dev, dtype=torch.long)
-        # Level pair per sample: rank loss only applies when lvl_hi > lvl_lo.
+        # Level masks: 0=clean (outside region or lvl=0),
+        # 1-5=degradation level (inside region)
+        level_light_rgb = torch.zeros(B, 1, H, W, device=dev, dtype=torch.long)
+        level_light_ir = torch.zeros(B, 1, H, W, device=dev, dtype=torch.long)
+        level_heavy_rgb = torch.zeros(B, 1, H, W, device=dev, dtype=torch.long)
+        level_heavy_ir = torch.zeros(B, 1, H, W, device=dev, dtype=torch.long)
         lvl_lo_arr = torch.zeros(B, dtype=torch.long, device=dev)
         lvl_hi_arr = torch.zeros(B, dtype=torch.long, device=dev)
 
         for b in range(B):
-            # ALL samples are degraded (no whole-sample clean). Clean tokens
-            # come from OUTSIDE the local degraded region, providing the
-            # upper-anchor for quality supervision naturally.
+            # 1. 选模态
             mod = random.choice(["rgb", "ir"])
-            types = _RGB_CORE_TYPES if mod == "rgb" else _T_CORE_TYPES
+            types = _RGB_TYPES if mod == "rgb" else _T_TYPES
             deg_type = random.choice(types)
 
-            # Independent level sampling: draw TWO levels independently from
-            # _LEVEL_PROBS, then assign the smaller to 'light' and the larger
-            # to 'heavy'. This naturally produces paired samples where:
-            #   - Some pairs are equal (both same level) -> NO rank signal,
-            #     rank loss is SKIPPED for these (see eomt_rgbt_quality.py:
-            #     rank loss only applies when lvl_hi > lvl_lo).
-            #   - Most pairs span a range of severity gaps (L1vsL5, L2vsL4,
-            #     L3vsL5, etc.) -> rich continuous ranking signal.
-            # Area is coupled to the HEAVY level (the more severe one drives
-            # the spatial extent).
-            #
-            # SPECIAL CASE for 'missing': missing is BINARY (ratio=1.0, region
-            # zeroed). There is no "mild missing" vs "severe missing" by ratio
-            # — zeroed is zeroed. So:
-            #   - heavy level is FIXED at L5 (missing = most severe).
-            #   - light level is FIXED at L1 (clean — no "light missing").
-            #   - The sampled "level" only selects the REGION SIZE (from
-            #     _LEVEL_AREA), giving small/medium/large/full missing holes.
-            #   - rank pair: clean (L1) vs zeroed (L5) — the only valid
-            #     ordering for a binary degradation.
-            if deg_type == "missing":
-                lvl_lo = 1                       # clean (no light missing)
-                lvl_hi = 5                       # missing is always L5 (worst)
-                # Sample region size level (2-5) independently for variety.
-                area_lvl = random.choices([2, 3, 4, 5],
-                                          weights=_LEVEL_PROBS[1:], k=1)[0]
-                area = random.choice(_LEVEL_AREA[area_lvl])
-            else:
-                lvl_a = random.choices([1, 2, 3, 4, 5],
-                                       weights=_LEVEL_PROBS, k=1)[0]
-                lvl_b = random.choices([1, 2, 3, 4, 5],
-                                       weights=_LEVEL_PROBS, k=1)[0]
-                lvl_lo, lvl_hi = min(lvl_a, lvl_b), max(lvl_a, lvl_b)
-                # When lvl_lo == lvl_hi, both versions are identical -> no
-                # rank signal. We do NOT force them apart (that would inject
-                # a false ordering). The rank loss handles this by skipping
-                # equal pairs (rank_mask=0).
-                area = random.choice(_LEVEL_AREA[lvl_hi])
+            # 2. 独立采样两个级别 (0-5), 小的给 light, 大的给 heavy
+            lvl_a = random.choices(_LEVEL_CHOICES, weights=_LEVEL_PROBS, k=1)[0]
+            lvl_b = random.choices(_LEVEL_CHOICES, weights=_LEVEL_PROBS, k=1)[0]
+            lvl_lo, lvl_hi = min(lvl_a, lvl_b), max(lvl_a, lvl_b)
 
-            # Build spatial mask (single rectangle, random aspect ratio).
-            if area <= 0:
+            # 3. missing 退化特殊处理: missing 是二值的 (置零), 无级别梯度
+            #    heavy 固定为 5 级 (全区域置零), light 固定为 0 级 (干净)
+            #    区域大小从固定范围采样 (与普通退化一致)
+            if deg_type in ('missing', 'rgb_missing', 't_missing'):
+                lvl_lo = 0   # clean
+                lvl_hi = 5   # full missing
+            # 区域大小: 从固定范围 [0.2, 0.6] 均匀采样, 与级别解耦
+            # (0 级=干净时区域无意义, 退化不会施加)
+            area = random.uniform(*_AREA_RANGE)
+
+            # 4. 构建空间 mask (单个矩形, 随机长宽比)
+            if lvl_lo == 0 and lvl_hi == 0:
+                # 两个级别都是 0 (干净), 无需退化区域
                 sm = torch.zeros(1, 1, H, W, device=dev, dtype=rgb.dtype)
             else:
-                aspect = random.uniform(0.5, 2.0)  # avoid always-square
+                aspect = random.uniform(0.5, 2.0)
                 target_area = H * W * area
                 rh = max(1, int((target_area * aspect) ** 0.5))
                 rw = max(1, int(target_area / rh))
@@ -255,28 +222,50 @@ class DegradationGenerator:
                 sm = torch.zeros(1, 1, H, W, device=dev, dtype=rgb.dtype)
                 sm[:, :, y0:y0 + rh, x0:x0 + rw] = 1.0
 
-            apply = (apply_quality_degradation_rgb if mod == "rgb"
-                     else apply_quality_degradation_t)
+            # 5. 施加退化 (在 [0,1] 空间, 调用 rgbt_c 库)
             mm, ss = (m_rgb, s_rgb) if mod == "rgb" else (m_t, s_t)
             src = (rgb if mod == "rgb" else ir)[b:b + 1]
-            src01 = denorm(src, mm, ss)
-            light01 = apply(src01.clone(), deg_type, lvl_lo, spatial_mask=sm)
-            heavy01 = apply(src01.clone(), deg_type, lvl_hi, spatial_mask=sm)
-            light_n = renorm(light01, mm, ss)
-            heavy_n = renorm(heavy01, mm, ss)
+            src01 = denorm(src, mm, ss)  # [1,3,H,W] in [0,1]
 
-            # Build level masks: L1 everywhere (clean default), then set the
-            # region to the ACTUAL level applied. light region=lvl_lo,
-            # heavy region=lvl_hi. Outside region stays L1 for both.
-            # When lvl_lo=1, light region is also L1 (= clean, no degradation).
+            # 转为 numpy [H,W,C] 施加退化, 再转回 tensor
+            src_np = src01.squeeze(0).permute(1, 2, 0).cpu().numpy()  # [H,W,3]
+
+            # light 版本 (lvl_lo)
+            if lvl_lo == 0:
+                light_np = src_np.copy()
+            else:
+                light_full = apply_rgbt_c_corruption(src_np, deg_type, lvl_lo)
+                # 仅在 mask 区域施加退化, 区域外保持干净
+                sm_np = sm.squeeze(0).squeeze(0).cpu().numpy()  # [H,W]
+                light_np = np.where(
+                    sm_np[:, :, np.newaxis] > 0.5, light_full, src_np)
+
+            # heavy 版本 (lvl_hi)
+            if lvl_hi == 0:
+                heavy_np = src_np.copy()
+            else:
+                heavy_full = apply_rgbt_c_corruption(src_np, deg_type, lvl_hi)
+                sm_np = sm.squeeze(0).squeeze(0).cpu().numpy()
+                heavy_np = np.where(
+                    sm_np[:, :, np.newaxis] > 0.5, heavy_full, src_np)
+
+            # 转回 tensor [1,3,H,W] 并 renorm
+            light_t = torch.from_numpy(light_np).permute(2, 0, 1).unsqueeze(0).to(dev)
+            heavy_t = torch.from_numpy(heavy_np).permute(2, 0, 1).unsqueeze(0).to(dev)
+            light_n = renorm(light_t, mm, ss)
+            heavy_n = renorm(heavy_t, mm, ss)
+
+            # 6. 构建 level masks
+            # 区域内: light=lvl_lo, heavy=lvl_hi; 区域外: 0 (clean)
             lvl_mask_light = torch.where(
                 sm.squeeze(0) > 0.5,
                 torch.full_like(sm.squeeze(0), lvl_lo, dtype=torch.long),
-                torch.ones_like(sm.squeeze(0), dtype=torch.long))  # [1,H,W]
+                torch.zeros_like(sm.squeeze(0), dtype=torch.long))
             lvl_mask_heavy = torch.where(
                 sm.squeeze(0) > 0.5,
                 torch.full_like(sm.squeeze(0), lvl_hi, dtype=torch.long),
-                torch.ones_like(sm.squeeze(0), dtype=torch.long))
+                torch.zeros_like(sm.squeeze(0), dtype=torch.long))
+
             if mod == "rgb":
                 light_rgb[b:b + 1] = light_n
                 heavy_rgb[b:b + 1] = heavy_n
@@ -288,13 +277,10 @@ class DegradationGenerator:
                 level_light_ir[b:b + 1] = lvl_mask_light
                 level_heavy_ir[b:b + 1] = lvl_mask_heavy
 
-            # Record level pair for rank loss: margin scales with level gap.
             lvl_lo_arr[b] = lvl_lo
             lvl_hi_arr[b] = lvl_hi
 
-        # rank_mask[b] = 1 if this sample has a valid rank pair (lvl_hi > lvl_lo)
         rank_mask = (lvl_hi_arr > lvl_lo_arr).float()
-        # level_gap[b] = lvl_hi - lvl_lo (for adaptive margin in rank loss)
         level_gap = (lvl_hi_arr - lvl_lo_arr).float()
         return (light_rgb, light_ir, heavy_rgb, heavy_ir,
                 level_light_rgb, level_light_ir,

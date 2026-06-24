@@ -59,16 +59,25 @@ model = dict(
     use_self_attn_bias=True,
     use_compensation=True,
     degradation=dict(
-        # Local degradation with 3 core types (noise + blur + missing) and
-        # level-area coupling (higher level -> larger area). See
-        # degradation.py make_paired for the full scheme. degrade_prob=0.8
-        # means 20% clean + 80% degraded (of which 15% are level-1 clean),
-        # total clean ~32%.
+        # RGBT-C 标准退化: 直接调用 rgbt_c 库 (13 种退化, 0-5 级).
+        # 0 级=干净(权重10), 1-5 级逐渐增加(权重 10/15/20/25/30).
+        # 详见 degradation.py make_paired.
         degrade_prob=0.8,
         curriculum=False,
         total_epochs=200,
     ),
 )
+
+# ---- Epoch-based schedule: 200 epochs (F0/F1 frozen-backbone training) ----
+# MFNet train = 588 iters/epoch (batch 2), 200 epochs = 117600 iters.
+# Override the base 100-epoch schedule for the degraded-training student.
+param_scheduler = [
+    dict(type='LinearLR', start_factor=1e-6, by_epoch=False, begin=0, end=1500),
+    dict(type='PolyLR', eta_min=0.0, power=0.9, begin=1500, end=117600,
+         by_epoch=False),
+]
+train_cfg = dict(_delete_=True, type='EpochBasedTrainLoop',
+                 max_epochs=200, val_interval=5)
 
 custom_hooks = [
     dict(type='EoMTRGBTVisHook', interval=10, num_samples=1),

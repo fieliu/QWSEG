@@ -124,11 +124,13 @@ class EoMTRGBTFusion(EoMTSegmentor):
         # ---- dual-stream stage: blocks [0, decode_start) ----
         for i in range(self.decode_start):
             block = backbone.blocks[i]
-            if i in fp_to_idx:
-                z_rgb, z_t = self._fuse(fp_to_idx[i], z_rgb, z_t, quality_info)
-            # 在对比层保存融合前的双流特征 (block 前的特征, 语义已成熟)
+            # 先保存对比特征 (融合前双流独立, 语义已成熟),
+            # 必须在 _fuse 之前, 否则保存的是融合后两流已互相污染的特征,
+            # 对比损失信号会大幅减弱甚至失效.
             if self.use_contrast and i == self.contrast_layer:
                 self._contrast_feat = (z_rgb, z_t)
+            if i in fp_to_idx:
+                z_rgb, z_t = self._fuse(fp_to_idx[i], z_rgb, z_t, quality_info)
             z_rgb = self._run_block(block, net, z_rgb, None, rope)
             z_t = self._run_block(block, net, z_t, None, rope)
 

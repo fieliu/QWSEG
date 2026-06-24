@@ -29,6 +29,7 @@ class EoMTRGBTFusion(EoMTSegmentor):
                  contrast_tau=0.1, patch_size=16, **kwargs):
         super().__init__(*args, patch_size=patch_size, **kwargs)
         self.patch_size = patch_size
+        self.fusion_heads = fusion_heads
         net = self.network
         num_layers = len(net.encoder.backbone.blocks)
         self.decode_start = num_layers - net.num_blocks  # query inserted here

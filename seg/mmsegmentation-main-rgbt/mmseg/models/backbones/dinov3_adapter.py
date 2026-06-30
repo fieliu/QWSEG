@@ -22,7 +22,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn as nn.functional as F
+import torch.nn.functional as F
 import torch.utils.checkpoint as cp
 
 from mmseg.registry import MODELS

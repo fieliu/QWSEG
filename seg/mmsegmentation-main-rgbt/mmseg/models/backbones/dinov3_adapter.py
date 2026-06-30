@@ -177,7 +177,7 @@ class Injector(nn.Module):
         self.query_norm = norm_layer(dim)
         self.feat_norm = norm_layer(dim)
         self.attn = MSDeformAttnWrapper(
-            d_model=dim, n_levels=n_levels, num_heads=num_heads, n_points=n_points)
+            d_model=dim, n_levels=n_levels, n_heads=num_heads, n_points=n_points)
         self.gamma = nn.Parameter(init_values * torch.ones((dim)), requires_grad=True)
 
     def forward(self, query, reference_points, feat, spatial_shapes, level_start_index):
@@ -207,7 +207,7 @@ class Extractor(nn.Module):
         self.query_norm = norm_layer(dim)
         self.feat_norm = norm_layer(dim)
         self.attn = MSDeformAttnWrapper(
-            d_model=dim, n_levels=n_levels, num_heads=num_heads, n_points=n_points)
+            d_model=dim, n_levels=n_levels, n_heads=num_heads, n_points=n_points)
         self.with_cffn = with_cffn
         self.with_cp = with_cp
         if with_cffn:

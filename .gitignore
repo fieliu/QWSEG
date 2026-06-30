@@ -102,3 +102,5 @@ projects/
 # Notebooks (often with embedded images)
 *.ipynb
 *.md
+ViT-Adapter/*
+

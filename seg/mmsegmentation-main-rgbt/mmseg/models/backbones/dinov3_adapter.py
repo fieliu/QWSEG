@@ -36,26 +36,46 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class MSDeformAttnWrapper(nn.Module):
-    """Wraps mmdet's MultiScaleDeformableAttention to match the interface
-    used in the official ViT-Adapter code."""
+    """Wraps MultiScaleDeformableAttention to match the interface
+    used in the official ViT-Adapter code.
+
+    Tries multiple import paths for compatibility across mmdet/mmcv versions.
+    """
 
     def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4):
         super().__init__()
-        from mmdet.models.layers.transformer.multi_scale_deform_attn import \
-            MultiScaleDeformableAttention
-        self.attn = MultiScaleDeformableAttention(
+        _DeformAttn = None
+        # mmdet 3.x moves it to mmcv.ops; mmdet 2.x had it in layers
+        for _path in [
+            'mmcv.ops',
+            'mmdet.models.layers',
+            'mmdet.models.layers.transformer.multi_scale_deform_attn',
+        ]:
+            try:
+                _mod = __import__(_path, fromlist=['MultiScaleDeformableAttention'])
+                _DeformAttn = getattr(_mod, 'MultiScaleDeformableAttention', None)
+                if _DeformAttn is not None:
+                    break
+            except (ImportError, AttributeError):
+                continue
+        if _DeformAttn is None:
+            raise ImportError(
+                "Cannot import MultiScaleDeformableAttention. "
+                "Please install mmdet: `mim install mmdet` or "
+                "`pip install mmdet`"
+            )
+        self.attn = _DeformAttn(
             embed_dims=d_model,
             num_levels=n_levels,
             num_heads=n_heads,
             num_points=n_points,
             batch_first=True,
         )
-        # Ensure im2col_step is available
-        self.attn.im2col_step = 64
+        if hasattr(self.attn, 'im2col_step'):
+            self.attn.im2col_step = 64
 
     def forward(self, query, reference_points, value, spatial_shapes,
                 level_start_index, attention_weights=None):
-        """Match official interface: attn(query, ref_pts, value, spatial_shapes, level_start_index, None)"""
         return self.attn(
             query=query,
             key=value,

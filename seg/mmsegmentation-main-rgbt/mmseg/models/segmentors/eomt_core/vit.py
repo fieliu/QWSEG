@@ -39,7 +39,8 @@ def _load_meta_dinov3_pth(ckpt_path):
     cfg = DINOv3ViTConfig(
         patch_size=patch, hidden_size=hidden, intermediate_size=inter,
         num_hidden_layers=n_layers, num_attention_heads=hidden // 64,
-        num_register_tokens=n_reg, use_gated_mlp=False)
+        num_register_tokens=n_reg, use_gated_mlp=False,
+        rope_theta=100.0)
     model = DINOv3ViTModel(cfg)
 
     new = {}
@@ -139,9 +140,10 @@ class ViT(nn.Module):
         self.register_buffer("pixel_std", pixel_std)
 
     def transformers_to_timm(self, backbone, img_size: tuple[int, int]):
-        # DINOv3ViTModel structure: embeddings, model (DINOv3ViTEncoder with
-        # .layer), norm, rope_embeddings.  DINOv2 had .layer directly on the
-        # top-level model; DINOv3 nests it under .model.
+        # DINOv3ViTModel structure varies by transformers version:
+        #   Old: backbone.model.layer (DINOv3ViTEncoder nested under .model)
+        #   New: backbone.layer (DINOv3ViTEncoder flattened into top-level)
+        # DINOv2: backbone.layers (timm style)
         backbone.patch_embed = backbone.embeddings
         backbone.patch_embed.patch_size = (
             backbone.embeddings.config.patch_size,
@@ -154,13 +156,24 @@ class ViT(nn.Module):
 
         backbone.embed_dim = backbone.embeddings.config.hidden_size
         backbone.num_prefix_tokens = backbone.patch_embed.config.num_register_tokens + 1
-        # DINOv3: layers live in backbone.model.layer (not backbone.layer)
-        backbone.blocks = backbone.model.layer
 
-        del (
-            backbone.patch_embed.mask_token,
-            backbone.embeddings,
-            backbone.model,
-        )
+        # Auto-detect layer location
+        if hasattr(backbone, 'model') and hasattr(backbone.model, 'layer'):
+            # Old DINOv3: layers under backbone.model.layer
+            backbone.blocks = backbone.model.layer
+            del backbone.model
+        elif hasattr(backbone, 'layer'):
+            # New DINOv3: layers directly on backbone
+            backbone.blocks = backbone.layer
+            del backbone.layer
+        elif hasattr(backbone, 'layers'):
+            # DINOv2 / timm style
+            backbone.blocks = backbone.layers
+
+        # Clean up embeddings reference (we use patch_embed now)
+        del backbone.embeddings
+        # Remove mask_token if present (not needed for inference)
+        if hasattr(backbone, 'mask_token'):
+            del backbone.mask_token
 
         return backbone

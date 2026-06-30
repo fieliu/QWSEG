@@ -17,12 +17,10 @@ def load_dinov3_backbone(
 
     Returns the backbone with .blocks, .patch_embed, .embed_dim, etc.
     """
-    import sys
-    import os
-    # Add the segmentors path so we can import eomt_core
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-    from segmentors.eomt_core.vit import ViT
+    import importlib
+    # Import eomt_core.vit directly without triggering segmentors/__init__.py
+    vit_mod = importlib.import_module('mmseg.models.segmentors.eomt_core.vit')
+    ViT = vit_mod.ViT
 
     encoder = ViT(
         img_size=img_size,

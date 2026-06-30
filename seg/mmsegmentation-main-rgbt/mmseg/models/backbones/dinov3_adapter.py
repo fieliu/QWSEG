@@ -25,6 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as cp
 
+from mmengine.model import BaseModule
 from mmseg.registry import MODELS
 
 logger = logging.getLogger(__name__)

@@ -58,7 +58,6 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
                  clean_floor=0.9,
                  freeze_backbone=False,
                  freeze_fusion=False,
-                 freeze_neck_head=False,
                  degradation=None,
                  # Dormant params (accepted for config backward-compat, unused)
                  suppress_value=-20.0,
@@ -217,25 +216,6 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
             print_log(
                 f'EoMTRGBTQuality: freeze_fusion=True -> froze {n_ff} '
                 f'fusion param tensors; ONLY decode-head trainable.',
-                logger='current')
-        # PURE-PLUGIN (Fp): on top of freeze_backbone, also freeze fusion +
-        # decode head (q / class_head / mask_head / upscale), leaving ONLY the
-        # quality predictors + compensation + attn-bias as trainable increment.
-        # Isolates the quality mechanism's value with the host model fully frozen
-        # (true LoRA-style plugin). attn bias is param-free; clean input -> s~=1,
-        # bias~=0 -> equals the frozen host, so clean perf does not drop.
-        if freeze_neck_head:
-            n_fnh = 0
-            mods = [self.fusions, self.network.q, self.network.class_head,
-                    self.network.mask_head, self.network.upscale]
-            for m in mods:
-                for p in m.parameters():
-                    p.requires_grad = False
-                    n_fnh += 1
-            print_log(
-                f'EoMTRGBTQuality: freeze_neck_head=True -> additionally froze '
-                f'{n_fnh} fusion+decode-head param tensors; ONLY quality '
-                f'predictor/compensation trainable (pure-plugin Fp).',
                 logger='current')
         # set by TrainVisHook (model.current_epoch = runner.epoch); default 0
         self.current_epoch = 0

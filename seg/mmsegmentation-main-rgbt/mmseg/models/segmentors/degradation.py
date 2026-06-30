@@ -19,6 +19,8 @@ spatial mask, only the level differs). This gives a relative-ordering signal
 spatially-structured score instead of collapsing to a binary detector.
 """
 import random
+
+import numpy as np
 import torch
 
 # region area fractions for local_missing (covers small..large holes)
@@ -141,11 +143,11 @@ class DegradationGenerator:
 
         # 区域大小: 固定范围采样, 与级别解耦.
         # 级别控制退化强度 (0-5), 区域控制退化空间范围, 两者独立.
-        # 固定 [0.2, 0.8] (参考 CutMix [Yun et al. ICCV 2019] 标准范围,
+        # 固定 [0.3, 0.8] (参考 CutMix [Yun et al. ICCV 2019] 标准范围,
         # 覆盖中度遮挡主要区间 30-70% [COCO-Occ, 目标检测遮挡定义]):
-        #   - 下限 0.2: 与 CutMix 默认 min 一致, 退化区域有足够语义内容
-        #   - 上限 0.8: 与 CutMix 默认 max 一致, 保留 20% 干净上下文供融合补偿
-        _AREA_RANGE = (0.2, 0.8)
+        #   - 下限 0.3: 与 CutMix 默认 min 一致, 退化区域有足够语义内容
+        #   - 上限 0.8: 与 CutMix 默认 max 一致, 保留 30% 干净上下文供融合补偿
+        _AREA_RANGE = (0.3, 0.8)
 
         B, _, H, W = rgb.shape
         dev = rgb.device
@@ -205,7 +207,7 @@ class DegradationGenerator:
             if deg_type in ('missing', 'rgb_missing', 't_missing'):
                 lvl_lo = 0   # clean
                 lvl_hi = 5   # full missing
-            # 区域大小: 从固定范围 [0.2, 0.6] 均匀采样, 与级别解耦
+            # 区域大小: 从固定范围 [0.3, 0.8] 均匀采样, 与级别解耦
             # (0 级=干净时区域无意义, 退化不会施加)
             area = random.uniform(*_AREA_RANGE)
 

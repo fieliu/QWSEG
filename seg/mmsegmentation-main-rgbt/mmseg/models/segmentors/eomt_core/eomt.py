@@ -90,6 +90,17 @@ class EoMT(nn.Module):
     ):
         if rope is not None:
             if mask is not None:
+                # NOTE: mask is BOOLEAN (True=keep, False=block).  This is
+                # correct for the default SDPA backend
+                # (F.scaled_dot_product_attention treats bool mask as
+                # True=attend / False=mask-out) and for NPU's SDPA path.
+                # Do NOT convert to an additive (0/-inf) float mask here:
+                # `sdpa_attention_forward` on NPU converts non-bool masks via
+                # `logical_not(mask.bool())`, which maps -inf -> False -> True
+                # and would silently un-block every masked key.  The eager
+                # backend would mishandle bool masks (adds 1.0/0.0), but eager
+                # is not the default and QualityAttnWrapper handles bool masks
+                # explicitly via masked_fill when _q_keep_mask is set.
                 mask = mask[:, None, ...].expand(-1, module.num_heads, -1, -1)
             return module(x, mask, rope)[0]
 

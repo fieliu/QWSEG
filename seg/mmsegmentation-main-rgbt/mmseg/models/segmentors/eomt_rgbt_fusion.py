@@ -85,14 +85,17 @@ class EoMTRGBTFusion(EoMTSegmentor):
         attn = block.attn if hasattr(block, "attn") else block.attention
         attn_out = net._attn(attn, block.norm1(x), attn_mask, rope=rope)
         if hasattr(block, "ls1"):
-            x = x + block.ls1(attn_out)
+            attn_out = block.ls1(attn_out)
         elif hasattr(block, "layer_scale1"):
-            x = x + block.layer_scale1(attn_out)
+            attn_out = block.layer_scale1(attn_out)
+        x = x + block.drop_path(attn_out)
+
         mlp_out = block.mlp(block.norm2(x))
         if hasattr(block, "ls2"):
-            x = x + block.ls2(mlp_out)
+            mlp_out = block.ls2(mlp_out)
         elif hasattr(block, "layer_scale2"):
-            x = x + block.layer_scale2(mlp_out)
+            mlp_out = block.layer_scale2(mlp_out)
+        x = x + block.drop_path(mlp_out)
         return x
 
     def _merge(self, z_rgb, z_t, **kwargs):

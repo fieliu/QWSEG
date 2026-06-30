@@ -100,6 +100,53 @@ def get_layer_id_for_vit(var_name, max_layer_id):
         return max_layer_id - 1
 
 
+def get_layer_id_for_dinov3_adapter(var_name, max_layer_id):
+    """Get the layer id for DINOv3Adapter backbone.
+
+    Handles both single-branch (DINOv3Adapter) and dual-branch
+    (RGBTDINOv3Adapter) parameter naming conventions.
+
+    DINOv3Adapter naming:
+      - backbone.backbone.blocks.{i}.*  -> ViT layer i
+      - backbone.backbone.cls_token     -> layer 0
+      - backbone.backbone.pos_embed     -> layer 0
+      - backbone.backbone.patch_embed.* -> layer 0
+      - backbone.spm.*, backbone.interactions.*, etc. -> adapter (max_layer_id-1)
+
+    RGBTDINOv3Adapter naming:
+      - backbone.rgb_adapter.backbone.blocks.{i}.* -> ViT layer i
+      - backbone.thr_* -> thermal adapter (max_layer_id-1)
+    """
+    # Single-branch: DINOv3Adapter
+    if var_name.startswith('backbone.backbone.blocks.'):
+        layer_id = int(var_name.split('.')[3])
+        return layer_id + 1
+    if var_name in ('backbone.backbone.cls_token',
+                    'backbone.backbone.mask_token',
+                    'backbone.backbone.pos_embed'):
+        return 0
+    if var_name.startswith('backbone.backbone.patch_embed'):
+        return 0
+    if var_name.startswith('backbone.backbone.embeddings'):
+        return 0
+
+    # Dual-branch: RGBTDINOv3Adapter (rgb_adapter prefix)
+    if var_name.startswith('backbone.rgb_adapter.backbone.blocks.'):
+        layer_id = int(var_name.split('.')[4])
+        return layer_id + 1
+    if var_name in ('backbone.rgb_adapter.backbone.cls_token',
+                    'backbone.rgb_adapter.backbone.mask_token',
+                    'backbone.rgb_adapter.backbone.pos_embed'):
+        return 0
+    if var_name.startswith('backbone.rgb_adapter.backbone.patch_embed'):
+        return 0
+    if var_name.startswith('backbone.rgb_adapter.backbone.embeddings'):
+        return 0
+
+    # All adapter modules (SPM, Interactions, level_embed, etc.) get highest lr
+    return max_layer_id - 1
+
+
 @OPTIM_WRAPPER_CONSTRUCTORS.register_module()
 class LearningRateDecayOptimizerConstructor(DefaultOptimWrapperConstructor):
     """Different learning rates are set for different layers of backbone.
@@ -142,6 +189,11 @@ class LearningRateDecayOptimizerConstructor(DefaultOptimWrapperConstructor):
                 if 'ConvNeXt' in module.backbone.__class__.__name__:
                     layer_id = get_layer_id_for_convnext(
                         name, self.paramwise_cfg.get('num_layers'))
+                    print_log(f'set param {name} as id {layer_id}')
+                elif 'DINOv3Adapter' in module.backbone.__class__.__name__ or \
+                     'RGBTDINOv3Adapter' in module.backbone.__class__.__name__:
+                    layer_id = get_layer_id_for_dinov3_adapter(
+                        name, num_layers)
                     print_log(f'set param {name} as id {layer_id}')
                 elif 'BEiT' in module.backbone.__class__.__name__ or \
                      'MAE' in module.backbone.__class__.__name__:

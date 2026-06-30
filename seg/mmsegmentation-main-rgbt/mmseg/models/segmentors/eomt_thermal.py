@@ -1,11 +1,7 @@
-"""Single-modal EoMT segmentor wrapped for MMSegmentation.
+"""EoMT single-modal Thermal-only segmentor wrapped for MMSegmentation.
 
-Deliverable 1: a faithful EoMT (Encoder-only Mask Transformer, CVPR 2025)
-wrapped as an mmseg BaseSegmentor. Uses a DINOv3 ViT backbone via the original
-EoMT ViT wrapper, and the original HF Mask2Former set-prediction loss.
-
-Only the RGB channels (first 3 of the 6-channel RGB-T input) are used here.
-This is the smoke-test baseline to confirm EoMT runs inside mmseg.
+Same as EoMTSegmentor but uses the last 3 channels (Thermal) instead of RGB.
+This is for verifying the thermal-only upper bound.
 """
 from typing import Optional
 import torch
@@ -23,7 +19,7 @@ from .eomt_utils import build_targets, mask_class_to_seg_logits, resize_seg_logi
 
 
 @MODELS.register_module()
-class EoMTSegmentor(BaseSegmentor):
+class EoMTThermal(BaseSegmentor):
     def __init__(
         self,
         img_size,
@@ -35,7 +31,6 @@ class EoMTSegmentor(BaseSegmentor):
         num_blocks=4,
         masked_attn_enabled=True,
         local_files_only=True,
-        # loss coefficients (EoMT defaults)
         num_points=12544,
         oversample_ratio=3.0,
         importance_sample_ratio=0.75,
@@ -80,16 +75,11 @@ class EoMTSegmentor(BaseSegmentor):
             no_object_coefficient=no_object_coefficient,
         )
 
-    # ---- input handling -------------------------------------------------
-    def _get_rgb(self, inputs):
-        # 6-channel RGB-T input -> take RGB (first 3). Already normalized by
-        # the mmseg data_preprocessor, so EoMT internal normalization is OFF
-        # (we feed network.encoder.backbone directly, bypassing forward's norm).
-        return inputs[:, :3]
+    def _get_thermal(self, inputs):
+        # 6-channel RGB-T input -> take Thermal (last 3 channels)
+        return inputs[:, 3:]
 
     def _network_forward(self, x):
-        """Replicates EoMT.forward but WITHOUT the internal pixel_mean/std
-        normalization (mmseg data_preprocessor already normalized the input)."""
         net = self.network
         backbone = net.encoder.backbone
 
@@ -135,9 +125,8 @@ class EoMTSegmentor(BaseSegmentor):
         class_logits_per_layer.append(cl)
         return mask_logits_per_layer, class_logits_per_layer
 
-    # ---- training -------------------------------------------------------
     def loss(self, inputs, data_samples):
-        x = self._get_rgb(inputs)
+        x = self._get_thermal(inputs)
         mask_logits_per_layer, class_logits_per_layer = self._network_forward(x)
         targets = build_targets(data_samples, self.num_classes, self.ignore_index)
 
@@ -150,9 +139,8 @@ class EoMTSegmentor(BaseSegmentor):
                 losses[f"l{li}.{k}"] = v
         return losses
 
-    # ---- inference ------------------------------------------------------
     def encode_decode(self, inputs, batch_img_metas):
-        x = self._get_rgb(inputs)
+        x = self._get_thermal(inputs)
         mask_logits_per_layer, class_logits_per_layer = self._network_forward(x)
         ml, cl = mask_logits_per_layer[-1], class_logits_per_layer[-1]
         seg_logits = mask_class_to_seg_logits(ml, cl)
@@ -169,12 +157,12 @@ class EoMTSegmentor(BaseSegmentor):
         return self.postprocess_result(seg_logits, data_samples)
 
     def _forward(self, inputs, data_samples=None):
-        x = self._get_rgb(inputs)
+        x = self._get_thermal(inputs)
         ml, cl = self._network_forward(x)
         return mask_class_to_seg_logits(ml[-1], cl[-1])
 
     def extract_feat(self, inputs):
-        return self._get_rgb(inputs)
+        return self._get_thermal(inputs)
 
     def postprocess_result(self, seg_logits, data_samples):
         B, C, H, W = seg_logits.shape

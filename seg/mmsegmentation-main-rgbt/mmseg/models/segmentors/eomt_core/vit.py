@@ -139,6 +139,9 @@ class ViT(nn.Module):
         self.register_buffer("pixel_std", pixel_std)
 
     def transformers_to_timm(self, backbone, img_size: tuple[int, int]):
+        # DINOv3ViTModel structure: embeddings, model (DINOv3ViTEncoder with
+        # .layer), norm, rope_embeddings.  DINOv2 had .layer directly on the
+        # top-level model; DINOv3 nests it under .model.
         backbone.patch_embed = backbone.embeddings
         backbone.patch_embed.patch_size = (
             backbone.embeddings.config.patch_size,
@@ -151,12 +154,13 @@ class ViT(nn.Module):
 
         backbone.embed_dim = backbone.embeddings.config.hidden_size
         backbone.num_prefix_tokens = backbone.patch_embed.config.num_register_tokens + 1
-        backbone.blocks = backbone.layer
+        # DINOv3: layers live in backbone.model.layer (not backbone.layer)
+        backbone.blocks = backbone.model.layer
 
         del (
             backbone.patch_embed.mask_token,
             backbone.embeddings,
-            backbone.layer,
+            backbone.model,
         )
 
         return backbone

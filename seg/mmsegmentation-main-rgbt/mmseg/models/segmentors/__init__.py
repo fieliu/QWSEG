@@ -47,6 +47,10 @@ from .swin_dual_add import SwinDualAdd
 from .mitmul_ablation import MiTMulABBaseline, MiTMulABV1, MiTMulABV2, MiTMulABV3, MiTMulABV5, MiTMulABV6, MiTMulABV7, MiTMulABV8
 from .swin_multibranch_noquality import SwinMultiBranchNoQuality
 from .swin_quality_lt_mask2former import QualityGatedSwinLTMask2Former
+from .dinov3_adapter_m2f import DINOv3AdapterM2F, DINOv3AdapterM2FSingle
+from .dinov3_adapter_m2f_quality import DINOv3AdapterM2FQuality
+from .mask2former_rgbt_crossattn import Mask2FormerRGBTCrossAttn
+from .eomt_thermal import EoMTThermal
 
 __all__ = [
     'BaseSegmentor', 'EncoderDecoder', 'CascadeEncoderDecoder', 'SegTTAModel',
@@ -81,4 +85,7 @@ __all__ = [
     'CRMMask2Former', 'Mask2FormerRGBTAdd',
     'SwinMultiBranchNoQuality',
     'QualityGatedSwinLTMask2Former',
+    'DINOv3AdapterM2F', 'DINOv3AdapterM2FSingle', 'DINOv3AdapterM2FQuality',
+    'Mask2FormerRGBTCrossAttn',
+    'EoMTThermal',
 ]

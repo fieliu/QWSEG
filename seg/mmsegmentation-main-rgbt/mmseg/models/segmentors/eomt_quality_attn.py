@@ -235,7 +235,7 @@ class QualityAttnWrapper(nn.Module):
     def forward(self, hidden_states, attention_mask=None,
                 position_embeddings=None, **kwargs):
         # No quality mask set (e.g. EoMT query-decode stage) -> behave EXACTLY
-        # like the original attention, so its native mask handling is preserved.
+        # like the original attention (native flash-attention / SDPA path).
         if self._q_keep_mask is None:
             return self.attn(hidden_states, attention_mask=attention_mask,
                              position_embeddings=position_embeddings, **kwargs)
@@ -252,20 +252,32 @@ class QualityAttnWrapper(nn.Module):
                 if rope_fn is not None:
                     q, k = rope_fn(q, k, cos, sin)
 
-            attn = torch.matmul(q, k.transpose(-1, -2)) * a.scaling  # [B,H,N,N]
+            # Key-side log-bias for flash attention (F.scaled_dot_product_attention).
+            #   softmax(QKᵀ/d + log(D))  ≅  softmax(QKᵀ/d) * D / renormalize
+            # D clamped to 1e-9 so log(0) -> -20.7 (near-full suppress).
+            # MUST use torch.zeros + assignment to get a contiguous New tensor;
+            # .expand() creates a broadcast view whose strides flash-attn rejects.
+            log_bias = torch.log(self._q_keep_mask.clamp_min(1e-9))  # [B, N]
+            attn_bias = torch.zeros(B, 1, 1, N, device=q.device, dtype=q.dtype)
+            attn_bias[:, 0, 0, :] = log_bias
+
+            # Merge with EoMT decode-stage attention_mask (bool or additive)
             if attention_mask is not None:
                 if attention_mask.dtype == torch.bool:
-                    attn = attn.masked_fill(attention_mask, float('-inf'))
+                    attn_bias = attn_bias.masked_fill(attention_mask, float('-inf'))
                 else:
-                    attn = attn + attention_mask
-            attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
-            attn = attn * self._q_keep_mask[:, None, None, :]
-            attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-6)
-            if self.training and a.dropout > 0:
-                attn = F.dropout(attn, p=a.dropout)
-            out = torch.matmul(attn, v).transpose(1, 2).reshape(B, N, -1).contiguous()
+                    attn_bias = attn_bias + attention_mask
+
+            # Flash attention on Ampere+, <1% of the matmul memory (no [B,H,N,N]).
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_bias,
+                dropout_p=a.dropout if self.training else 0.0,
+                scale=a.scaling,
+            )
+            out = out.transpose(1, 2).reshape(B, N, -1).contiguous()
             out = a.o_proj(out)
-            return out, attn
+            return out, None  # 2-tuple: EoMT._attn does module(...)[0]
         finally:
             self._q_keep_mask = None  # always consume, even on exception
 

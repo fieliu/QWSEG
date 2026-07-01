@@ -265,7 +265,9 @@ class PartialDegradeEvalHook(Hook):
         return out
 
     def _call_rgbt_c(self, img_01, modality, corr_type, severity, mask, device):
-        """Call the rgbt_c library to degrade img_01 [B,3,H,W] locally."""
+        """Call the rgbt_c library to degrade img_01 [B,3,H,W] locally.
+        get_corruption(name) returns a callable; apply with severity= kwarg,
+        matching degradation.py's pattern."""
         import os, sys
         qwseg_root = os.path.abspath(
             os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', '..'))
@@ -274,23 +276,20 @@ class PartialDegradeEvalHook(Hook):
         from rgbt_c import get_corruption
 
         B, C, H, W = img_01.shape
-        # Convert to uint8 for rgbt_c
-        img_uint8 = (img_01 * 255.0).clamp(0, 255).byte()
-        degraded = img_uint8.clone()
+        # Convert to numpy uint8 (rgbt_c works with numpy, per degradation.py)
+        img_np = (img_01 * 255.0).clamp(0, 255).cpu().numpy().astype('uint8')
+        degraded_np = img_np.copy()
+        mask_np = mask.cpu().numpy().astype('uint8')
 
-        corruption = get_corruption(corr_type, severity)
-        if corruption is not None:
+        corr = get_corruption(corr_type)
+        if corr is not None:
             for b in range(B):
-                img_b = degraded[b:b+1]  # [1,3,H,W]
-                if modality == 'rgb':
-                    degraded_b = corruption(img_b)
-                else:
-                    # T corruptions expect the function name directly
-                    degraded_b = corruption(img_b)
-
+                img_b = degraded_np[b:b+1]  # [1,3,H,W]
+                # severity is a kwarg to the callable, per degradation.py
+                degraded_b = corr(img_b, severity=severity)
                 # Only replace masked region
-                m = mask[b:b+1].byte()  # [1,1,H,W]
-                degraded[b:b+1] = torch.where(
-                    m.bool(), degraded_b, degraded[b:b+1])
+                m = mask_np[b:b+1]  # [1,1,H,W]
+                degraded_np[b:b+1] = degraded_b * m + img_np[b:b+1] * (1 - m)
 
-        return degraded.float() / 255.0
+        degraded = torch.from_numpy(degraded_np.astype('float32')).to(device)
+        return degraded / 255.0

@@ -78,7 +78,6 @@ model = dict(
             norm_cfg=dict(type='GN', num_groups=32),
             act_cfg=dict(type='ReLU'),
             encoder=dict(
-                type='DetrTransformerEncoder',
                 num_layers=6,
                 layer_cfg=dict(
                     type='BaseTransformerLayer',

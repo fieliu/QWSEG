@@ -73,6 +73,7 @@ model = dict(
         align_corners=False,
         pixel_decoder=dict(
             type='MSDeformAttnPixelDecoder',
+            _scope_='mmdet',
             num_outs=3,
             norm_cfg=dict(type='GN', num_groups=32),
             act_cfg=dict(type='ReLU'),
@@ -109,6 +110,7 @@ model = dict(
             type='SinePositionalEncoding', num_feats=128, normalize=True),
         transformer_decoder=dict(
             type='DetrTransformerDecoder',
+            _scope_='mmdet',
             return_intermediate=True,
             num_layers=9,
             layer_cfg=dict(

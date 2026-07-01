@@ -252,23 +252,27 @@ class QualityAttnWrapper(nn.Module):
                 if rope_fn is not None:
                     q, k = rope_fn(q, k, cos, sin)
 
-            # Key-side log-bias for flash attention (F.scaled_dot_product_attention).
-            #   softmax(QKᵀ/d + log(D))  ≅  softmax(QKᵀ/d) * D / renormalize
-            # D clamped to 1e-9 so log(0) -> -20.7 (near-full suppress).
-            # MUST use torch.zeros + assignment to get a contiguous New tensor;
-            # .expand() creates a broadcast view whose strides flash-attn rejects.
+            # .transpose(1,2) makes q/k/v non-contiguous. Flash attention's CUDA
+            # kernel needs stride-1 in the last dim for LSE alignment; .contiguous()
+            # fixes this. The copy is cheap (one per stream per block) vs 30GB of
+            # matmul materialization.
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+
+            # Key-side log-bias [B, 1, 1, N]: same softmax bias for all heads and
+            # all query positions. torch.zeros gives proper contiguous memory;
+            # .expand() views have misaligned strides that flash-attn rejects.
             log_bias = torch.log(self._q_keep_mask.clamp_min(1e-9))  # [B, N]
             attn_bias = torch.zeros(B, 1, 1, N, device=q.device, dtype=q.dtype)
             attn_bias[:, 0, 0, :] = log_bias
 
-            # Merge with EoMT decode-stage attention_mask (bool or additive)
             if attention_mask is not None:
                 if attention_mask.dtype == torch.bool:
                     attn_bias = attn_bias.masked_fill(attention_mask, float('-inf'))
                 else:
                     attn_bias = attn_bias + attention_mask
 
-            # Flash attention on Ampere+, <1% of the matmul memory (no [B,H,N,N]).
             out = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attn_bias,

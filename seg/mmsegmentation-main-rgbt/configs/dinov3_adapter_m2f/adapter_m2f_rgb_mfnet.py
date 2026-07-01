@@ -77,7 +77,7 @@ model = dict(
             encoder=dict(
                 type='DetrTransformerEncoder',
                 num_layers=6,
-                transformerlayers=dict(
+                layer_cfg=dict(
                     type='BaseTransformerLayer',
                     attn_cfgs=dict(
                         type='MultiScaleDeformableAttention',
@@ -109,28 +109,31 @@ model = dict(
             type='DetrTransformerDecoder',
             return_intermediate=True,
             num_layers=9,
-            transformerlayers=dict(
+            layer_cfg=dict(
                 type='DetrTransformerDecoderLayer',
-                attn_cfgs=dict(
+                self_attn_cfg=dict(
                     type='MultiheadAttention',
                     embed_dims=256,
                     num_heads=8,
                     attn_drop=0.0,
                     proj_drop=0.0,
                     dropout_layer=None,
-                    batch_first=False),
-                ffn_cfgs=dict(
+                    batch_first=True),
+                cross_attn_cfg=dict(
+                    type='MultiheadAttention',
+                    embed_dims=256,
+                    num_heads=8,
+                    attn_drop=0.0,
+                    proj_drop=0.0,
+                    dropout_layer=None,
+                    batch_first=True),
+                ffn_cfg=dict(
                     type='FFN',
                     embed_dims=256,
                     feedforward_channels=2048,
                     num_fcs=2,
-                    act_cfg=dict(type='ReLU', inplace=True),
-                    ffn_drop=0.0,
-                    dropout_layer=None,
-                    add_identity=True),
-                feedforward_channels=2048,
-                operation_order=('cross_attn', 'norm', 'self_attn', 'norm',
-                                 'ffn', 'norm')),
+                    act_cfg=dict(type='ReLU', inplace=True)),
+                norm_cfg=dict(type='LN')),
             init_cfg=None),
         loss_cls=dict(
             type='CrossEntropyLoss',
@@ -182,22 +185,22 @@ optim_wrapper = dict(
         num_layers=12,
         layer_decay_rate=0.95))
 
-# Official lr schedule: poly with linear warmup
+# LR schedule: poly with linear warmup, 200 epochs = 117600 iters
 param_scheduler = [
     dict(type='LinearLR', start_factor=1e-6, by_epoch=False, begin=0, end=1500),
-    dict(type='PolyLR', eta_min=0.0, power=1.0, begin=1500, end=160000,
+    dict(type='PolyLR', eta_min=0.0, power=1.0, begin=1500, end=117600,
          by_epoch=False),
 ]
 
-train_cfg = dict(type='IterBasedTrainLoop', max_iters=160000, val_interval=5000)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=200, val_interval=5)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
 default_hooks = dict(
     timer=dict(type='IterTimerHook'),
-    logger=dict(type='LoggerHook', interval=50, log_metric_by_epoch=False),
+    logger=dict(type='LoggerHook', interval=50, log_metric_by_epoch=True),
     param_scheduler=dict(type='ParamSchedulerHook'),
-    checkpoint=dict(type='CheckpointHook', by_epoch=False, interval=5000,
+    checkpoint=dict(type='CheckpointHook', by_epoch=True, interval=5,
                     save_best='mIoU'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
     visualization=dict(type='SegVisualizationHook'))

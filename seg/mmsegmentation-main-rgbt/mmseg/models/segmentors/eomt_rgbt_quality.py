@@ -77,6 +77,17 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         self.quality_predictors = nn.ModuleList(
             [TokenQualityPredictor(dim) for _ in range(self.num_segments)]
         )
+        # INCREMENTAL quality-gated cross-attn fusions (one per segment boundary).
+        # These are NEW parameters (not from the clean teacher) that apply the
+        # soft keep-mask D to gate each modality's keys during cross-attention:
+        #   z_rgb' = baseline(z_rgb, z_t)           # frozen teacher fusion
+        #   z_rgb''= quality(z_rgb', z_t, D_t)      # new gated fusion (incremental)
+        # Baseline self.fusions (inherited from EoMTRGBTFusion / teacher) are
+        # always frozen; these quality_fusions are the true incremental contribution.
+        self.quality_fusions = nn.ModuleList(
+            [CrossAttnFusion(dim, num_heads=self.fusion_heads)
+             for _ in range(len(self.fusion_points))]
+        )
         # Dedicated cross-attn fusion for the final merge. Unlike the per-segment
         # fusions (which run mid-stream at fusion_points), this runs ONCE right
         # before the two streams are merged into a single sequence for the EoMT
@@ -190,32 +201,46 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         deg_cfg = degradation or {}
         self.degrader = DegradationGenerator(**deg_cfg)
 
-        # frozen-backbone experiment: keep the ORIGINAL pretrained backbone
-        # frozen, train only the increments (quality / compensation / fusion)
-        # and the task head. Validates the "detachable robustness increment"
-        # claim. QualityAttnWrapper has no params of its own, so freezing all of
-        # backbone.parameters() freezes exactly the original ViT weights; the
-        # quality modules live under separate attributes and stay trainable.
+        # frozen-backbone (Adapter paradigm): the clean teacher's ViT backbone
+        # AND baseline cross-attn fusions are NEVER modified — they are the
+        # frozen host model. The incremental modules (quality_predictors,
+        # quality_fusions, quality-attn wrapper, decode-head) are trained.
+        # freeze_fusion additionally freezes the incremental quality_fusions,
+        # isolating the quality_predictors + decode-head contribution (F0).
         if freeze_backbone:
             n_frozen = 0
+            # freeze ViT backbone (untouchable host)
             for p in self.network.encoder.backbone.parameters():
                 p.requires_grad = False
                 n_frozen += 1
-            print_log(
-                f'EoMTRGBTQuality: freeze_backbone=True -> froze {n_frozen} '
-                f'backbone param tensors; quality/fusion/decode-head trainable.',
-                logger='current')
-        # F0: 只冻结交叉注意力融合模块 (增量部分), 保留解码头可训练.
-        # F0 = 冻骨干 + 冻融合 + 禁质量 -> 只有解码头 (q/class_head/mask_head/
-        # upscale) 可训练. F1-F0 增益 = 融合 + 质量机制的增量贡献.
-        if freeze_fusion:
-            n_ff = 0
+            # freeze baseline cross-attn fusions (from teacher, NOT retrained)
+            n_bf = 0
             for p in self.fusions.parameters():
                 p.requires_grad = False
-                n_ff += 1
+                n_bf += 1
             print_log(
-                f'EoMTRGBTQuality: freeze_fusion=True -> froze {n_ff} '
-                f'fusion param tensors; ONLY decode-head trainable.',
+                f'EoMTRGBTQuality: freeze_backbone=True -> froze {n_frozen} '
+                f'backbone + {n_bf} baseline-fusion param tensors; '
+                f'quality_fusions/predictors/head trainable (F1).',
+                logger='current')
+        # F0: additionally freeze all quality/incremental modules, leaving ONLY
+        # the decode-head (q/class_head/mask_head/upscale) trainable.
+        # F1−F0 = quality_predictors + quality_fusions + quality-attn 的纯增量贡献
+        if freeze_fusion:
+            n_qf = 0
+            for p in self.quality_fusions.parameters():
+                p.requires_grad = False
+                n_qf += 1
+            for p in self.quality_predictors.parameters():
+                p.requires_grad = False
+                n_qf += 1
+            for p in self.merge_fusion.parameters():
+                p.requires_grad = False
+                n_qf += 1
+            print_log(
+                f'EoMTRGBTQuality: freeze_fusion=True -> additionally froze '
+                f'{n_qf} quality-module param tensors; ONLY decode-head '
+                f'trainable (F0).',
                 logger='current')
         # set by TrainVisHook (model.current_epoch = runner.epoch); default 0
         self.current_epoch = 0
@@ -381,20 +406,26 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         return (D_rgb, s_rgb), (D_t, s_t)
 
     def _fuse_q(self, z_rgb, z_t, D_rgb, D_t):
-        """Cross-attn fusion: each modality perceives the OTHER's high-quality
-        tokens. Low-quality tokens of the key modality are key-suppressed
-        (invisible as keys) via the soft keep-mask D -> RGB attends only to T's
-        kept tokens and vice versa; each modality's own low-quality tokens act
-        as queries and are repaired by aggregating the other's good tokens
-        (residual add in CrossAttnFusion). With multiplicative key-gating,
-        suppression is truly proportional (D=0.5 -> key weight x0.5,
-        D=0.01 -> x0.01), unlike an additive bias which softmax amplifies
-        exponentially."""
-        m_t = self._mask_2d(self._protect_prefix_mask(D_t))
-        m_rgb = self._mask_2d(self._protect_prefix_mask(D_rgb))
-        fusion = self.fusions[self._fuse_call]
-        new_rgb = fusion(z_rgb, z_t, keep_mask=m_t)   # RGB attends to T; low-q T keys suppressed
-        new_t = fusion(z_t, z_rgb, keep_mask=m_rgb)
+        """Two-stage cross-attn fusion: (1) baseline frozen fusion (teacher's
+        clean cross-attn, no gating) for cross-modal information exchange,
+        (2) INCREMENTAL quality-gated fusion (new params) that applies the
+        soft keep-mask D to suppress low-quality keys of the OTHER modality.
+        Stage (1) is the baseline teacher path (frozen in Adapter paradigm);
+        stage (2) is the pure incremental quality contribution. The residual
+        adds compound: z' = quality(baseline(z, z_other), z_other, D_other).
+        With use_quality=False, stage (2) is skipped -> z' = baseline(z, z_other)
+        = exactly the EoMTRGBTFusion teacher forward (equivalence holds)."""
+        # Stage 1: baseline frozen cross-attn (teacher's path, always runs)
+        baseline = self.fusions[self._fuse_call]
+        new_rgb = baseline(z_rgb, z_t, keep_mask=None)
+        new_t = baseline(z_t, z_rgb, keep_mask=None)
+        # Stage 2: incremental quality-gated cross-attn (new params)
+        if self.use_quality:
+            quality = self.quality_fusions[self._fuse_call]
+            m_t = self._mask_2d(self._protect_prefix_mask(D_t))
+            m_rgb = self._mask_2d(self._protect_prefix_mask(D_rgb))
+            new_rgb = quality(new_rgb, z_t, keep_mask=m_t)
+            new_t = quality(new_t, z_rgb, keep_mask=m_rgb)
         self._fuse_call += 1
         return new_rgb, new_t
 

@@ -1,7 +1,8 @@
 # EoMT RGB-T F1: FROZEN backbone + FULL quality mechanism, NO distillation,
 # started from the CLEAN model. Adapter paradigm: warm-start from clean fusion
 # baseline (teacher weights = starting point), freeze backbone, train quality
-# (bias + compensation) + fusion + decode head only.
+# (predictors + quality_fusions + attn-gate are PURE INCREMENTS;
+# baseline fusions from teacher are frozen, not retrained) + decode head.
 # F1 - F0 = the quality plugin's pure robustness increment on a frozen clean
 # model (no backbone change). Provide clean ckpt:
 #   --cfg-options model.teacher_ckpt=<clean fusion best.pth>

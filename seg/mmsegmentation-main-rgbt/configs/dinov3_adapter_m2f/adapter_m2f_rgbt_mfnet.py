@@ -72,8 +72,7 @@ model = dict(
         num_transformer_feat_level=3,
         align_corners=False,
         pixel_decoder=dict(
-            type='MSDeformAttnPixelDecoder',
-            _scope_='mmdet',
+            type='mmdet.MSDeformAttnPixelDecoder',
             num_outs=3,
             norm_cfg=dict(type='GN', num_groups=32),
             act_cfg=dict(type='ReLU'),
@@ -130,18 +129,18 @@ model = dict(
 				norm_cfg=dict(type='LN')),
             init_cfg=None),
         loss_cls=dict(
-            type='CrossEntropyLoss',
+            type='mmdet.CrossEntropyLoss',
             use_sigmoid=False,
             loss_weight=2.0,
             reduction='mean',
             class_weight=[1.0] * num_classes + [0.1]),
         loss_mask=dict(
-            type='CrossEntropyLoss',
+            type='mmdet.CrossEntropyLoss',
             use_sigmoid=True,
             reduction='mean',
             loss_weight=5.0),
         loss_dice=dict(
-            type='DiceLoss',
+            type='mmdet.DiceLoss',
             use_sigmoid=True,
             activate=True,
             reduction='mean',
@@ -153,14 +152,20 @@ model = dict(
             oversample_ratio=3.0,
             importance_sample_ratio=0.75,
             assigner=dict(
-                type='MaskHungarianAssigner',
-                cls_cost=dict(type='ClassificationCost', weight=2.0),
-                mask_cost=dict(
-                    type='CrossEntropyLossCost', weight=5.0,
-                    use_sigmoid=True),
-                dice_cost=dict(
-                    type='DiceCost', weight=5.0, pred_act=True, eps=1.0)),
-            sampler=dict(type='MaskPseudoSampler'))),
+                type='mmdet.HungarianAssigner',
+                match_costs=[
+                    dict(type='mmdet.ClassificationCost', weight=2.0),
+                    dict(
+                        type='mmdet.CrossEntropyLossCost',
+                        weight=5.0,
+                        use_sigmoid=True),
+                    dict(
+                        type='mmdet.DiceCost',
+                        weight=5.0,
+                        pred_act=True,
+                        eps=1.0),
+                ]),
+            sampler=dict(type='mmdet.MaskPseudoSampler'))),
     fusion_type='crossattn',
     train_cfg=dict(),
     test_cfg=dict(mode='slide', crop_size=crop_size, stride=(320, 427)))

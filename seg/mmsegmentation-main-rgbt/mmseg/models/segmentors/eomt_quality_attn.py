@@ -234,56 +234,29 @@ class QualityAttnWrapper(nn.Module):
 
     def forward(self, hidden_states, attention_mask=None,
                 position_embeddings=None, **kwargs):
-        # No quality mask set (e.g. EoMT query-decode stage) -> behave EXACTLY
-        # like the original attention (native flash-attention / SDPA path).
         if self._q_keep_mask is None:
             return self.attn(hidden_states, attention_mask=attention_mask,
                              position_embeddings=position_embeddings, **kwargs)
         try:
-            a = self.attn
-            B, N, _ = hidden_states.size()
-            q = a.q_proj(hidden_states).view(B, N, a.num_heads, a.head_dim).transpose(1, 2)
-            k = a.k_proj(hidden_states).view(B, N, a.num_heads, a.head_dim).transpose(1, 2)
-            v = a.v_proj(hidden_states).view(B, N, a.num_heads, a.head_dim).transpose(1, 2)
+            # Turn soft keep-mask D into a key-side log-bias:
+            #   D=1 (keep) -> log(1)=0 (no effect)
+            #   D=0.01 (pruned) -> log(0.01)=-4.6 (near-full suppress)
+            #   softmax(scores + log(D_j)) ≅ softmax(scores) * D_j / Σ D
+            # HF DINOv3 attention accepts attention_mask as [B, N] float
+            # (additive, broadcast to all heads & queries). Just merge our
+            # bias with any existing mask and delegate to the ORIGINAL module.
+            log_bias = torch.log(self._q_keep_mask.clamp_min(1e-9))
+            if attention_mask is None:
+                merged_mask = log_bias
+            elif attention_mask.dtype == torch.bool:
+                merged_mask = log_bias.masked_fill(attention_mask, float('-inf'))
+            else:
+                merged_mask = attention_mask + log_bias
 
-            if position_embeddings is not None:
-                rope_fn = _get_rope_fn()
-                cos, sin = position_embeddings
-                if rope_fn is not None:
-                    q, k = rope_fn(q, k, cos, sin)
-
-            # .transpose(1,2) makes q/k/v non-contiguous. Flash attention's CUDA
-            # kernel needs stride-1 in the last dim for LSE alignment; .contiguous()
-            # fixes this. The copy is cheap (one per stream per block) vs 30GB of
-            # matmul materialization.
-            q = q.contiguous()
-            k = k.contiguous()
-            v = v.contiguous()
-
-            # Key-side log-bias [B, 1, 1, N]: same softmax bias for all heads and
-            # all query positions. torch.zeros gives proper contiguous memory;
-            # .expand() views have misaligned strides that flash-attn rejects.
-            log_bias = torch.log(self._q_keep_mask.clamp_min(1e-9))  # [B, N]
-            attn_bias = torch.zeros(B, 1, 1, N, device=q.device, dtype=q.dtype)
-            attn_bias[:, 0, 0, :] = log_bias
-
-            if attention_mask is not None:
-                if attention_mask.dtype == torch.bool:
-                    attn_bias = attn_bias.masked_fill(attention_mask, float('-inf'))
-                else:
-                    attn_bias = attn_bias + attention_mask
-
-            out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_bias,
-                dropout_p=a.dropout if self.training else 0.0,
-                scale=a.scaling,
-            )
-            out = out.transpose(1, 2).reshape(B, N, -1).contiguous()
-            out = a.o_proj(out)
-            return out, None  # 2-tuple: EoMT._attn does module(...)[0]
+            return self.attn(hidden_states, attention_mask=merged_mask,
+                             position_embeddings=position_embeddings, **kwargs)
         finally:
-            self._q_keep_mask = None  # always consume, even on exception
+            self._q_keep_mask = None
 
 
 def wrap_backbone_attention(backbone):

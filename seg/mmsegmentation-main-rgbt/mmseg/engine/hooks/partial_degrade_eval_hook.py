@@ -153,51 +153,63 @@ class PartialDegradeEvalHook(Hook):
 
         for idx in self._subset_indices:
             sample = dataset[idx]
-            # mmseg val dataset returns (img, data_sample) or just img
+            # dataset returns (img, data_sample) or dict
             if isinstance(sample, (tuple, list)):
                 img = sample[0]
+                ds  = sample[1]
+            elif isinstance(sample, dict):
+                img = sample.get('inputs', sample)
+                ds  = sample.get('data_samples', None)
             else:
-                img = sample['inputs'] if isinstance(sample, dict) else sample
-
-            # Handle dict-style data_sample
-            if isinstance(img, dict):
-                continue  # skip non-tensor
+                continue
 
             if not isinstance(img, torch.Tensor):
                 continue
             if img.ndim == 3:
-                img = img.unsqueeze(0)  # [C,H,W] -> [1,C,H,W]
+                img = img.unsqueeze(0)
             img = img.to(next(model.parameters()).device)
 
             # Random severity 1-5
             sev = rng.randint(1, 5)
-            sev_idx = sev - 1  # 0-based index
+            sev_idx = sev - 1
 
-            # Apply local degradation
+            # Apply local degradation to the image (6ch RGB-T)
             degraded = self._apply_degradation(
                 img, modality, corr_type, sev, mean, std, rng)
 
-            # Forward
-            processed = model.data_preprocessor(
-                {'inputs': [degraded[0]],
-                 'data_samples': [sample[1]] if isinstance(sample, (tuple, list)) and len(sample) > 1 else []},
-                False)
+            # Build a minimal valid batch — re-use the original data_sample
+            # so predict() / postprocess_result have metainfo.
+            inputs_list = [degraded[0]]
+            if ds is not None:
+                ds_list = [ds]
+            else:
+                ds_list = []
+            batch = {'inputs': inputs_list, 'data_samples': ds_list}
+            processed = model.data_preprocessor(batch, False)
             inputs = processed['inputs']
             if isinstance(inputs, (list, tuple)):
                 inputs = torch.stack(inputs)
+            proc_samples = processed.get('data_samples', ds_list)
 
             # predict
-            results = model.predict(inputs, processed.get('data_samples', None))
+            try:
+                results = model.predict(inputs, proc_samples)
+            except Exception as e:
+                runner.logger.warning(
+                    f'PartialDegradeEvalHook: predict failed for {modality}/{corr_type}'
+                    f' sev={sev} idx={idx}: {e}')
+                continue
             if results is None:
                 continue
 
-            for ds in results:
-                pred_label = ds.pred_sem_seg.data.squeeze()
-                if isinstance(sample, (tuple, list)) and len(sample) > 1:
-                    label = sample[1].gt_sem_seg.data.squeeze().to(pred_label)
-                else:
-                    continue
+            # Get GT label from the original data_sample
+            if hasattr(ds, 'gt_sem_seg') and ds.gt_sem_seg is not None:
+                label = ds.gt_sem_seg.data.squeeze()
+            else:
+                continue
 
+            for r in results:
+                pred_label = r.pred_sem_seg.data.squeeze()
                 ai, au, _, _ = _intersect_and_union(
                     pred_label, label, num_classes, ignore_index)
                 area_intersect[sev_idx] += ai.cpu().float()

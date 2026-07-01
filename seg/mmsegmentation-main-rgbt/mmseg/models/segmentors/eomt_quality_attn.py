@@ -249,37 +249,40 @@ class QualityAttnWrapper(nn.Module):
             if position_embeddings is not None:
                 rope_fn = _get_rope_fn()
                 cos, sin = position_embeddings
-                # _get_rope_fn asserts non-None when module is loaded; but if
-                # transformers hasn't been imported yet (rope_fn=None), skip RoPE
-                # rather than crash — the EoMT path always imports it first.
                 if rope_fn is not None:
                     q, k = rope_fn(q, k, cos, sin)
 
-            attn = torch.matmul(q, k.transpose(-1, -2)) * a.scaling  # [B,H,N,N]
+            # Build log-bias from soft keep-mask D for key-side suppression.
+            #   softmax(QKᵀ/d + log(D))  ≅  softmax(QKᵀ/d) * D / Σ(D)
+            # — functionally nearly identical for source-blocking (low-quality
+            # keys get near-zero weight), AND compatible with flash attention
+            # (F.scaled_dot_product_attention) which does NOT materialize the
+            # [B,H,N,N] attention matrix → massive memory savings. D clamped to
+            # 1e-9 so log(0) -> -20.7 (near-full suppression) instead of -inf.
+            # Broadcast [B,N] -> [B,1,1,N] (all heads, all query positions).
+            log_bias = torch.log(self._q_keep_mask.clamp_min(1e-9))
+            attn_bias = log_bias[:, None, None, :]
+
+            # Merge with EoMT's native attention_mask (decode-stage masked attn)
             if attention_mask is not None:
-                # HF attention_mask is additive (0 = keep, -inf = block) or
-                # boolean. Handle both for forward-compat with masked-attention
-                # decode stage. Applied BEFORE softmax so masked keys get -inf
-                # (zero weight after softmax), consistent with HF semantics.
                 if attention_mask.dtype == torch.bool:
-                    attn = attn.masked_fill(attention_mask, float('-inf'))
+                    # boolean mask: convert to additive (-inf for masked)
+                    attn_bias = attn_bias.masked_fill(attention_mask, float('-inf'))
                 else:
-                    attn = attn + attention_mask
-            attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
-            # Multiplicative key-side keep-gate (probability space):
-            # D=1 -> weight unchanged; D=0 -> weight zeroed; D=0.8 -> weight x0.8.
-            # Broadcast D [B,N] over heads [B,H] and query positions [Nq].
-            attn = attn * self._q_keep_mask[:, None, None, :]
-            # Renormalize so weights sum to 1 (stable output magnitude).
-            # eps guards against the degenerate case where ALL keys are
-            # suppressed (sum=0) — complementary_fix_tokens prevents this in
-            # practice, but the guard keeps the math safe.
-            attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-6)
-            if self.training and a.dropout > 0:
-                attn = F.dropout(attn, p=a.dropout)
-            out = torch.matmul(attn, v).transpose(1, 2).reshape(B, N, -1).contiguous()
+                    attn_bias = attn_bias + attention_mask
+
+            # Use PyTorch's native scaled_dot_product_attention to leverage
+            # flash attention on Ampere+ GPUs — avoids materializing the
+            # full [B,H,N,N] attention matrix (O(N) memory instead of O(N²)).
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_bias,
+                dropout_p=a.dropout if self.training else 0.0,
+                scale=a.scaling,
+            )
+            out = out.transpose(1, 2).reshape(B, N, -1).contiguous()
             out = a.o_proj(out)
-            return out, attn
+            return out, None  # must be 2-tuple: EoMT._attn does module(...)[0]
         finally:
             self._q_keep_mask = None  # always consume, even on exception
 

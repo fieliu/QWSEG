@@ -30,28 +30,30 @@ class CrossAttnFusion(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x_self, x_other, keep_mask=None):
-        """x_self/x_other: [B, N, C]. keep_mask: [B, N] multiplicative key
-        keep-mask D in (0,1), applied AFTER softmax in probability space
-        (D=1 -> key visible; D=0 -> key invisible; D=0.8 -> key weight x0.8).
-        Broadcast over query positions and heads. Renormalized to sum=1 so
-        the output magnitude is stable regardless of how many keys are
-        suppressed."""
+        """x_self/x_other: [B, N, C]. keep_mask: [B, N] soft keep-mask D in
+        (0,1), applied as a log-space key-side bias (D→log(D)) compatible
+        with F.scaled_dot_product_attention (flash attention). The bias
+        log(D_j) is added to all queries' scores for key j pre-softmax:
+        D=1→log=0 (keep), D=0.01→log=-4.6 (near-full suppress)."""
         B, N, C = x_self.shape
         q = self.q(self.norm_q(x_self))
         kv = self.kv(self.norm_kv(x_other))
         q = q.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         k, v = kv.reshape(B, N, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4).unbind(0)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, heads, Nq, Nk]
-        attn = attn.softmax(dim=-1)
         if keep_mask is not None:
-            # Multiplicative key-gate: D=1 keep, D=0 suppress, D=0.8 -> x0.8.
-            # keep_mask: [B, Nk] -> [B, 1, 1, Nk]
-            attn = attn * keep_mask[:, None, None, :]
-            # Renormalize so weights sum to 1 (stable output magnitude).
-            attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-6)
-        attn = self.attn_drop(attn)
-        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+            # log-space key bias: keep_mask [B,Nk] → log [B,1,1,Nk]
+            attn_bias = torch.log(keep_mask.clamp_min(1e-9))[:, None, None, :]
+        else:
+            attn_bias = None
+
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_bias,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+            scale=self.scale,
+        )
+        out = out.transpose(1, 2).reshape(B, N, C)
         out = self.proj_drop(self.proj(out))
         return x_self + out
 

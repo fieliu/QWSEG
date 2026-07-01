@@ -80,7 +80,6 @@ model = dict(
             encoder=dict(
                 num_layers=6,
                 layer_cfg=dict(
-                    type='BaseTransformerLayer',
                     self_attn_cfg=dict(
                         type='MultiScaleDeformableAttention',
                         embed_dims=256,
@@ -98,8 +97,7 @@ model = dict(
                         feedforward_channels=1024,
                         num_fcs=2,
                         ffn_drop=0.0,
-                        act_cfg=dict(type='ReLU', inplace=True)),
-                    operation_order=('self_attn', 'norm', 'ffn', 'norm')),
+                        act_cfg=dict(type='ReLU', inplace=True))),
                 init_cfg=None),
             positional_encoding=dict(
                 type='SinePositionalEncoding', num_feats=128, normalize=True),
@@ -113,7 +111,7 @@ model = dict(
             return_intermediate=True,
             num_layers=9,
             layer_cfg=dict(
-                type='DetrTransformerDecoderLayer',
+
 				self_attn_cfg=dict(
 				    type='MultiheadAttention',
 				    embed_dims=256,

@@ -693,14 +693,17 @@ class DINOv3Adapter(nn.Module):
             pos_embed = self._get_pos_embed(backbone.pos_embed[:, 1:], H, W)
             x_tokens = backbone.pos_drop(x_tokens + pos_embed)
 
-        # Strip ALL prefix tokens (cls + register tokens) added by _pos_embed
-        num_prefix = 0
-        if hasattr(backbone, 'cls_token') and backbone.cls_token is not None:
-            num_prefix += 1
-        if hasattr(backbone, 'num_register_tokens'):
-            num_prefix += int(getattr(backbone, 'num_register_tokens', 0))
-        elif hasattr(backbone, 'register_tokens') and backbone.register_tokens is not None:
-            num_prefix += backbone.register_tokens.shape[1]
+        # Strip ALL prefix tokens (cls + register tokens) added by patch_embed
+        # Use num_prefix_tokens (set by ViT wrapper) as the reliable source;
+        # fall back to attribute detection for timm-style backbones.
+        num_prefix = getattr(backbone, 'num_prefix_tokens', 0)
+        if num_prefix == 0:
+            if hasattr(backbone, 'cls_token') and backbone.cls_token is not None:
+                num_prefix += 1
+            if hasattr(backbone, 'num_register_tokens'):
+                num_prefix += int(getattr(backbone, 'num_register_tokens', 0))
+            elif hasattr(backbone, 'register_tokens') and backbone.register_tokens is not None:
+                num_prefix += backbone.register_tokens.shape[1]
         if num_prefix > 0:
             x_tokens = x_tokens[:, num_prefix:]
 
@@ -917,14 +920,17 @@ class RGBTDINOv3Adapter(BaseModule):
                 backbone.pos_embed[:, 1:], H, W)
             x_tokens = backbone.pos_drop(x_tokens + pos_embed)
 
-        # Strip ALL prefix tokens (cls + register tokens) added by _pos_embed
-        num_prefix = 0
-        if hasattr(backbone, 'cls_token') and backbone.cls_token is not None:
-            num_prefix += 1
-        if hasattr(backbone, 'num_register_tokens'):
-            num_prefix += int(getattr(backbone, 'num_register_tokens', 0))
-        elif hasattr(backbone, 'register_tokens') and backbone.register_tokens is not None:
-            num_prefix += backbone.register_tokens.shape[1]
+        # Strip ALL prefix tokens (cls + register tokens) added by patch_embed
+        # Use num_prefix_tokens (set by ViT wrapper) as the reliable source;
+        # fall back to attribute detection for timm-style backbones.
+        num_prefix = getattr(backbone, 'num_prefix_tokens', 0)
+        if num_prefix == 0:
+            if hasattr(backbone, 'cls_token') and backbone.cls_token is not None:
+                num_prefix += 1
+            if hasattr(backbone, 'num_register_tokens'):
+                num_prefix += int(getattr(backbone, 'num_register_tokens', 0))
+            elif hasattr(backbone, 'register_tokens') and backbone.register_tokens is not None:
+                num_prefix += backbone.register_tokens.shape[1]
         if num_prefix > 0:
             x_tokens = x_tokens[:, num_prefix:]
 

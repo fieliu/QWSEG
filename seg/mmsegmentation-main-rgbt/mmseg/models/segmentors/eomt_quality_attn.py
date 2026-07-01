@@ -249,7 +249,10 @@ class QualityAttnWrapper(nn.Module):
             log_bias = log_bias[:, None, None, :]                    # [B, 1, 1, N]
             num_heads = getattr(self.attn, 'num_heads', None)
             if num_heads is not None:
-                log_bias = log_bias.expand(-1, num_heads, -1, -1)    # [B, H, 1, N]
+                # Use .repeat (not .expand) so the tensor is contiguous in
+                # memory; flash-attention backward ("LSE is not correctly
+                # aligned (strideH)") fails on expanded non-contiguous masks.
+                log_bias = log_bias.repeat(1, num_heads, 1, 1)       # [B, H, 1, N]
             # broadcast over query dim is implicit in SDPA (Nq=1 broadcasts)
             if attention_mask is None:
                 merged_mask = log_bias

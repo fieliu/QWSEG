@@ -678,7 +678,10 @@ class DINOv3Adapter(nn.Module):
         # 2. Patch embedding forward
         backbone = self.backbone
         if hasattr(backbone, 'patch_embed'):
-            x_tokens, H, W = backbone.patch_embed(x)
+            pe = backbone.patch_embed
+            out = pe(x)
+            x_tokens = out[0] if isinstance(out, (tuple, list)) else out
+            H, W = pe.grid_size
         else:
             x_tokens = backbone.embeddings(x)
             H, W = self.img_size[0] // self.patch_size, self.img_size[1] // self.patch_size
@@ -898,7 +901,10 @@ class RGBTDINOv3Adapter(BaseModule):
 
         # Patch embedding
         if hasattr(backbone, 'patch_embed'):
-            x_tokens, H, W = backbone.patch_embed(x_input)
+            pe = backbone.patch_embed
+            out = pe(x_input)
+            x_tokens = out[0] if isinstance(out, (tuple, list)) else out
+            H, W = pe.grid_size
         else:
             x_tokens = backbone.embeddings(x_input)
             H, W = img_size[0] // patch_size, img_size[1] // patch_size

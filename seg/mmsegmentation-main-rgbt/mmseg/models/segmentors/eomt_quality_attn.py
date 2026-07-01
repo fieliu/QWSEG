@@ -242,14 +242,27 @@ class QualityAttnWrapper(nn.Module):
             #   D=1 (keep) -> log(1)=0 (no effect)
             #   D=0.01 (pruned) -> log(0.01)=-4.6 (near-full suppress)
             #   softmax(scores + log(D_j)) ≅ softmax(scores) * D_j / Σ D
-            # HF DINOv3 attention accepts attention_mask as [B, N] float
-            # (additive, broadcast to all heads & queries). Just merge our
-            # bias with any existing mask and delegate to the ORIGINAL module.
-            log_bias = torch.log(self._q_keep_mask.clamp_min(1e-9))
+            # self._q_keep_mask: [B, N] (key-side). Expand to the 4D additive
+            # mask shape [B, H, Nq, Nk] required by HF DINOv3's SDPA path:
+            #   [B, N] -> [B, 1, 1, N]  (broadcast over heads & queries)
+            log_bias = torch.log(self._q_keep_mask.clamp_min(1e-9))  # [B, N]
+            log_bias = log_bias[:, None, None, :]                    # [B, 1, 1, N]
+            num_heads = getattr(self.attn, 'num_heads', None)
+            if num_heads is not None:
+                log_bias = log_bias.expand(-1, num_heads, -1, -1)    # [B, H, 1, N]
+            # broadcast over query dim is implicit in SDPA (Nq=1 broadcasts)
             if attention_mask is None:
                 merged_mask = log_bias
             elif attention_mask.dtype == torch.bool:
-                merged_mask = log_bias.masked_fill(attention_mask, float('-inf'))
+                # bool mask: True=attend. Apply log_bias only at kept positions,
+                # -inf at masked-out positions. Expand bool [B, Nq, Nk] (or 4D)
+                # to match log_bias's 4D shape.
+                bm = attention_mask
+                if bm.ndim == 2:
+                    bm = bm[:, None, None, :]
+                elif bm.ndim == 3:
+                    bm = bm[:, None, :, :]
+                merged_mask = log_bias.masked_fill(~bm, float('-inf'))
             else:
                 merged_mask = attention_mask + log_bias
 

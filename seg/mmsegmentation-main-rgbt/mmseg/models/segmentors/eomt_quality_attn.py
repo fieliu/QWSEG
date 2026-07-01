@@ -252,36 +252,20 @@ class QualityAttnWrapper(nn.Module):
                 if rope_fn is not None:
                     q, k = rope_fn(q, k, cos, sin)
 
-            # Build log-bias from soft keep-mask D for key-side suppression.
-            #   softmax(QKᵀ/d + log(D))  ≅  softmax(QKᵀ/d) * D / Σ(D)
-            # — functionally nearly identical for source-blocking (low-quality
-            # keys get near-zero weight), AND compatible with flash attention
-            # (F.scaled_dot_product_attention) which does NOT materialize the
-            # [B,H,N,N] attention matrix → massive memory savings. D clamped to
-            # 1e-9 so log(0) -> -20.7 (near-full suppression) instead of -inf.
-            # Flash attention requires contiguous, properly-strided tensors;
-            # .expand() + .contiguous() avoids the broadcast-view stride error.
-            log_bias = torch.log(self._q_keep_mask.clamp_min(1e-9))  # [B, N]
-            attn_bias = log_bias[:, None, None, :].expand(-1, 1, N, -1).contiguous()
-
-            # Merge with EoMT's native attention_mask (decode-stage masked attn)
+            attn = torch.matmul(q, k.transpose(-1, -2)) * a.scaling  # [B,H,N,N]
             if attention_mask is not None:
                 if attention_mask.dtype == torch.bool:
-                    attn_bias = attn_bias.masked_fill(attention_mask, float('-inf'))
+                    attn = attn.masked_fill(attention_mask, float('-inf'))
                 else:
-                    attn_bias = attn_bias + attention_mask
-
-            # PyTorch native scaled_dot_product_attention — leverages flash
-            # attention on Ampere+ GPUs (no [B,H,N,N] materialization).
-            out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_bias,
-                dropout_p=a.dropout if self.training else 0.0,
-                scale=a.scaling,
-            )
-            out = out.transpose(1, 2).reshape(B, N, -1).contiguous()
+                    attn = attn + attention_mask
+            attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
+            attn = attn * self._q_keep_mask[:, None, None, :]
+            attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-6)
+            if self.training and a.dropout > 0:
+                attn = F.dropout(attn, p=a.dropout)
+            out = torch.matmul(attn, v).transpose(1, 2).reshape(B, N, -1).contiguous()
             out = a.o_proj(out)
-            return out, None  # must be 2-tuple: EoMT._attn does module(...)[0]
+            return out, attn
         finally:
             self._q_keep_mask = None  # always consume, even on exception
 

@@ -98,11 +98,11 @@ model = dict(
                         act_cfg=dict(type='ReLU', inplace=True))),
                 init_cfg=None),
             positional_encoding=dict(
-                type='SinePositionalEncoding', num_feats=128, normalize=True),
+                num_feats=128, normalize=True),
             init_cfg=None),
         enforce_decoder_input_project=False,
         positional_encoding=dict(
-            type='SinePositionalEncoding', num_feats=128, normalize=True),
+            num_feats=128, normalize=True),
         transformer_decoder=dict(
             type='DetrTransformerDecoder',
             _scope_='mmdet',

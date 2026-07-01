@@ -210,6 +210,9 @@ class PartialDegradeEvalHook(Hook):
 
             for r in results:
                 pred_label = r.pred_sem_seg.data.squeeze()
+                # Align devices: pred_label on GPU (from model), label on CPU
+                # (from data_sample) -> move label to pred_label's device
+                label = label.to(pred_label.device)
                 ai, au, _, _ = _intersect_and_union(
                     pred_label, label, num_classes, ignore_index)
                 area_intersect[sev_idx] += ai.cpu().float()

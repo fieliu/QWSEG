@@ -73,6 +73,7 @@ model = dict(
         align_corners=False,
         pixel_decoder=dict(
             type='MSDeformAttnPixelDecoder',
+            _scope_='mmdet',
             num_outs=3,
             norm_cfg=dict(type='GN', num_groups=32),
             act_cfg=dict(type='ReLU'),

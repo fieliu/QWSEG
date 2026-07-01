@@ -82,4 +82,5 @@ train_cfg = dict(_delete_=True, type='EpochBasedTrainLoop',
 custom_hooks = [
     dict(type='EoMTRGBTVisHook', interval=10, num_samples=1),
     dict(type='MissingModalityEvalHook', interval=5),
+    dict(type='PartialDegradeEvalHook', interval=5, num_samples=50),
 ]

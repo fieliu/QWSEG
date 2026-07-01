@@ -14,7 +14,12 @@ try:
     from .adapter_m2f_quality_vis_hook import AdapterM2FQualityVisHook
 except ImportError:
     AdapterM2FQualityVisHook = None
+try:
+    from .partial_degrade_eval_hook import PartialDegradeEvalHook
+except ImportError:
+    PartialDegradeEvalHook = None
 from .visualization_hook import SegVisualizationHook
 
 __all__ = ['SegVisualizationHook', 'TrainVisHook', 'MissingModalityEvalHook',
-           'EoMTRGBTVisHook', 'AdapterM2FQualityVisHook']
+           'EoMTRGBTVisHook', 'AdapterM2FQualityVisHook',
+           'PartialDegradeEvalHook']

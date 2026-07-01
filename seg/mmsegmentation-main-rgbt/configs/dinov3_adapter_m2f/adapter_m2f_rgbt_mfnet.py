@@ -207,3 +207,7 @@ default_hooks = dict(
                     save_best='mIoU'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
     visualization=dict(type='SegVisualizationHook'))
+
+custom_hooks = [
+    dict(type='PartialDegradeEvalHook', interval=5, num_samples=50),
+]

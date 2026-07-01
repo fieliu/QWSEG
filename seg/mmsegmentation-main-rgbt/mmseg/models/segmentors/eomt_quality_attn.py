@@ -259,21 +259,20 @@ class QualityAttnWrapper(nn.Module):
             # (F.scaled_dot_product_attention) which does NOT materialize the
             # [B,H,N,N] attention matrix → massive memory savings. D clamped to
             # 1e-9 so log(0) -> -20.7 (near-full suppression) instead of -inf.
-            # Broadcast [B,N] -> [B,1,1,N] (all heads, all query positions).
-            log_bias = torch.log(self._q_keep_mask.clamp_min(1e-9))
-            attn_bias = log_bias[:, None, None, :]
+            # Flash attention requires contiguous, properly-strided tensors;
+            # .expand() + .contiguous() avoids the broadcast-view stride error.
+            log_bias = torch.log(self._q_keep_mask.clamp_min(1e-9))  # [B, N]
+            attn_bias = log_bias[:, None, None, :].expand(-1, 1, N, -1).contiguous()
 
             # Merge with EoMT's native attention_mask (decode-stage masked attn)
             if attention_mask is not None:
                 if attention_mask.dtype == torch.bool:
-                    # boolean mask: convert to additive (-inf for masked)
                     attn_bias = attn_bias.masked_fill(attention_mask, float('-inf'))
                 else:
                     attn_bias = attn_bias + attention_mask
 
-            # Use PyTorch's native scaled_dot_product_attention to leverage
-            # flash attention on Ampere+ GPUs — avoids materializing the
-            # full [B,H,N,N] attention matrix (O(N) memory instead of O(N²)).
+            # PyTorch native scaled_dot_product_attention — leverages flash
+            # attention on Ampere+ GPUs (no [B,H,N,N] materialization).
             out = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attn_bias,

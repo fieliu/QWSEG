@@ -44,7 +44,9 @@ class CrossAttnFusion(nn.Module):
 
         if keep_mask is not None:
             # log-space key bias: keep_mask [B,Nk] → log [B,1,1,Nk]
-            attn_bias = torch.log(keep_mask.clamp_min(1e-9))[:, None, None, :]
+            # .expand+contiguous avoids broadcast view stride error in flash attn
+            log_bias = torch.log(keep_mask.clamp_min(1e-9))  # [B, Nk]
+            attn_bias = log_bias[:, None, None, :].expand(-1, 1, N, -1).contiguous()
         else:
             attn_bias = None
 

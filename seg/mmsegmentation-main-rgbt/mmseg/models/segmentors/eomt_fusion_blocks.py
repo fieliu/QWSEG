@@ -12,6 +12,7 @@ additive bias, destroying proportional suppression for mid-quality tokens).
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class CrossAttnFusion(nn.Module):

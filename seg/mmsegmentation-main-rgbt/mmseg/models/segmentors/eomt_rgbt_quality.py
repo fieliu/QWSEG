@@ -79,9 +79,10 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         )
         # INCREMENTAL quality-gated cross-attn fusions (one per segment boundary).
         # These are NEW parameters (not from the clean teacher) that apply the
-        # soft keep-mask D to gate each modality's keys during cross-attention:
-        #   z_rgb' = baseline(z_rgb, z_t)           # frozen teacher fusion
-        #   z_rgb''= quality(z_rgb', z_t, D_t)      # new gated fusion (incremental)
+        # soft keep-mask D to gate each modality's keys during cross-attention,
+        # running BEFORE the baseline fusion (PRE-REPAIR design):
+        #   z_rgb' = quality(z_rgb, z_t, D_t)       # new gated fusion (incremental)
+        #   z_rgb''= baseline(z_rgb', z_t)           # frozen teacher fusion
         # Baseline self.fusions (inherited from EoMTRGBTFusion / teacher) are
         # always frozen; these quality_fusions are the true incremental contribution.
         self.quality_fusions = nn.ModuleList(
@@ -406,26 +407,30 @@ class EoMTRGBTQuality(EoMTRGBTFusion):
         return (D_rgb, s_rgb), (D_t, s_t)
 
     def _fuse_q(self, z_rgb, z_t, D_rgb, D_t):
-        """Two-stage cross-attn fusion: (1) baseline frozen fusion (teacher's
-        clean cross-attn, no gating) for cross-modal information exchange,
-        (2) INCREMENTAL quality-gated fusion (new params) that applies the
-        soft keep-mask D to suppress low-quality keys of the OTHER modality.
-        Stage (1) is the baseline teacher path (frozen in Adapter paradigm);
-        stage (2) is the pure incremental quality contribution. The residual
-        adds compound: z' = quality(baseline(z, z_other), z_other, D_other).
-        With use_quality=False, stage (2) is skipped -> z' = baseline(z, z_other)
+        """Two-stage cross-attn fusion (PRE-REPAIR design):
+          (1) INCREMENTAL quality-gated fusion first: applies the soft
+              keep-mask D to suppress low-quality keys of the OTHER modality,
+              CLEANING features before they enter the baseline.
+          (2) baseline frozen fusion (teacher's clean cross-attn, no gating)
+              runs on the CLEANED features for final cross-modal exchange.
+
+        Stage (1) is the pure incremental quality contribution (new params);
+        stage (2) is the baseline teacher path (frozen in Adapter paradigm).
+
+        Compound: z' = baseline(quality(z, z_other, D_other), z_other).
+        With use_quality=False, stage (1) is skipped -> z' = baseline(z, z_other)
         = exactly the EoMTRGBTFusion teacher forward (equivalence holds)."""
-        # Stage 1: baseline frozen cross-attn (teacher's path, always runs)
-        baseline = self.fusions[self._fuse_call]
-        new_rgb = baseline(z_rgb, z_t, keep_mask=None)
-        new_t = baseline(z_t, z_rgb, keep_mask=None)
-        # Stage 2: incremental quality-gated cross-attn (new params)
+        # Stage 1: incremental quality-gated cross-attn (new params, PRE-REPAIR)
         if self.use_quality:
             quality = self.quality_fusions[self._fuse_call]
             m_t = self._mask_2d(self._protect_prefix_mask(D_t))
             m_rgb = self._mask_2d(self._protect_prefix_mask(D_rgb))
-            new_rgb = quality(new_rgb, z_t, keep_mask=m_t)
-            new_t = quality(new_t, z_rgb, keep_mask=m_rgb)
+            z_rgb = quality(z_rgb, z_t, keep_mask=m_t)
+            z_t = quality(z_t, z_rgb, keep_mask=m_rgb)
+        # Stage 2: baseline frozen cross-attn (teacher's path, runs on CLEANED features)
+        baseline = self.fusions[self._fuse_call]
+        new_rgb = baseline(z_rgb, z_t, keep_mask=None)
+        new_t = baseline(z_t, z_rgb, keep_mask=None)
         self._fuse_call += 1
         return new_rgb, new_t
 

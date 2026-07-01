@@ -13,6 +13,7 @@ model = dict(
     use_quality_merge=True,       # quality-weighted residual ON
     quality_loss_weight=1.0,
     deg_ceiling_weight=0.1,
+    clean_floor_weight=0.1,
     degradation=dict(
         degrade_prob=0.8,
         curriculum=False,

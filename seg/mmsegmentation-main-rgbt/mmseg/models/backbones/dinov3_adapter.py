@@ -77,12 +77,12 @@ class MSDeformAttnWrapper(nn.Module):
     def forward(self, query, reference_points, value, spatial_shapes,
                 level_start_index, attention_weights=None):
         return self.attn(
-            query=query,
-            key=value,
-            value=value,
-            reference_points=reference_points,
-            spatial_shapes=spatial_shapes,
-            level_start_index=level_start_index,
+            query=query.contiguous(),
+            key=value.contiguous(),
+            value=value.contiguous(),
+            reference_points=reference_points.contiguous(),
+            spatial_shapes=spatial_shapes.contiguous(),
+            level_start_index=level_start_index.contiguous(),
         )
 
 
@@ -283,7 +283,8 @@ class InteractionBlock(nn.Module):
         else:
             self.extra_extractors = None
 
-    def forward(self, x, c, blocks, deform_inputs1, deform_inputs2, H, W):
+    def forward(self, x, c, blocks, deform_inputs1, deform_inputs2, H, W,
+                keep_mask=None):
         """Args:
             x: ViT tokens [B, N, C]
             c: spatial prior tokens (concat of 3 levels) [B, Nc, C]
@@ -291,6 +292,7 @@ class InteractionBlock(nn.Module):
             deform_inputs1: [ref_pts, spatial_shapes, level_start_index] for injector
             deform_inputs2: same for extractor
             H, W: spatial shape of ViT token grid
+            keep_mask: optional [B, N] quality keep-mask for self-attn bias
         Returns:
             x: updated ViT tokens
             c: updated spatial prior tokens
@@ -300,9 +302,9 @@ class InteractionBlock(nn.Module):
                           feat=c, spatial_shapes=deform_inputs1[1],
                           level_start_index=deform_inputs1[2])
 
-        # 2. Run ViT blocks
+        # 2. Run ViT blocks (with quality self-attn bias if provided)
         for blk in blocks:
-            x = blk(x, H, W)
+            x = blk(x, H, W, keep_mask=keep_mask)
 
         # 3. Extract features from ViT tokens back to spatial prior
         c = self.extractor(query=c, reference_points=deform_inputs2[0],
@@ -400,7 +402,7 @@ class DINOv3BlockWrapper(nn.Module):
         self.block = block
         self.rope = rope
 
-    def forward(self, x, H, W):
+    def forward(self, x, H, W, keep_mask=None):
         block = self.block
         B, L, C = x.shape
 
@@ -428,6 +430,12 @@ class DINOv3BlockWrapper(nn.Module):
                 k = self.rope(k)
 
             attn_weights = (q @ k.transpose(-2, -1)) * (head_dim ** -0.5)
+            # Quality self-attn bias: log(D) suppresses low-quality keys
+            # (same additive-bias mechanism as EoMT QualityAttnWrapper)
+            if keep_mask is not None:
+                log_bias = torch.log(keep_mask.clamp_min(1e-9))
+                # [B, N] -> [B, 1, 1, N] for broadcasting over heads & queries
+                attn_weights = attn_weights + log_bias.unsqueeze(1).unsqueeze(1)
             attn_weights = attn_weights.softmax(dim=-1)
             out = (attn_weights @ v).transpose(1, 2).reshape(B, L, C)
             out = attn.o_proj(out)
@@ -682,10 +690,16 @@ class DINOv3Adapter(nn.Module):
             pos_embed = self._get_pos_embed(backbone.pos_embed[:, 1:], H, W)
             x_tokens = backbone.pos_drop(x_tokens + pos_embed)
 
-        # Remove CLS token if present (DINOv3 may not have one)
+        # Strip ALL prefix tokens (cls + register tokens) added by _pos_embed
+        num_prefix = 0
         if hasattr(backbone, 'cls_token') and backbone.cls_token is not None:
-            # Keep only patch tokens
-            x_tokens = x_tokens[:, 1:]
+            num_prefix += 1
+        if hasattr(backbone, 'num_register_tokens'):
+            num_prefix += int(getattr(backbone, 'num_register_tokens', 0))
+        elif hasattr(backbone, 'register_tokens') and backbone.register_tokens is not None:
+            num_prefix += backbone.register_tokens.shape[1]
+        if num_prefix > 0:
+            x_tokens = x_tokens[:, num_prefix:]
 
         # 3. Interaction: inject → ViT blocks → extract
         outs = list()
@@ -897,15 +911,27 @@ class RGBTDINOv3Adapter(BaseModule):
                 backbone.pos_embed[:, 1:], H, W)
             x_tokens = backbone.pos_drop(x_tokens + pos_embed)
 
+        # Strip ALL prefix tokens (cls + register tokens) added by _pos_embed
+        num_prefix = 0
         if hasattr(backbone, 'cls_token') and backbone.cls_token is not None:
-            x_tokens = x_tokens[:, 1:]
+            num_prefix += 1
+        if hasattr(backbone, 'num_register_tokens'):
+            num_prefix += int(getattr(backbone, 'num_register_tokens', 0))
+        elif hasattr(backbone, 'register_tokens') and backbone.register_tokens is not None:
+            num_prefix += backbone.register_tokens.shape[1]
+        if num_prefix > 0:
+            x_tokens = x_tokens[:, num_prefix:]
 
         return (x_tokens, c, c1, c2_len, c3_len, H, W,
                 deform_inputs1, deform_inputs2)
 
     def _run_stage(self, x_tokens, c, interaction, wrapped_blocks,
-                   indexes, deform_inputs1, deform_inputs2, H, W):
+                   indexes, deform_inputs1, deform_inputs2, H, W,
+                   keep_mask=None):
         """Run one interaction stage for one branch.
+
+        Args:
+            keep_mask: optional [B, N] quality keep-mask for self-attn bias
 
         Returns:
             x_tokens: updated ViT tokens
@@ -914,7 +940,8 @@ class RGBTDINOv3Adapter(BaseModule):
         """
         blocks_slice = wrapped_blocks[indexes[0]:indexes[-1] + 1]
         x_tokens, c = interaction(x_tokens, c, blocks_slice,
-                                  deform_inputs1, deform_inputs2, H, W)
+                                  deform_inputs1, deform_inputs2, H, W,
+                                  keep_mask=keep_mask)
         out_feat = x_tokens.transpose(1, 2).view(
             x_tokens.shape[0], self.embed_dims, H, W).contiguous()
         return x_tokens, c, out_feat
@@ -1026,25 +1053,19 @@ class RGBTDINOv3Adapter(BaseModule):
         rgb_outs = []
         thr_outs = []
         all_quality = []  # for quality loss in segmentor
+        # Store token grid for quality loss (after prefix tokens stripped)
+        self._token_grid = (rgb_H, rgb_W)
 
         for i in range(len(self.interaction_indexes)):
             indexes = self.interaction_indexes[i]
 
-            # RGB branch stage
-            rgb_x, rgb_c, rgb_out = self._run_stage(
-                rgb_x, rgb_c, self.rgb_adapter.interactions[i],
-                self.rgb_adapter.wrapped_blocks, indexes,
-                rgb_di1, rgb_di2, rgb_H, rgb_W)
-            rgb_outs.append(rgb_out)
-
-            # T branch stage
-            thr_x, thr_c, thr_out = self._run_stage(
-                thr_x, thr_c, self.thr_interactions[i],
-                self.thr_wrapped_blocks, indexes,
-                thr_di1, thr_di2, thr_H, thr_W)
-            thr_outs.append(thr_out)
-
-            # ===== [INCREMENT] Quality repair (before baseline CrossAttn) =====
+            # ===== [INCREMENT-1] Quality prediction at stage START =====
+            # (consistent with EoMT: quality predicted at segment boundary is
+            #  reused 3 ways — self-attn bias, cross-attn repair, merge weight)
+            keep_rgb = None
+            keep_thr = None
+            D_rgb = None
+            D_thr = None
             if getattr(self, 'use_quality', False):
                 from mmseg.models.segmentors.eomt_quality_attn import (
                     soft_keep_mask, complementary_fix_tokens)
@@ -1055,6 +1076,33 @@ class RGBTDINOv3Adapter(BaseModule):
                 D_thr = soft_keep_mask(s_thr, self.quality_tau, self.mask_temperature)
                 D_rgb, D_thr = complementary_fix_tokens(D_rgb, D_thr, s_rgb, s_thr)
 
+                # self-attn bias: each stream suppresses ITS OWN low-quality keys
+                keep_rgb = D_rgb.squeeze(-1)  # [B, N]
+                keep_thr = D_thr.squeeze(-1)
+                all_quality.append((s_rgb, s_thr))
+            else:
+                all_quality.append(None)
+
+            # ===== Run ViT blocks WITH quality self-attn bias =====
+            # RGB branch stage
+            rgb_x, rgb_c, rgb_out = self._run_stage(
+                rgb_x, rgb_c, self.rgb_adapter.interactions[i],
+                self.rgb_adapter.wrapped_blocks, indexes,
+                rgb_di1, rgb_di2, rgb_H, rgb_W,
+                keep_mask=keep_rgb)
+            rgb_outs.append(rgb_out)
+
+            # T branch stage
+            thr_x, thr_c, thr_out = self._run_stage(
+                thr_x, thr_c, self.thr_interactions[i],
+                self.thr_wrapped_blocks, indexes,
+                thr_di1, thr_di2, thr_H, thr_W,
+                keep_mask=keep_thr)
+            thr_outs.append(thr_out)
+
+            # ===== [INCREMENT-2] Quality repair (cross-attn) =====
+            # Uses the SAME D predicted at stage start (consistent with EoMT)
+            if getattr(self, 'use_quality', False):
                 if getattr(self, 'use_quality_gate', False):
                     m_thr = D_thr.squeeze(-1)
                     m_rgb = D_rgb.squeeze(-1)
@@ -1070,9 +1118,6 @@ class RGBTDINOv3Adapter(BaseModule):
 
                 rgb_x = repaired_rgb
                 thr_x = repaired_thr
-                all_quality.append((s_rgb, s_thr))
-            else:
-                all_quality.append(None)
 
             # ===== [BASELINE] Cross-modal attention: sense each other =====
             new_rgb_x = self.cross_fusions[i](rgb_x, thr_x, keep_mask=None)

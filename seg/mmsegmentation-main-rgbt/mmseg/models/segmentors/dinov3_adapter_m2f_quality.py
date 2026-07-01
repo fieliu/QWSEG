@@ -17,7 +17,6 @@ The segmentor handles:
   - Degradation generation
 """
 
-import math
 from typing import List, Optional
 
 import torch
@@ -65,8 +64,11 @@ class DINOv3AdapterM2FQuality(Mask2FormerRGBTCrossAttn):
                  quality_loss_weight: float = 1.0,
                  quality_tau: float = 0.5,
                  mask_temperature: float = 0.1,
+                 rank_margin: float = 0.20,
                  deg_ceiling_weight: float = 0.1,
                  deg_ceiling: float = 0.2,
+                 clean_floor_weight: float = 0.1,
+                 clean_floor: float = 0.9,
                  use_quality_gate: bool = True,
                  use_quality_merge: bool = True,
                  freeze_backbone: bool = False,
@@ -114,8 +116,11 @@ class DINOv3AdapterM2FQuality(Mask2FormerRGBTCrossAttn):
         self.quality_loss_weight = quality_loss_weight
         self.quality_tau = quality_tau
         self.mask_temperature = mask_temperature
+        self.rank_margin = rank_margin
         self.deg_ceiling_weight = deg_ceiling_weight
         self.deg_ceiling = deg_ceiling
+        self.clean_floor_weight = clean_floor_weight
+        self.clean_floor = clean_floor
 
         # Sub-component switches
         self.use_quality_gate = use_quality_gate
@@ -141,6 +146,9 @@ class DINOv3AdapterM2FQuality(Mask2FormerRGBTCrossAttn):
             self._freeze_backbone()
         if freeze_fusion:
             self._freeze_fusion()
+        # If quality is disabled (F0), also freeze quality modules to prevent drift
+        if not self.use_quality:
+            self._freeze_quality_modules()
 
         # State for quality loss / visualization
         self._last_quality = None
@@ -200,36 +208,33 @@ class DINOv3AdapterM2FQuality(Mask2FormerRGBTCrossAttn):
             f'quality_cross_fusions + quality_predictors + head trainable.',
             logger='current')
 
-    def _apply_degradation(self, inputs):
-        """Apply on-the-fly degradation via DegradationGenerator."""
-        if self.degrader is None or not self.training:
-            return inputs, None, None
-
-        rgb = inputs[:, :3, :, :]
-        ir = inputs[:, 3:6, :, :]
-
-        drgb, dir_, mask_rgb, mask_ir = self.degrader(
-            rgb, ir, epoch=getattr(self, 'current_epoch', 0))
-
-        degraded = torch.cat([drgb, dir_], dim=1)
-        return degraded, mask_rgb, mask_ir
+    def _freeze_quality_modules(self):
+        """Freeze quality modules when quality is disabled (F0 ablation)."""
+        n = 0
+        for p in self.backbone.quality_predictors.parameters():
+            p.requires_grad = False
+            n += 1
+        for p in self.backbone.quality_cross_fusions.parameters():
+            p.requires_grad = False
+            n += 1
+        print_log(
+            f'DINOv3AdapterM2FQuality: quality disabled -> '
+            f'froze {n} quality module param tensors.',
+            logger='current')
 
     def extract_feat(self, inputs):
         """Extract features with quality repair (in backbone) + fusion.
 
         Full flow:
-          1. [Optional] Apply degradation during training
-          2. Backbone forward (includes quality repair + baseline CrossAttn per stage)
+          1. Backbone forward (includes quality repair + baseline CrossAttn per stage)
              -> (rgb_feats, thr_feats) at 4 scales
-          3. Concat + ChannelSpatialAttention -> fused features
-          4. Neck (if any) -> Mask2FormerHead
-        """
-        # Optional on-the-fly degradation during training
-        if self.training and self.degrader is not None:
-            inputs, mask_rgb, mask_ir = self._apply_degradation(inputs)
-        else:
-            mask_rgb, mask_ir = None, None
+          2. Concat + ChannelSpatialAttention -> fused features
+          3. Neck (if any) -> Mask2FormerHead
 
+        Note: degradation is applied in loss() via make_paired (paired path),
+        not here. This method is called by both loss (with degraded 2B input)
+        and predict/_forward (clean input).
+        """
         # Ensure backbone switches are up-to-date
         self.backbone.use_quality = self.use_quality
         self.backbone.use_quality_gate = self.use_quality_gate
@@ -242,7 +247,6 @@ class DINOv3AdapterM2FQuality(Mask2FormerRGBTCrossAttn):
 
         # Get quality predictions from backbone
         self._last_quality = getattr(self.backbone, '_all_quality', [None] * 4)
-        self._last_deg_masks = (mask_rgb, mask_ir)
 
         # Fusion at each scale: concat + ChannelSpatialAttention
         fused_feats = []
@@ -271,79 +275,180 @@ class DINOv3AdapterM2FQuality(Mask2FormerRGBTCrossAttn):
 
         return fused_feats
 
+    # ---- paired light/heavy degradation + rank-only quality loss ----
     def loss(self, inputs, data_samples):
-        """Compute segmentation + quality losses."""
-        losses = super().loss(inputs, data_samples)
+        """Compute segmentation + quality losses via paired degradation path.
 
-        # Quality supervision loss
-        if self.use_quality and self.quality_loss_weight > 0 and self._last_quality:
-            q_loss = self._compute_quality_loss()
-            if q_loss is not None:
-                losses['loss_quality'] = q_loss * self.quality_loss_weight
+        Aligns with EoMT's _loss_paired:
+          1. make_paired -> light/heavy versions + level masks (0=clean, 1-5=degraded)
+          2. cat light(0:B) + heavy(B:2B) -> one forward pass
+          3. segmentation loss on BOTH versions (targets duplicated)
+          4. quality supervision: rank + clean_floor + deg_ceiling (not BCE)
+        """
+        if not self.training or self.degrader is None or not self.use_quality:
+            # F0 / eval / no degrader: standard single-forward loss
+            return super().loss(inputs, data_samples)
+
+        rgb = inputs[:, :3, :, :]
+        ir = inputs[:, 3:6, :, :]
+        epoch = getattr(self, 'current_epoch', 0)
+        mean = self.data_preprocessor.mean.flatten()
+        std = self.data_preprocessor.std.flatten()
+        (l_rgb, l_ir, h_rgb, h_ir,
+         lvl_light_rgb, lvl_light_ir,
+         lvl_heavy_rgb, lvl_heavy_ir,
+         rank_mask, level_gap) = \
+            self.degrader.make_paired(rgb, ir, mean, std, epoch=epoch)
+        B = rgb.shape[0]
+
+        # batch-cat light(0:B) + heavy(B:2B), one forward
+        cat_inputs = torch.cat([
+            torch.cat([l_rgb, l_ir], dim=1),   # [B, 6, H, W] light
+            torch.cat([h_rgb, h_ir], dim=1),   # [B, 6, H, W] heavy
+        ], dim=0)                               # [2B, 6, H, W]
+
+        fused_feats = self.extract_feat(cat_inputs)
+        quality_info = self._last_quality  # list of (s_rgb, s_t), each [2B,N,1]
+
+        # segmentation loss on BOTH versions (targets duplicated light+heavy)
+        data_samples2 = list(data_samples) + list(data_samples)
+        losses = dict()
+        loss_decode = self.decode_head.loss(
+            fused_feats, data_samples2, self.train_cfg)
+        losses.update(add_prefix(loss_decode, 'decode'))
+
+        if self.with_auxiliary_head:
+            loss_aux = self._auxiliary_head_forward_train(
+                fused_feats, data_samples2)
+            losses.update(loss_aux)
+
+        # quality supervision using LEVEL masks (L0=clean, L1-L5=degraded)
+        if self.quality_loss_weight > 0 and quality_info:
+            grid = getattr(self.backbone, '_token_grid', None)
+            if grid is not None:
+                lvl_light_rgb_tok = self._mask_to_token(lvl_light_rgb, grid)
+                lvl_light_t_tok = self._mask_to_token(lvl_light_ir, grid)
+                lvl_heavy_rgb_tok = self._mask_to_token(lvl_heavy_rgb, grid)
+                lvl_heavy_t_tok = self._mask_to_token(lvl_heavy_ir, grid)
+
+                losses['loss_quality'] = self.quality_loss_weight * \
+                    self._rank_loss(
+                        quality_info,
+                        lvl_light_rgb_tok, lvl_light_t_tok,
+                        lvl_heavy_rgb_tok, lvl_heavy_t_tok,
+                        B, margin=self.rank_margin,
+                        rank_mask=rank_mask, level_gap=level_gap)
+
+                if self.clean_floor_weight > 0:
+                    losses['loss_clean_floor'] = self.clean_floor_weight * \
+                        self._clean_floor_loss(
+                            quality_info,
+                            (lvl_light_rgb_tok, lvl_light_t_tok),
+                            (lvl_heavy_rgb_tok, lvl_heavy_t_tok), B)
+
+                if self.deg_ceiling_weight > 0:
+                    losses['loss_deg_ceiling'] = self.deg_ceiling_weight * \
+                        self._deg_ceiling_loss(
+                            quality_info,
+                            (lvl_light_rgb_tok, lvl_light_t_tok),
+                            (lvl_heavy_rgb_tok, lvl_heavy_t_tok), B)
 
         return losses
 
-    def _compute_quality_loss(self):
-        """Quality supervision: degraded tokens -> target 0, clean -> 1 (BCE)."""
-        mask_rgb, mask_ir = getattr(self, '_last_deg_masks', (None, None))
-        if mask_rgb is None and mask_ir is None:
-            return None
+    def _mask_to_token(self, mask, grid):
+        """Downsample a [B,1,H,W] level mask to the patch-token grid and
+        flatten to [B, N]. Uses max-pool (conservative: take the HIGHEST level
+        in the receptive field, so severe degradation is never missed).
+        Aligns with EoMT's _mask_to_token."""
+        gh, gw = grid
+        m = F.adaptive_max_pool2d(mask.float(), (gh, gw))  # [B,1,gh,gw]
+        return m.flatten(2).squeeze(1).long()              # [B, N]
 
-        total_loss = 0.0
-        n_valid = 0
+    def _rank_loss(self, quality_info, lvl_light_rgb_tok, lvl_light_t_tok,
+                   lvl_heavy_rgb_tok, lvl_heavy_t_tok, B,
+                   margin=0.20, rank_mask=None, level_gap=None):
+        """Rank quality loss using LEVEL masks (0=clean, 1-5=degraded).
 
-        for q in self._last_quality:
-            if q is None:
+        For each token in the degraded region, push s_light > s_heavy by a
+        FIXED margin: L = mean max(0, margin - (s_light - s_heavy)).
+
+        Aligns with EoMT's _rank_loss.
+        """
+        total = z = 0.0
+        for (s_rgb, s_t) in quality_info:
+            if s_rgb is None:
                 continue
-            s_rgb, s_thr = q  # [B, N, 1]
-            N = s_rgb.shape[1]
-            B = s_rgb.shape[0]
-            H_t = W_t = int(math.sqrt(N))
-            if H_t * W_t != N:
+            for s, lvl_l, lvl_h in (
+                    (s_rgb, lvl_light_rgb_tok, lvl_heavy_rgb_tok),
+                    (s_t, lvl_light_t_tok, lvl_heavy_t_tok)):
+                s = s.squeeze(-1)                       # [2B, N]
+                if s.shape[1] > lvl_l.shape[1]:
+                    s = s[:, s.shape[1] - lvl_l.shape[1]:]
+                s_light, s_heavy = s[:B], s[B:]         # [B, N] each
+                gap = s_light - s_heavy                 # want > margin
+                hinge = (margin - gap).clamp_min(0.0)   # [B, N]
+                reg = ((lvl_h > 0) & (lvl_l < lvl_h)).float()  # [B, N]
+                if rank_mask is not None:
+                    hinge = hinge * rank_mask.view(B, 1)
+                    reg = reg * rank_mask.view(B, 1)
+                denom = reg.sum().clamp_min(1.0)
+                total = total + (hinge * reg).sum() / denom
+                z += 1
+        return total / max(z, 1)
+
+    def _clean_floor_loss(self, quality_info, lvl_light_tok, lvl_heavy_tok, B):
+        """Anti-collapse soft floor on CLEAN tokens (level == 0).
+        Soft lower bound relu(floor - s): only penalizes scores BELOW the
+        floor, leaving [floor, 1] free.
+
+        Aligns with EoMT's _clean_floor_loss.
+        """
+        floor = self.clean_floor
+        total = z = 0.0
+        for (s_rgb, s_t) in quality_info:
+            if s_rgb is None:
                 continue
+            for s, lvl_l, lvl_h in (
+                    (s_rgb, lvl_light_tok[0], lvl_heavy_tok[0]),
+                    (s_t, lvl_light_tok[1], lvl_heavy_tok[1])):
+                s = s.squeeze(-1)                       # [2B, N]
+                if s.shape[1] > lvl_l.shape[1]:
+                    s = s[:, s.shape[1] - lvl_l.shape[1]:]
+                lvl_all = torch.cat([lvl_l, lvl_h], dim=0)  # [2B, N]
+                clean = (lvl_all == 0).float()              # [2B, N]
+                below = (floor - s).clamp_min(0.0)          # penalize s<floor
+                denom = clean.sum().clamp_min(1.0)
+                total = total + (below * clean).sum() / denom
+                z += 1
+        return total / max(z, 1)
 
-            # Downsample masks to token grid
-            if mask_rgb is not None:
-                m_rgb_small = F.interpolate(
-                    mask_rgb.float(), size=(H_t, W_t),
-                    mode='bilinear', align_corners=False)
-            else:
-                m_rgb_small = torch.zeros(B, 1, H_t, W_t, device=s_rgb.device)
-            if mask_ir is not None:
-                m_ir_small = F.interpolate(
-                    mask_ir.float(), size=(H_t, W_t),
-                    mode='bilinear', align_corners=False)
-            else:
-                m_ir_small = torch.zeros(B, 1, H_t, W_t, device=s_rgb.device)
+    def _deg_ceiling_loss(self, quality_info, lvl_light_tok, lvl_heavy_tok, B):
+        """Lower-end anchor: on the HEAVY version's DEGRADED tokens (level >=
+        1), push s_heavy BELOW deg_ceiling. The ceiling scales with level:
+            ceiling(lvl) = deg_ceiling * (6 - lvl) / 5  # L1->base, L5->0.2*base
 
-            target_rgb = 1.0 - m_rgb_small.view(B, -1)
-            target_thr = 1.0 - m_ir_small.view(B, -1)
-
-            pred_rgb = s_rgb.squeeze(-1)
-            pred_thr = s_thr.squeeze(-1)
-
-            loss_rgb = F.binary_cross_entropy(pred_rgb, target_rgb, reduction='mean')
-            loss_thr = F.binary_cross_entropy(pred_thr, target_thr, reduction='mean')
-
-            # deg_ceiling: push degraded tokens below deg_ceiling
-            if self.deg_ceiling_weight > 0:
-                deg_rgb_tokens = m_rgb_small.view(B, -1) > 0.5
-                deg_thr_tokens = m_ir_small.view(B, -1) > 0.5
-                ceiling_loss = torch.tensor(0.0, device=s_rgb.device)
-                if deg_rgb_tokens.any():
-                    ceiling_loss = ceiling_loss + F.relu(
-                        pred_rgb[deg_rgb_tokens] - self.deg_ceiling).mean()
-                if deg_thr_tokens.any():
-                    ceiling_loss = ceiling_loss + F.relu(
-                        pred_thr[deg_thr_tokens] - self.deg_ceiling).mean()
-                total_loss += ceiling_loss * self.deg_ceiling_weight
-
-            total_loss += loss_rgb + loss_thr
-            n_valid += 1
-
-        if n_valid == 0:
-            return None
-        return total_loss / n_valid
+        Aligns with EoMT's _deg_ceiling_loss.
+        """
+        base_ceiling = self.deg_ceiling
+        total = z = 0.0
+        for (s_rgb, s_t) in quality_info:
+            if s_rgb is None:
+                continue
+            for s, lvl_h in (
+                    (s_rgb, lvl_heavy_tok[0]),
+                    (s_t, lvl_heavy_tok[1])):
+                s = s.squeeze(-1)                       # [2B, N]
+                if s.shape[1] > lvl_h.shape[1]:
+                    s = s[:, s.shape[1] - lvl_h.shape[1]:]
+                s_heavy = s[B:]                         # [B, N] heavy version
+                lvl_f = lvl_h.float()
+                ceiling = base_ceiling * (6.0 - lvl_f) / 5.0  # [B, N]
+                above = (s_heavy - ceiling).clamp_min(0.0)
+                reg = (lvl_h > 0).float()
+                denom = reg.sum().clamp_min(1.0)
+                total = total + (above * reg).sum() / denom
+                z += 1
+        return total / max(z, 1)
 
     def train(self, mode=True):
         super().train(mode)

@@ -415,30 +415,32 @@ class DINOv3BlockWrapper(nn.Module):
 
         attn = block.attn if hasattr(block, 'attn') else block.attention
         if hasattr(attn, 'q_proj'):
-            # DINOv3 split QKV
-            q = attn.q_proj(x_norm)
-            k = attn.k_proj(x_norm)
-            v = attn.v_proj(x_norm)
-            num_heads = attn.num_heads
-            head_dim = C // num_heads
-            q = q.reshape(B, L, num_heads, head_dim).permute(0, 2, 1, 3)
-            k = k.reshape(B, L, num_heads, head_dim).permute(0, 2, 1, 3)
-            v = v.reshape(B, L, num_heads, head_dim).permute(0, 2, 1, 3)
-
-            if self.rope is not None:
-                q = self.rope(q)
-                k = self.rope(k)
-
-            attn_weights = (q @ k.transpose(-2, -1)) * (head_dim ** -0.5)
-            # Quality self-attn bias: log(D) suppresses low-quality keys
-            # (same additive-bias mechanism as EoMT QualityAttnWrapper)
+            # DINOv3 HF attention: takes (hidden_states, attention_mask,
+            # position_embeddings=(cos,sin)) and handles QKV + RoPE internally.
+            # We only need to build the additive quality bias mask.
+            attn_mask = None
             if keep_mask is not None:
-                log_bias = torch.log(keep_mask.clamp_min(1e-9))
-                # [B, N] -> [B, 1, 1, N] for broadcasting over heads & queries
-                attn_weights = attn_weights + log_bias.unsqueeze(1).unsqueeze(1)
-            attn_weights = attn_weights.softmax(dim=-1)
-            out = (attn_weights @ v).transpose(1, 2).reshape(B, L, C)
-            out = attn.o_proj(out)
+                # log(D) additive bias, shape [B, 1, 1, N] broadcasting over
+                # heads & queries (key-side suppression).
+                log_bias = torch.log(keep_mask.clamp_min(1e-9))  # [B, N]
+                attn_mask = log_bias[:, None, None, :]            # [B, 1, 1, N]
+                num_heads = attn.num_heads
+                attn_mask = attn_mask.expand(-1, num_heads, L, -1).contiguous()
+
+            # Compute RoPE (cos, sin) for this input shape once.
+            pos_emb = None
+            if self.rope is not None:
+                # rope_embeddings expects pixel_values [B,C,H,W]; reconstruct
+                # a dummy from x's grid (H, W) is not needed because RoPE
+                # only uses spatial dims from the tensor's grid.
+                # EoMT passes rope = backbone.rope_embeddings(input_image).
+                # Here self.rope IS that module; call with dummy [B,C,H,W].
+                dummy = x.new_zeros(B, 3, H * 16, W * 16)
+                pos_emb = self.rope(dummy)  # (cos, sin)
+
+            out = attn(x_norm, attention_mask=attn_mask,
+                       position_embeddings=pos_emb)
+            out = out[0] if isinstance(out, (tuple, list)) else out
         else:
             out = attn(x_norm)
 

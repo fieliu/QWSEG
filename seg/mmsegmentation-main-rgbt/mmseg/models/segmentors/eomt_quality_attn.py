@@ -28,6 +28,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from transformers.models.dinov3_vit.modeling_dinov3_vit import (
+        apply_rotary_pos_emb as _dinov3_apply_rope,
+    )
+except Exception:  # pragma: no cover
+    _dinov3_apply_rope = None
+
 
 # ---------------------------------------------------------------------------
 # Soft keep-mask (replaces the old hard-threshold STE).
@@ -238,39 +245,55 @@ class QualityAttnWrapper(nn.Module):
             return self.attn(hidden_states, attention_mask=attention_mask,
                              position_embeddings=position_embeddings, **kwargs)
         try:
-            # Turn soft keep-mask D into a key-side log-bias:
-            #   D=1 (keep) -> log(1)=0 (no effect)
-            #   D=0.01 (pruned) -> log(0.01)=-4.6 (near-full suppress)
-            #   softmax(scores + log(D_j)) ≅ softmax(scores) * D_j / Σ D
-            # self._q_keep_mask: [B, N] (key-side). Expand to the 4D additive
-            # mask shape [B, H, Nq, Nk] required by HF DINOv3's SDPA path:
-            #   [B, N] -> [B, 1, 1, N]  (broadcast over heads & queries)
-            log_bias = torch.log(self._q_keep_mask.clamp_min(1e-9))  # [B, N]
-            log_bias = log_bias[:, None, None, :]                    # [B, 1, 1, N]
-            num_heads = getattr(self.attn, 'num_heads', None)
-            if num_heads is not None:
-                # Use .repeat (not .expand) so the tensor is contiguous in
-                # memory; flash-attention backward ("LSE is not correctly
-                # aligned (strideH)") fails on expanded non-contiguous masks.
-                log_bias = log_bias.repeat(1, num_heads, 1, 1)       # [B, H, 1, N]
-            # broadcast over query dim is implicit in SDPA (Nq=1 broadcasts)
-            if attention_mask is None:
-                merged_mask = log_bias
-            elif attention_mask.dtype == torch.bool:
-                # bool mask: True=attend. Apply log_bias only at kept positions,
-                # -inf at masked-out positions. Expand bool [B, Nq, Nk] (or 4D)
-                # to match log_bias's 4D shape.
-                bm = attention_mask
-                if bm.ndim == 2:
-                    bm = bm[:, None, None, :]
-                elif bm.ndim == 3:
-                    bm = bm[:, None, :, :]
-                merged_mask = log_bias.masked_fill(~bm, float('-inf'))
-            else:
-                merged_mask = attention_mask + log_bias
+            # Re-implement DINOv3ViTAttention.forward + eager_attention_forward
+            # (reference: transformers.models.dinov3_vit.modeling_dinov3_vit)
+            # using eager attention (NOT SDPA) so we can inject a pre-softmax
+            # additive quality bias without flash-attention backward issues
+            # ("LSE is not correctly aligned (strideH)" arises when SDPA's
+            # attn_mask is a broadcasted float tensor).
+            attn = self.attn
+            B, L, C = hidden_states.shape
+            H = attn.num_heads
+            Hd = attn.head_dim
 
-            return self.attn(hidden_states, attention_mask=merged_mask,
-                             position_embeddings=position_embeddings, **kwargs)
+            # 1) q/k/v projections (same as DINOv3ViTAttention.forward)
+            q = attn.q_proj(hidden_states).view(B, L, H, Hd).transpose(1, 2)
+            k = attn.k_proj(hidden_states).view(B, L, H, Hd).transpose(1, 2)
+            v = attn.v_proj(hidden_states).view(B, L, H, Hd).transpose(1, 2)
+
+            # 2) RoPE (patch-only, prefix tokens untouched) — delegate to the
+            #    official apply_rotary_pos_emb so behavior is identical.
+            if position_embeddings is not None and _dinov3_apply_rope is not None:
+                cos, sin = position_embeddings
+                q, k = _dinov3_apply_rope(q, k, cos, sin)
+
+            # 3) Eager attention (reference: eager_attention_forward)
+            #    scores = Q @ K^T * scale
+            scale = attn.scaling
+            attn_weights = torch.matmul(q, k.transpose(-1, -2)) * scale  # [B,H,L,L]
+
+            # 4) Quality key-side bias: log(D) additive before softmax.
+            #    [B,N] -> broadcast over heads & queries (key-side suppression).
+            log_bias = torch.log(self._q_keep_mask.clamp_min(1e-9))  # [B, N]
+            attn_weights = attn_weights + log_bias[:, None, None, :]
+
+            # 5) Merge any existing attention_mask (e.g. bool padding mask).
+            if attention_mask is not None:
+                if attention_mask.dtype == torch.bool:
+                    attn_weights = attn_weights.masked_fill(~attention_mask, float('-inf'))
+                else:
+                    attn_weights = attn_weights + attention_mask
+
+            # 6) softmax + dropout + context
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+            dropout_p = attn.dropout if self.training else 0.0
+            attn_weights = F.dropout(attn_weights, p=dropout_p, training=self.training)
+            out = torch.matmul(attn_weights, v)  # [B,H,L,Hd]
+
+            # 7) output projection (same as DINOv3ViTAttention.forward)
+            out = out.transpose(1, 2).reshape(B, L, C).contiguous()
+            out = attn.o_proj(out)
+            return out, attn_weights
         finally:
             self._q_keep_mask = None
 

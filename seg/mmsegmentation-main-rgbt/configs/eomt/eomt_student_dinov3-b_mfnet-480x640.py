@@ -10,7 +10,7 @@ custom_imports = dict(
              'mmseg.engine',
              'mmseg.datasets.mfnet',
              'mmseg.datasets.transforms.loading'],
-    allow_failed_imports=False)
+    allow_failed_imports=True)
 
 # Path to the trained clean teacher checkpoint (fill after training the
 # eomt_rgbt_fusion baseline).

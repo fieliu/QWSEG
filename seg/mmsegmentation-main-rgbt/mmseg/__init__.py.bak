@@ -1,10 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import warnings
 
-try:
-    import mmcv
-except ImportError:
-    mmcv = None
+import mmcv
 import mmengine
 from packaging.version import parse
 

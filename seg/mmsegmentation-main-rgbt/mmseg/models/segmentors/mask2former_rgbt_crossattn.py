@@ -116,9 +116,10 @@ class Mask2FormerRGBTCrossAttn(Mask2FormerRGBTAdd):
 
         dim = self.backbone.embed_dims  # 768 for ViT-B
 
-        # Channel-Spatial attention fusion: one per scale level
+        # Channel-Spatial attention fusion: one per scale level.
+        # Concat [rgb_f, thr_f] gives 2*dim channels → need 2*dim input.
         self.cs_fusions = nn.ModuleList(
-            [ChannelSpatialAttention(dim) for _ in range(4)]
+            [ChannelSpatialAttention(2 * dim) for _ in range(4)]
         )
 
         print_log(

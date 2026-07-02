@@ -47,8 +47,8 @@ class ChannelSpatialAttention(nn.Module):
         self.conv_spatial = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
 
         # Dimensionality reduction: 2C -> C
-        self.conv_reduce = nn.Conv2d(in_channels * 2, in_channels, 1, bias=True)
-        self.bn = nn.BatchNorm2d(in_channels)
+        self.conv_reduce = nn.Conv2d(in_channels, in_channels // 2, 1, bias=True)
+        self.bn = nn.BatchNorm2d(in_channels // 2)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):

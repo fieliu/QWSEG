@@ -118,24 +118,11 @@ class EncoderDecoder(BaseSegmentor):
                 self.auxiliary_head = MODELS.build(auxiliary_head)
 
     def extract_feat(self, inputs: Tensor) -> List[Tensor]:
-        """Extract features from images."""
-        x_rgbt = self.backbone(inputs)
-        
-        
-
-        b,c,h,w = x_rgbt[0].shape
-        x_stage0 = x_rgbt[0].view(b//2,c*2,h,w)#[:B_size,:,:,:] + x_rgbt[0][B_size:,:,:,:]
-        b,c,h,w = x_rgbt[1].shape
-        x_stage1 = x_rgbt[1].view(b//2,c*2,h,w)#[:B_size,:,:,:] + x_rgbt[1][B_size:,:,:,:]
-        b,c,h,w = x_rgbt[2].shape
-        x_stage2 = x_rgbt[2].view(b//2,c*2,h,w)#[:B_size,:,:,:] + x_rgbt[2][B_size:,:,:,:]
-        b,c,h,w = x_rgbt[3].shape
-        x_stage3 = x_rgbt[3].view(b//2,c*2,h,w)#[:B_size,:,:,:] + x_rgbt[3][B_size:,:,:,:]
-        x = (x_stage0,x_stage1,x_stage2,x_stage3)
-        
-        if self.with_neck:
-            x = self.neck(x)
-        return x
+        """Extract features from images. Backbone returns list of feature maps."""
+        x = self.backbone(inputs)
+        if isinstance(x, (list, tuple)):
+            return list(x)
+        return [x]
 
     def encode_decode(self, inputs: Tensor,
                       batch_img_metas: List[dict]) -> Tensor:

@@ -46,6 +46,9 @@ class EoMTSegmentor(BaseSegmentor):
         ignore_index=255,
         data_preprocessor=None,
         init_cfg=None,
+        # mmseg standard kwargs (accepted for compatibility, stored)
+        train_cfg=None,
+        test_cfg=None,
     ):
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
         self.img_size = tuple(img_size)

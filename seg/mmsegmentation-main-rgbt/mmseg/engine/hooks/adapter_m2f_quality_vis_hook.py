@@ -148,12 +148,19 @@ class AdapterM2FQualityVisHook(Hook):
                         s_rgb = vis_q_rgb[0].squeeze(-1)  # [N]
                         s_thr = vis_q_thr[0].squeeze(-1)  # [N]
                         N = s_rgb.shape[0]
-                        side = int(np.sqrt(N))
-                        if side * side == N:
-                            q_rgb_map = s_rgb.reshape(side, side).cpu().numpy()
-                            q_thr_map = s_thr.reshape(side, side).cpu().numpy()
-                            q_rgb_vis = _quality_to_red_blue(q_rgb_map)
-                            q_thr_vis = _quality_to_red_blue(q_thr_map)
+                        # Get actual token grid size from backbone
+                        token_grid = getattr(model.backbone, '_token_grid', None)
+                        if token_grid is not None:
+                            gh, gw = token_grid
+                        else:
+                            # Fallback: assume square grid
+                            side = int(np.sqrt(N))
+                            gh, gw = side, side
+                        if gh * gw == N:
+                            q_rgb_map = s_rgb.reshape(gh, gw).cpu().numpy()
+                            q_thr_map = s_thr.reshape(gh, gw).cpu().numpy()
+                            q_rgb_vis = _quality_to_red_blue(q_rgb_map, gh, gw)
+                            q_thr_vis = _quality_to_red_blue(q_thr_map, gh, gw)
                             q_rgb_vis = cv2.resize(q_rgb_vis, (w, h))
                             q_thr_vis = cv2.resize(q_thr_vis, (w, h))
                             qual_row = np.concatenate([

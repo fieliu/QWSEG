@@ -57,7 +57,7 @@ def _load_meta_dinov3_pth(ckpt_path):
     new["norm.bias"] = sd["norm.bias"]
 
     for i in range(n_layers):
-        s, d = f"blocks.{i}.", f"layer.{i}."
+        s, d = f"blocks.{i}.", f"model.layer.{i}."
         new[d + "norm1.weight"] = sd[s + "norm1.weight"]
         new[d + "norm1.bias"] = sd[s + "norm1.bias"]
         new[d + "norm2.weight"] = sd[s + "norm2.weight"]

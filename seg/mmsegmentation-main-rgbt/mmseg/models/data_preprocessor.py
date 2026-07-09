@@ -6,10 +6,12 @@ import torch
 from mmengine.model import BaseDataPreprocessor
 
 from mmseg.registry import MODELS
+from mmengine.registry import MODELS as ENGINE_MODELS
 from mmseg.utils import stack_batch
 
 
 @MODELS.register_module()
+@ENGINE_MODELS.register_module()
 class SegDataPreProcessor(BaseDataPreprocessor):
     """Image pre-processor for segmentation tasks.
 

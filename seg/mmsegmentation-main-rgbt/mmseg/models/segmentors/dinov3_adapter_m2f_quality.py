@@ -285,9 +285,14 @@ class DINOv3AdapterM2FQuality(Mask2FormerRGBTCrossAttn):
           3. segmentation loss on BOTH versions (targets duplicated)
           4. quality supervision: rank + clean_floor + deg_ceiling (not BCE)
         """
-        if not self.training or self.degrader is None or not self.use_quality:
-            # F0 / eval / no degrader: standard single-forward loss
+        if not self.training or self.degrader is None:
+            # eval / no degrader: standard single-forward loss
             return super().loss(inputs, data_samples)
+        # F0 (use_quality=False) also uses paired degradation for fair
+        # comparison with F1. With quality_loss_weight=0, no quality
+        # supervision is applied; only segmentation loss on degraded data.
+        # This ensures F1-F0 = pure quality mechanism increment (same
+        # degradation, different modules). Aligns with EoMT's loss().
 
         rgb = inputs[:, :3, :, :]
         ir = inputs[:, 3:6, :, :]

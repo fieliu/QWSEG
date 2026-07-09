@@ -115,7 +115,7 @@ class Mask2FormerRGBTAdd(BaseSegmentor):
     def _forward(self, inputs: torch.Tensor,
                  data_samples: OptSampleList = None) -> torch.Tensor:
         fused_feats = self.extract_feat(inputs)
-        return self.decode_head.forward(fused_feats)
+        return self.decode_head.forward(fused_feats, batch_data_samples=data_samples)
 
     def whole_inference(self, inputs, batch_img_metas):
         return self.encode_decode(inputs, batch_img_metas)

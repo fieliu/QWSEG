@@ -415,32 +415,45 @@ class DINOv3BlockWrapper(nn.Module):
 
         attn = block.attn if hasattr(block, 'attn') else block.attention
         if hasattr(attn, 'q_proj'):
-            # DINOv3 HF attention: takes (hidden_states, attention_mask,
-            # position_embeddings=(cos,sin)) and handles QKV + RoPE internally.
-            # We only need to build the additive quality bias mask.
-            attn_mask = None
-            if keep_mask is not None:
-                # log(D) additive bias, shape [B, 1, 1, N] broadcasting over
-                # heads & queries (key-side suppression).
-                log_bias = torch.log(keep_mask.clamp_min(1e-9))  # [B, N]
-                attn_mask = log_bias[:, None, None, :]            # [B, 1, 1, N]
-                num_heads = attn.num_heads
-                attn_mask = attn_mask.expand(-1, num_heads, L, -1).contiguous()
-
             # Compute RoPE (cos, sin) for this input shape once.
             pos_emb = None
             if self.rope is not None:
-                # rope_embeddings expects pixel_values [B,C,H,W]; reconstruct
-                # a dummy from x's grid (H, W) is not needed because RoPE
-                # only uses spatial dims from the tensor's grid.
-                # EoMT passes rope = backbone.rope_embeddings(input_image).
-                # Here self.rope IS that module; call with dummy [B,C,H,W].
                 dummy = x.new_zeros(B, 3, H * 16, W * 16)
                 pos_emb = self.rope(dummy)  # (cos, sin)
 
-            out = attn(x_norm, attention_mask=attn_mask,
-                       position_embeddings=pos_emb)
-            out = out[0] if isinstance(out, (tuple, list)) else out
+            if keep_mask is not None:
+                # Eager attention with log(D) additive bias (key-side
+                # suppression). Re-implements DINOv3ViTAttention.forward
+                # manually to avoid SDPA "LSE is not correctly aligned"
+                # error when passing a float attention_mask (consistent
+                # with EoMT's QualityAttnWrapper).
+                H_n = attn.num_heads
+                Hd = attn.head_dim
+                q = attn.q_proj(x_norm).view(B, L, H_n, Hd).transpose(1, 2)
+                k = attn.k_proj(x_norm).view(B, L, H_n, Hd).transpose(1, 2)
+                v = attn.v_proj(x_norm).view(B, L, H_n, Hd).transpose(1, 2)
+                # RoPE (patch-only, prefix tokens untouched)
+                if pos_emb is not None:
+                    from mmseg.models.segmentors.eomt_quality_attn import (
+                        _get_rope_fn)
+                    rope_fn = _get_rope_fn()
+                    if rope_fn is not None:
+                        cos, sin = pos_emb
+                        q, k = rope_fn(q, k, cos, sin)
+                # Eager attention + quality bias
+                scale = attn.scaling
+                attn_weights = torch.matmul(q, k.transpose(-1, -2)) * scale
+                log_bias = torch.log(keep_mask.clamp_min(1e-9))  # [B, N]
+                attn_weights = attn_weights + log_bias[:, None, None, :]
+                attn_weights = F.softmax(attn_weights, dim=-1,
+                                        dtype=torch.float32).to(q.dtype)
+                out = torch.matmul(attn_weights, v)
+                out = out.transpose(1, 2).reshape(B, L, C).contiguous()
+                out = attn.o_proj(out)
+            else:
+                # No quality mask: use original HF attention (may use SDPA)
+                out = attn(x_norm, position_embeddings=pos_emb)
+                out = out[0] if isinstance(out, (tuple, list)) else out
         else:
             out = attn(x_norm)
 

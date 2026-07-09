@@ -128,44 +128,9 @@ class EncoderDecoder(BaseSegmentor):
                       batch_img_metas: List[dict]) -> Tensor:
         """Encode images with backbone and decode into a semantic segmentation
         map of the same size as input."""
-
-        ##COMBINE RGB and IR in the B dimension
-        input_rgb = inputs[:,0:3,:,:]
-        input_ir = inputs[:,3:6,:,:]
-        input_rgbt = torch.cat([input_rgb,input_ir],dim=1)
-        b,c,h,w = input_rgbt.shape
-        input_rgbt = input_rgbt.view(b*2,c//2,h,w)
-        #input_rgbt = torch.cat([input_rgb, input_ir], dim=0)
-        x = self.extract_feat(input_rgbt)
-        '''
-        b,c,h,w = x_rgbt[0].shape
-        x_stage0 = x_rgbt[0].view(b//2,c*2,h,w)#[:B_size,:,:,:] + x_rgbt[0][B_size:,:,:,:]
-        b,c,h,w = x_rgbt[1].shape
-        x_stage1 = x_rgbt[1].view(b//2,c*2,h,w)#[:B_size,:,:,:] + x_rgbt[1][B_size:,:,:,:]
-        b,c,h,w = x_rgbt[2].shape
-        x_stage2 = x_rgbt[2].view(b//2,c*2,h,w)#[:B_size,:,:,:] + x_rgbt[2][B_size:,:,:,:]
-        b,c,h,w = x_rgbt[3].shape
-        x_stage3 = x_rgbt[3].view(b//2,c*2,h,w)#[:B_size,:,:,:] + x_rgbt[3][B_size:,:,:,:]
-        '''
-        '''
-        input_rgb = inputs[:,0:3,:,:]
-        input_ir = inputs[:,3:6,:,:]
-        x_rgb = self.extract_feat(input_rgb)
-        x_ir = self.extract_feat(input_ir)
-        
-        x_stage0 = x_rgb[0] + x_ir[0]
-        x_stage1 = x_rgb[1] + x_ir[1]
-        x_stage2 = x_rgb[2] + x_ir[2]
-        x_stage3 = x_rgb[3] + x_ir[3]
-        '''
-
-        #x = (x_stage0,x_stage1,x_stage2,x_stage3)
-        
-        #x = self.CrossAttentionFusion(x_rgb,x_ir)
-        # x = self.extract_feat(inputs)
+        x = self.extract_feat(inputs)
         seg_logits = self.decode_head.predict(x, batch_img_metas,
                                               self.test_cfg)
-
         return seg_logits
 
     def _decode_head_forward_train(self, inputs: List[Tensor],

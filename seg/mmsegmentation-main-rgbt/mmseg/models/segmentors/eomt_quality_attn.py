@@ -245,54 +245,39 @@ class QualityAttnWrapper(nn.Module):
             return self.attn(hidden_states, attention_mask=attention_mask,
                              position_embeddings=position_embeddings, **kwargs)
         try:
-            # Re-implement DINOv3ViTAttention.forward + eager_attention_forward
-            # (reference: transformers.models.dinov3_vit.modeling_dinov3_vit)
-            # using eager attention (NOT SDPA) so we can inject a pre-softmax
-            # additive quality bias without flash-attention backward issues
-            # ("LSE is not correctly aligned (strideH)" arises when SDPA's
-            # attn_mask is a broadcasted float tensor).
-            attn = self.attn
+            a = self.attn
             B, L, C = hidden_states.shape
-            H = attn.num_heads
-            Hd = attn.head_dim
+            H = a.num_heads
+            Hd = a.head_dim
 
-            # 1) q/k/v projections (same as DINOv3ViTAttention.forward)
-            q = attn.q_proj(hidden_states).view(B, L, H, Hd).transpose(1, 2)
-            k = attn.k_proj(hidden_states).view(B, L, H, Hd).transpose(1, 2)
-            v = attn.v_proj(hidden_states).view(B, L, H, Hd).transpose(1, 2)
+            # q/k/v projections (same as DINOv3ViTAttention.forward)
+            q = a.q_proj(hidden_states).view(B, L, H, Hd).transpose(1, 2)
+            k = a.k_proj(hidden_states).view(B, L, H, Hd).transpose(1, 2)
+            v = a.v_proj(hidden_states).view(B, L, H, Hd).transpose(1, 2)
 
-            # 2) RoPE (patch-only, prefix tokens untouched) — delegate to the
-            #    official apply_rotary_pos_emb so behavior is identical.
+            # RoPE (patch-only, prefix tokens untouched)
             if position_embeddings is not None and _dinov3_apply_rope is not None:
                 cos, sin = position_embeddings
                 q, k = _dinov3_apply_rope(q, k, cos, sin)
 
-            # 3) Eager attention (reference: eager_attention_forward)
-            #    scores = Q @ K^T * scale
-            scale = attn.scaling
+            # Eager attention: matmul-based, quality key-side log(D) bias
+            scale = a.scaling
             attn_weights = torch.matmul(q, k.transpose(-1, -2)) * scale  # [B,H,L,L]
-
-            # 4) Quality key-side bias: log(D) additive before softmax.
-            #    [B,N] -> broadcast over heads & queries (key-side suppression).
-            log_bias = torch.log(self._q_keep_mask.clamp_min(1e-9))  # [B, N]
+            log_bias = torch.log(self._q_keep_mask.clamp_min(1e-9))  # [B, L]
             attn_weights = attn_weights + log_bias[:, None, None, :]
 
-            # 5) Merge any existing attention_mask (e.g. bool padding mask).
             if attention_mask is not None:
                 if attention_mask.dtype == torch.bool:
                     attn_weights = attn_weights.masked_fill(~attention_mask, float('-inf'))
                 else:
                     attn_weights = attn_weights + attention_mask
 
-            # 6) softmax + dropout + context
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-            dropout_p = attn.dropout if self.training else 0.0
+            dropout_p = a.dropout if self.training else 0.0
             attn_weights = F.dropout(attn_weights, p=dropout_p, training=self.training)
-            out = torch.matmul(attn_weights, v)  # [B,H,L,Hd]
-
-            # 7) output projection (same as DINOv3ViTAttention.forward)
+            out = torch.matmul(attn_weights, v)
             out = out.transpose(1, 2).reshape(B, L, C).contiguous()
-            out = attn.o_proj(out)
+            out = a.o_proj(out)
             return out, attn_weights
         finally:
             self._q_keep_mask = None

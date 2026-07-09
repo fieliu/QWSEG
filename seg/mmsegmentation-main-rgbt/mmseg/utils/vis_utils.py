@@ -127,6 +127,9 @@ def _get_backbone_input_size(model):
 def _apply_palette(label, palette):
     if label.ndim != 2:
         label = label.squeeze()
+    if label.ndim != 2:
+        # Already a color image or has extra dims — take last 2 dims
+        label = label.reshape(-1, label.shape[-2], label.shape[-1])[-1]
     h, w = label.shape
     color_map = np.zeros((h, w, 3), dtype=np.uint8)
     for cls_id, color in enumerate(palette):

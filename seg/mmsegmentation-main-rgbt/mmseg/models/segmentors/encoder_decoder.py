@@ -196,73 +196,23 @@ class EncoderDecoder(BaseSegmentor):
         return losses
 
     def loss(self, inputs: Tensor, data_samples: SampleList) -> dict:
-        """Calculate losses from a batch of inputs and data samples.
+        """Forward function for training.
 
         Args:
-            inputs (Tensor): Input images.
-            data_samples (list[:obj:`SegDataSample`]): The seg data samples.
-                It usually includes information such as `metainfo` and
-                `gt_sem_seg`.
+            inputs (Tensor): Input images (6ch RGB-T or 3ch single-modal,
+                backbone internally selects channels).
+            data_samples (list[:obj:`SegDataSample`]): Segmentation data samples.
 
         Returns:
-            dict[str, Tensor]: a dictionary of loss components
+            dict[str, Tensor]: Loss dictionary.
         """
-
-
-
-        input_rgb = inputs[:,0:3,:,:]
-        input_ir = inputs[:,3:6,:,:]
-
-        # ####CEHCK####
-        # img_rgb = inputs[0, 0:3, :, :].cpu().numpy().transpose((1, 2, 0))
-        # img_ir = inputs[0, 3:6, :, :].cpu().numpy().transpose((1, 2, 0))
-        # img_rgb[:,:,0] = img_rgb[:,:,0]*58.395+123.675
-        # img_rgb[:,:,1] = img_rgb[:,:,1]*57.12+116.28
-        # img_rgb[:,:,2] = img_rgb[:,:,2]*57.375+103.53
-        # img_ir[:,:,0] = img_ir[:,:,0]*58.395+123.675
-        # img_ir[:,:,1] = img_ir[:,:,1]*57.12+116.28
-        # img_ir[:,:,2] = img_ir[:,:,2]*57.375+103.53
-        # cv2.imwrite('test_img_rgb.jpg',img_rgb)
-        # cv2.imwrite('test_img_ir.jpg',img_ir)
-        ####CEHCK####
-        '''
-        x_rgb = self.extract_feat(input_rgb)
-        x_ir = self.extract_feat(input_ir)
-
-        # x = self.extract_feat(inputs)
-        x_stage0 = x_rgb[0] + x_ir[0]
-        x_stage1 = x_rgb[1] + x_ir[1]
-        x_stage2 = x_rgb[2] + x_ir[2]
-        x_stage3 = x_rgb[3] + x_ir[3]
-        '''
-    
-        #input_rgbt = torch.cat([input_rgb,input_ir],dim=0)
-        input_rgbt = torch.cat([input_rgb, input_ir], dim=0)
-        x = self.extract_feat(input_rgbt)
-        #B_size = input_rgbt.shape[0]//2
-        '''
-        b,c,h,w = x_rgbt[0].shape
-        x_stage0 = x_rgbt[0].view(b//2,c*2,h,w)#[:B_size,:,:,:] + x_rgbt[0][B_size:,:,:,:]
-        b,c,h,w = x_rgbt[1].shape
-        x_stage1 = x_rgbt[1].view(b//2,c*2,h,w)#[:B_size,:,:,:] + x_rgbt[1][B_size:,:,:,:]
-        b,c,h,w = x_rgbt[2].shape
-        x_stage2 = x_rgbt[2].view(b//2,c*2,h,w)#[:B_size,:,:,:] + x_rgbt[2][B_size:,:,:,:]
-        b,c,h,w = x_rgbt[3].shape
-        x_stage3 = x_rgbt[3].view(b//2,c*2,h,w)#[:B_size,:,:,:] + x_rgbt[3][B_size:,:,:,:]
-        '''
-
-        #x = (x_stage0,x_stage1,x_stage2,x_stage3)
-        
-        #x = self.CrossAttentionFusion(x_rgb,x_ir)
+        x = self.extract_feat(inputs)
         losses = dict()
-
         loss_decode = self._decode_head_forward_train(x, data_samples)
         losses.update(loss_decode)
-
         if self.with_auxiliary_head:
             loss_aux = self._auxiliary_head_forward_train(x, data_samples)
             losses.update(loss_aux)
-
         return losses
 
     def predict(self,

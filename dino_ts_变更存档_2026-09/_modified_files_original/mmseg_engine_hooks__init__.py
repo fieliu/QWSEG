@@ -18,12 +18,8 @@ try:
     from .partial_degrade_eval_hook import PartialDegradeEvalHook
 except ImportError:
     PartialDegradeEvalHook = None
-try:
-    from .epoch_sync_hook import EpochSyncHook
-except ImportError:
-    EpochSyncHook = None
 from .visualization_hook import SegVisualizationHook
 
 __all__ = ['SegVisualizationHook', 'TrainVisHook', 'MissingModalityEvalHook',
            'EoMTRGBTVisHook', 'AdapterM2FQualityVisHook',
-           'PartialDegradeEvalHook', 'EpochSyncHook']
+           'PartialDegradeEvalHook']

@@ -1,0 +1,532 @@
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+% Place the official CVPR style files next to this source before submission.
+% The fallback keeps this draft locally compilable without vendoring the style.
+\newif\ifcvprformat
+\IfFileExists{cvpr.sty}{\cvprformattrue}{\cvprformatfalse}
+\ifcvprformat
+  \usepackage[review]{cvpr}
+\else
+  \usepackage[margin=0.72in,columnsep=0.24in]{geometry}
+\fi
+
+\usepackage{times}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{tabularx}
+\usepackage{xcolor}
+\usepackage{xspace}
+\usepackage{microtype}
+\usepackage{url}
+\usepackage[pagebackref,breaklinks,colorlinks,allcolors=blue]{hyperref}
+
+\newcommand{\method}{SAPT\xspace}
+\newcommand{\tbd}{\textcolor{red}{TBD}}
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\sg}{\operatorname{sg}}
+\newcommand{\cat}{\operatorname{cat}}
+\newcommand{\TopK}{\operatorname{TopK}}
+
+\ifcvprformat
+  \def\paperID{*****}
+  \def\confName{CVPR}
+  \def\confYear{2027}
+\fi
+
+\title{SAPT: Spatial-Anchor-Preserving Token Compression\\
+for Robust RGB-T Semantic Segmentation}
+
+\author{Anonymous CVPR Submission}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+RGB-thermal (RGB-T) semantic segmentation can improve scene understanding under poor illumination, yet two practical requirements remain in tension: the model must remain reliable when either sensor is corrupted or absent, while the cost of processing two dense token streams must stay manageable.
+Generic token pruning reduces computation but can erase spatial locations required by dense prediction; reliability-aware fusion often retains all modality tokens and therefore does not realize sequence-level acceleration.
+We present a spatial-anchor-preserving formulation that reparameterizes two aligned modality tokens at every patch into one mandatory \emph{Anchor} token and one optional \emph{Extra} token.
+All anchors are retained to preserve the complete segmentation grid, whereas a learned task-utility router selects a fixed budget of extras using an actual gather operation before the deep Transformer blocks.
+The resulting sequence contains $N+K$ tokens rather than $2N$, without deleting any spatial position.
+To make the sparse model robust, we introduce a staged training procedure: cross-modal adaptation of an RGB-pretrained DINOv3 backbone, dense supervised warm-up under clean, corrupted, and missing-modality views, dense EMA self-distillation, and finally dense-to-sparse distillation from a frozen robust teacher.
+Unlabeled RGB-T pairs contribute only feature-level consistency; no semantic pseudo-labels are generated.
+We will evaluate clean accuracy, corruption robustness, sensor-missing robustness, and measured latency on MFNet, FMB, SemanticRT, and PST900.
+Numerical results are intentionally marked as \tbd{} in this implementation-aligned draft and must be replaced after the full experimental protocol is completed.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+Semantic segmentation systems deployed in autonomous driving, robotics, and surveillance must assign a semantic label to every image location despite large variations in illumination and sensor quality.
+Thermal imaging complements RGB observations at night and in visually ambiguous regions, motivating RGB-T semantic segmentation datasets and methods~\cite{ha2017mfnet,shivakumar2019pst900,ji2023semanticrt,liu2023segmif}.
+However, a second modality does not automatically yield a robust system.
+RGB may suffer from low light, fog, blur, or saturation; thermal images may exhibit sensor noise, stripes, blur, or quantization; either stream may also be partially occluded or entirely unavailable.
+A model trained only on clean pairs can consequently over-rely on one modality and fail precisely when multimodal sensing is expected to help.
+
+Recent multimodal segmentation methods study arbitrary modality combinations, reliability-aware fusion, and foundation-model adaptation~\cite{zhang2023deliver,li2024stitchfusion,xu2026rsgmamba,tan2026rtfdnet,zhang2026crossweaver}.
+In parallel, large self-supervised vision encoders such as DINO and DINOv3 provide strong dense visual features~\cite{caron2021dino,simeoni2025dinov3}.
+SpectraDINO~\cite{nalcakan2026spectradino} further demonstrates that an RGB-pretrained DINO encoder can be adapted across infrared bands using modality-conditioned stems and adapters.
+These advances make ``a shared DINO backbone with modality adapters'' an increasingly strong baseline rather than a sufficient contribution by itself.
+
+Efficiency creates a distinct challenge.
+With two aligned modalities and $N$ patches per modality, naively concatenating both streams produces $2N$ tokens.
+Self-attention in the post-fusion blocks then scales quadratically with this sequence length.
+Existing token reduction methods select, merge, or learn a small set of tokens~\cite{rao2021dynamicvit,ryoo2021tokenlearner,bolya2023tome}, but unconstrained removal is risky for semantic segmentation: if all evidence at a spatial location disappears, the decoder must hallucinate a dense output from a spatially incomplete representation.
+Merely multiplying unwanted tokens by zero or masking attention also fails to deliver the intended dense-kernel speedup because tensor shapes remain unchanged.
+
+We address this tension with a simple structural constraint: \emph{keep one token for every spatial position and prune only cross-modal redundancy}.
+At a shallow fusion point, the aligned RGB and thermal token pair is mapped to an Anchor token, which carries the mandatory spatial representation, and an Extra token, which captures complementary or discrepant modality information.
+The dense model retains all $N$ anchors and all $N$ extras.
+The sparse model always retains the $N$ anchors and selects only $K$ extras according to learned task utility.
+Hard selection uses a real gather, shortening the sequence entering all remaining Transformer blocks from $2N$ to $N+K$.
+
+Robust compression also requires a suitable teacher.
+A clean-only teacher may transfer brittle behavior, while an EMA teacher initialized before the model has learned multimodal segmentation provides an unstable target.
+We therefore organize training into three conceptual stages, with the second stage split into two engineering phases.
+First, paired RGB-T data adapts the thermal input path to the frozen RGB-pretrained representation.
+Second, a dense model learns segmentation from clean, procedurally degraded, and missing-modality views before an EMA copy supplies weak-to-strong anchor consistency.
+Third, the accepted dense EMA model is frozen and supervises a sparse student through compression, robustness, and labeled logit losses.
+Semantic labels for unlabeled pairs are never synthesized.
+
+Our contributions are:
+\begin{itemize}
+    \item We formulate RGB-T fusion as an Anchor--Extra reparameterization that preserves exactly one dense semantic token at every patch while exposing only the complementary tokens to pruning.
+    \item We introduce fixed-budget, task-utility Top-$K$ routing with physical token gathering, which reduces the post-fusion sequence from $2N$ to $N+K$ and enables measurable latency savings rather than mask-only sparsity.
+    \item We develop a dense-teacher/sparse-student curriculum that separates modality adaptation, robust dense representation learning, and compression learning, and that supports unlabeled pairs without semantic pseudo-labels.
+    \item We define an evaluation protocol that jointly reports clean segmentation, modality-specific corruptions, complete sensor failure, token count, memory, and real latency. The present draft specifies this protocol but makes no empirical superiority claim before the experiments are complete.
+\end{itemize}
+
+\begin{figure*}[t]
+  \centering
+  \fbox{\begin{minipage}{0.96\linewidth}
+  \small
+  \textbf{Architecture placeholder.}
+  RGB and thermal images are patch-embedded separately and pass through the first $R$ shared-weight DINOv3 blocks as two independent attention sequences, each augmented by a shallow modality adapter.
+  At every aligned location, Anchor--Extra fusion produces one mandatory Anchor and one optional Extra.
+  A dense teacher sends all $2N$ tokens through the remaining blocks.
+  A sparse student keeps every Anchor and gathers the $K$ highest-utility Extras, sending $N+K$ tokens through the same deep blocks.
+  The Mask2Former decoder consumes only the final $N$ Anchor tokens.
+  Replace this box with a vector figure that also visualizes Stage~1, Stage~2A/2B, and Stage~3 supervision.
+  \end{minipage}}
+  \caption{Overview of the proposed spatial-anchor-preserving framework. The non-negotiable Anchor grid maintains dense spatial support, while only redundant cross-modal Extra tokens are compressed.}
+  \label{fig:overview}
+\end{figure*}
+
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{RGB-T and arbitrary-modal semantic segmentation.}
+MFNet~\cite{ha2017mfnet}, PST900~\cite{shivakumar2019pst900}, FMB~\cite{liu2023segmif}, and SemanticRT~\cite{ji2023semanticrt} provide paired visible--thermal images with dense labels at different scales and scene distributions.
+Earlier approaches commonly use modality-specific encoders and repeated fusion.
+More recent systems broaden the scope: CMNeXt/DeLiVER targets arbitrary combinations of available modalities~\cite{zhang2023deliver}; StitchFusion studies reusable fusion across visual modalities~\cite{li2024stitchfusion}; and CrossWeaver explicitly targets arbitrary-modality segmentation~\cite{zhang2026crossweaver}.
+Open-RGBT~\cite{yu2024openrgbt} studies open-vocabulary RGB-T segmentation, which is complementary to our closed-set robustness and efficiency focus.
+We do not claim a universal raw-sensor interface: the current model assumes aligned image-grid modalities and is evaluated first on RGB-T.
+
+\paragraph{Reliability under corrupted or missing modalities.}
+Multimodal models often assume that all sensors are present and reliable.
+CMNeXt evaluates arbitrary modality availability~\cite{zhang2023deliver}, while recent RSGMamba~\cite{xu2026rsgmamba} and RTFDNet~\cite{tan2026rtfdnet} emphasize reliability-aware or robust fusion.
+Our work asks a related but different question: can robustness be maintained while physically shortening the fused Transformer sequence?
+We use label-preserving synthetic corruptions for training, but do not equate them with real sensor failure.
+Accordingly, our protocol separates synthetic corruption, complete modality removal, and naturally adverse subsets.
+
+\paragraph{Foundation models beyond RGB.}
+Self-distilled ViTs learn transferable dense features without semantic labels~\cite{caron2021dino}, and DINOv3 scales this paradigm to stronger visual representations~\cite{simeoni2025dinov3}.
+RADIOv2.5 investigates multi-teacher foundation models and fixed-count token compression~\cite{heinrich2024radiov25}.
+Most directly related, SpectraDINO adapts RGB DINO models to infrared spectra through modality-conditioned components and staged learning~\cite{nalcakan2026spectradino}.
+We therefore treat shared DINO weights, separate input stems, and shallow modality adapters as enabling design choices.
+Our claimed contribution lies after adaptation: preserving a complete Anchor grid, learning an Extra-token budget, and distilling a corruption-robust dense model into a truly shorter sparse sequence.
+
+\paragraph{Token reduction.}
+DynamicViT removes low-importance image tokens~\cite{rao2021dynamicvit}, TokenLearner learns a compact token set~\cite{ryoo2021tokenlearner}, and Token Merging combines similar tokens~\cite{bolya2023tome}.
+Such methods are attractive for classification but require care for dense prediction.
+Our method does not prune spatial support: every patch owns one Anchor throughout the network.
+The router acts only on aligned cross-modal Extra tokens, and its hard path materializes a shorter tensor before expensive deep attention and FFN layers.
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Problem Setting}
+
+Given a registered RGB image $x^r\in\R^{H\times W\times3}$ and thermal image $x^t\in\R^{H\times W\times C_t}$, the goal is to predict a dense label map $y\in\{1,\ldots,C\}^{H\times W}$.
+At test time, either input can be clean, spatially corrupted, or missing.
+We focus on closed-set RGB-T semantic segmentation and assume image-grid alignment.
+Raw asynchronous event streams, point clouds, radar tensors, and open-vocabulary recognition are outside the current scope.
+
+With patch size $P$, the feature grid has $H_p=H/P$, $W_p=W/P$, and $N=H_pW_p$ locations.
+Our key invariant is that at least one learned token associated with each of these $N$ locations survives until decoding.
+
+\subsection{Modality-Conditioned Shared ViT}
+\label{sec:sharedvit}
+
+We initialize a ViT from an RGB-pretrained DINOv3 model~\cite{simeoni2025dinov3}.
+RGB and thermal inputs use separate patch projections $E_r$ and $E_t$ and learned modality embeddings.
+The first $R$ Transformer blocks share attention and FFN parameters, but process the modalities independently; equivalently, the modality axis is folded into the batch axis.
+This avoids premature attention between poorly aligned modality representations while retaining one common backbone.
+
+For modality $m\in\{r,t\}$ and shallow block $\ell\le R$, we write
+\begin{align}
+u^m_\ell &= h^m_{\ell-1}+\operatorname{Attn}_\ell(\operatorname{LN}(h^m_{\ell-1})),\\
+h^m_\ell &= u^m_\ell+\operatorname{FFN}_\ell(\operatorname{LN}(u^m_\ell))
+ +\gamma^m_\ell A^m_\ell(\operatorname{LN}(u^m_\ell)),
+\end{align}
+where $A^m_\ell$ is a bottleneck adapter and $\gamma^m_\ell$ is initialized to zero.
+The adapter supplements rather than replaces the shared FFN.
+Only the shallow blocks use modality-specific adapters because tokens lose a unique modality identity after fusion.
+
+When a whole modality is absent, an availability indicator zeros its input token stream before the shallow blocks.
+The fusion network then learns to rely on the available stream instead of interpreting a zero image as a valid sensor observation.
+
+\subsection{Anchor--Extra Reparameterization}
+\label{sec:anchor-extra}
+
+Let $r_i,t_i\in\R^D$ be the shallow RGB and thermal tokens at aligned location $i$.
+We construct a symmetric descriptor with both common and discrepancy cues,
+\begin{equation}
+c_i=[r_i;t_i;|r_i-t_i|;r_i\odot t_i].
+\end{equation}
+A two-way softmax predicts location-dependent fusion weights,
+\begin{equation}
+[\alpha_i^r,\alpha_i^t]=\operatorname{softmax}(F_{\alpha}(c_i)),
+\end{equation}
+and the Anchor is
+\begin{equation}
+a_i=\alpha_i^rV_r(r_i)+\alpha_i^tV_t(t_i).
+\label{eq:anchor}
+\end{equation}
+The corresponding Extra token is
+\begin{equation}
+e_i=F_e([r_i-t_i;r_i;t_i;a_i])+p_i^e+q^e,
+\label{eq:extra}
+\end{equation}
+where $p_i^e$ and $q^e$ encode spatial location and Extra-token type.
+An Anchor positional embedding $p_i^a$ is added separately.
+
+This design is motivated by the linear special case $a_i=\alpha_i r_i+(1-\alpha_i)t_i$ and $e_i=r_i-t_i$, from which the original pair can be recovered when $\alpha_i$ is known.
+Our MLP implementation is not claimed to be mathematically invertible; the special case only explains why a common component plus a residual component can retain more information than direct $2N\rightarrow N$ fusion.
+
+The dense sequence is
+\begin{equation}
+z_{\mathrm{dense}}=[a_1,\ldots,a_N,e_1,\ldots,e_N].
+\end{equation}
+It passes through blocks $R+1,\ldots,L$ with cross-modal global self-attention.
+Because the joint sequence is no longer a single raster---and selected Extras may be reordered---we disable raster RoPE in these deep blocks and use the learned Anchor and Extra positional encodings described above.
+After the final normalization, only the first $N$ Anchor outputs are reshaped to $D\times H_p\times W_p$ for dense decoding.
+
+\subsection{Task-Utility Extra Routing}
+\label{sec:routing}
+
+The router estimates the segmentation utility of each Extra conditioned on its corresponding Anchor:
+\begin{equation}
+u_i=F_u([a_i;e_i;|a_i-e_i|;a_i\odot e_i]).
+\end{equation}
+For a fixed budget $K$, the inference path selects
+\begin{align}
+\mathcal I_K &= \TopK(\{u_i\}_{i=1}^N,K),\\
+z_{\mathrm{sparse}} &= [a_1,\ldots,a_N;\operatorname{Gather}(E,\mathcal I_K)].
+\end{align}
+The gather operation creates a physical tensor of length $N+K$.
+All Anchor tokens remain, so the decoder still receives an $H_p\times W_p$ feature map even when $K=0$.
+
+At the beginning of sparse training, we use a differentiable full-length gate
+\begin{equation}
+\tilde e_i=e_i\,\sigma((u_i-\tau_K)/\tau),
+\end{equation}
+where $\tau_K$ is the $K$-th largest utility in each sample.
+This warm-up trains the router but does not save computation.
+After warm-up, training and all evaluation use hard Top-$K$ gathering.
+
+Ignoring linear projections, deep-block attention changes from $O((2N)^2D)$ to $O((N+K)^2D)$, while the token-wise FFN changes from $O(2ND^2)$ to $O((N+K)D^2)$.
+At $K=0.5N$, deep attention-score computation is $56.25\%$ of the dense path and deep FFN token computation is $75\%$.
+These are block-level estimates; end-to-end gains must be measured because shallow blocks, fusion, gathering, and the decoder remain.
+
+\subsection{Multi-Stage Optimization}
+\label{sec:training}
+
+\paragraph{Stage 1: cross-modal adaptation.}
+The RGB patch projection, shared DINOv3 blocks, RGB adapters, fusion/router, decoder, and an RGB alignment projector are frozen.
+We optimize the thermal patch projection, thermal modality embedding, shallow thermal adapters, and a student alignment projector on registered RGB-T pairs.
+For projected, $\ell_2$-normalized tokens $z_i^t$ and frozen RGB targets $z_i^r$, the patch and region losses are
+\begin{align}
+\mathcal L_{\mathrm{patch}}&=\frac{1}{|\Omega|}\sum_{i\in\Omega}
+\left(1-\cos(z_i^t,\sg[z_i^r])\right),\\
+\mathcal L_{\mathrm{region}}&=\frac{1}{|\Omega'|}\sum_{j\in\Omega'}
+\left(1-\cos(\bar z_j^t,\sg[\bar z_j^r])\right),\\
+\mathcal L_1&=\lambda_p\mathcal L_{\mathrm{patch}}+
+\lambda_r\mathcal L_{\mathrm{region}}.
+\end{align}
+Region pooling tolerates small registration errors.
+When correspondence is unreliable, $\lambda_p$ is set to zero.
+This stage transfers compatible structure, not semantic masks, and therefore can use unlabeled LLVIP or KAIST pairs~\cite{jia2021llvip,hwang2015kaist} after leakage removal.
+
+\paragraph{Stage 2A: dense robust warm-up.}
+We first train a complete dense segmentor without a teacher.
+For labeled $(x,y)$, let $C(x)$ be a label-preserving synthetic corruption and $D(x)$ remove one complete modality.
+Using the standard Mask2Former objective~\cite{cheng2022mask2former},
+\begin{equation}
+\mathcal L_{2A}=\mathcal L_{\mathrm{seg}}(f(x),y)
++\lambda_d\mathcal L_{\mathrm{seg}}(f(C(x)),y)
++\lambda_m\mathcal L_{\mathrm{seg}}(f(D(x)),y).
+\label{eq:stage2a}
+\end{equation}
+The current implementation uses class, mask-BCE, and Dice weights $2{:}5{:}5$.
+Real ground truth is reused because the corruptions preserve scene semantics and pixel coordinates; this is not pseudo-labeling.
+
+\paragraph{Stage 2B: dense EMA robustness.}
+After Stage~2A reaches acceptable clean and failure-mode accuracy, an EMA target is copied from the online dense model.
+For a strong view $x_s$ and a weak view $x_w$, both retaining all Extras,
+\begin{align}
+\mathcal L_{\mathrm{anchor}}&=\frac{1}{N}\sum_i
+\left(1-\cos(a_i^{\mathrm{online}}(x_s),
+\sg[a_i^{\mathrm{ema}}(x_w)])\right),\\
+\theta_{\mathrm{ema}}&\leftarrow m\theta_{\mathrm{ema}}+(1-m)\theta_{\mathrm{online}}.
+\end{align}
+For labeled samples, $\mathcal L_{2B}=\mathcal L_{2A}+\lambda_a\mathcal L_{\mathrm{anchor}}$; unlabeled samples use only $\mathcal L_{\mathrm{anchor}}$.
+Momentum increases from $0.996$ to $0.9999$.
+Although the teacher update follows DINO-style self-distillation~\cite{caron2021dino}, the current model does not use the original global DINO classification objective; its configured weight is zero.
+
+\paragraph{Stage 3: dense-to-sparse distillation.}
+We freeze the selected dense EMA model and initialize the sparse student from it.
+The student receives $C(x)$ and keeps $K$ Extras.
+The teacher remains dense and is evaluated on both $C(x)$ and clean $x$:
+\begin{align}
+\mathcal L_{\mathrm{comp}} &= \frac{1}{N}\sum_i
+\left(1-\cos(a_i^s(C(x)),\sg[a_i^d(C(x))])\right),\\
+\mathcal L_{\mathrm{rob}} &= \frac{1}{N}\sum_i
+\left(1-\cos(a_i^s(C(x)),\sg[a_i^d(x)])\right).
+\end{align}
+The first term isolates compression error under identical inputs; the second transfers clean-view stability to a degraded sparse student.
+For labeled samples, we additionally use the segmentation loss and temperature-scaled pixelwise logit distillation,
+\begin{equation}
+\mathcal L_{\mathrm{logit}}=T^2\operatorname{KL}
+\left(p_d(C(x);T)\,\|\,p_s(C(x);T)\right).
+\end{equation}
+The complete Stage~3 objective is
+\begin{equation}
+\mathcal L_3=\lambda_c\mathcal L_{\mathrm{comp}}+
+\lambda_b\mathcal L_{\mathrm{rob}}+
+\mathbb 1_y\left(\mathcal L_{\mathrm{seg}}+
+\lambda_l\mathcal L_{\mathrm{logit}}\right),
+\label{eq:stage3}
+\end{equation}
+where $\mathbb 1_y$ indicates that semantic labels are available.
+Unlabeled samples contribute only feature distillation.
+At no point do we convert teacher predictions into semantic training labels.
+
+\subsection{Procedural Corruptions}
+\label{sec:corruptions}
+
+The implementation applies corruptions online in image space before restoring the model's normalization.
+Stage~2A emphasizes sensor interruption: one modality is selected per sample and either fully removed or zeroed in a random local rectangle; a separate view always drops one entire modality.
+Stage~2B constructs weak/strong pairs from 13 modality-specific corruptions with severities $0$--$5$.
+RGB uses Gaussian noise, shot noise, motion blur, defocus blur, fog, low light, and missing input.
+Thermal uses Gaussian noise, stripe noise, motion blur, defocus blur, quantization, and missing input.
+For local corruption, the affected area is sampled from $[0.3,0.8]$ and kept identical between weak and strong views while severity differs.
+The current Stage~3 configuration reuses the Stage~2A missing/local-missing generator for dense-to-sparse distillation; extending Stage~3 to the full corruption bank is an ablation rather than an implemented default.
+
+Synthetic severity is a controllable training variable, not a calibrated physical sensor-quality measurement.
+We therefore use fixed corruption parameters for evaluation, hold out corruption families when testing unseen-corruption generalization, and report real adverse-condition subsets separately.
+
+\section{Experiments}
+\label{sec:experiments}
+
+\noindent\textbf{Draft status.}
+The repository currently contains the complete model path and MFNet-oriented configurations but no accepted training logs or benchmark results.
+Every numerical entry in this section is consequently a placeholder.
+No table should be used in a submission until reproduced from saved checkpoints and machine-readable evaluation logs.
+
+\subsection{Datasets and Protocol}
+
+\paragraph{Labeled segmentation datasets.}
+We plan to evaluate independently on MFNet~\cite{ha2017mfnet}, FMB~\cite{liu2023segmif}, SemanticRT~\cite{ji2023semanticrt}, and PST900~\cite{shivakumar2019pst900} using each official label space and split.
+Dataset-specific heads are required when class taxonomies differ.
+The primary current implementation targets MFNet at $480\times640$ resolution with nine output classes.
+SemanticRT contains 11,371 annotated RGB-T pairs and is especially useful for larger-scale robust training, but it is derived mainly from LLVIP, OSU, and INO sources.
+Any use of LLVIP in Stage~1 must therefore remove overlap with SemanticRT validation and test scenes using source IDs, exact hashes, and perceptual hashes.
+
+\paragraph{Unlabeled paired data.}
+LLVIP~\cite{jia2021llvip} and KAIST~\cite{hwang2015kaist} are candidates for Stage~1 alignment and Stage~2B/3 feature consistency.
+They are never assigned generated semantic masks.
+The checked-in Stage~1 configuration currently reuses MFNet training pairs as a runnable stand-in; the final experiments must replace this with a documented, deduplicated split.
+
+\paragraph{Metrics.}
+We report mean intersection-over-union (mIoU), mean class accuracy, and per-class IoU on clean data.
+For each corruption family and severity, we report mIoU, the absolute drop from clean performance, and the mean over corruptions.
+For missing sensors, RGB-missing and thermal-missing are reported separately together with their worst case.
+Efficiency measurements include parameters, FLOPs, actual deep sequence length, peak GPU memory, and synchronized wall-clock latency at batch size one and a deployment-relevant batch size.
+All latency measurements use identical hardware, precision, image size, warm-up, and iteration counts.
+
+\subsection{Implementation Details}
+
+The current model uses DINOv3 ViT-B/16 with $L=12$, embedding dimension $D=768$, and fusion after $R=3$ blocks.
+At $480\times640$, $N=30\times40=1200$.
+The dense teacher processes 2,400 deep tokens; the target sparse model uses $K=600$ Extras and processes 1,800 deep tokens.
+Adapters have bottleneck width 64.
+The Anchor map is converted to four scales by Feature2Pyramid and decoded by Mask2Former with 100 queries.
+
+Stage~1 uses AdamW with learning rate $10^{-4}$ for 100 epochs.
+Stages~2A, 2B, and 3 each use AdamW with learning rate $3\times10^{-5}$, weight decay $0.05$, layer-wise decay $0.9$, and a nominal 200-epoch schedule.
+Stage~3 reduces the budget through $N\rightarrow0.75N\rightarrow0.5N$ during the first 30 epochs, uses the soft router during warm-up, and then switches to hard gathering.
+The default loss weights are $\lambda_d=\lambda_m=\lambda_a=\lambda_c=\lambda_b=\lambda_l=1$ and logit temperature $T=2$.
+These settings are starting points and must be validated rather than reported as tuned optima.
+
+\subsection{Baselines}
+
+We compare against RGB-only and thermal-only DINOv3+Mask2Former models, a dense dual-stream DINOv3 model without Anchor--Extra compression, Anchor-only fusion, and recent multimodal methods whose code and evaluation protocol can be reproduced, including CMNeXt~\cite{zhang2023deliver}, StitchFusion~\cite{li2024stitchfusion}, SpectraDINO-based segmentation~\cite{nalcakan2026spectradino}, RSGMamba~\cite{xu2026rsgmamba}, and RTFDNet~\cite{tan2026rtfdnet}.
+Comparisons must use the same train/test split and input resolution; numbers copied from papers are listed separately from controlled re-runs.
+
+\begin{table*}[t]
+\centering
+\caption{Primary RGB-T semantic segmentation results. All entries are placeholders. ``Corr.'' averages the fixed corruption suite; ``Miss-W'' is the worse of RGB-missing and thermal-missing. Controlled re-runs and reported numbers must not be mixed.}
+\label{tab:main}
+\small
+\setlength{\tabcolsep}{4.5pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccccc}
+\toprule
+Method & Backbone & MFNet clean & FMB clean & SemanticRT clean & PST900 clean & Corr. & Miss-W & Params \\
+\midrule
+RGB-only & DINOv3-B/16 & \tbd & \tbd & \tbd & \tbd & \tbd & -- & \tbd \\
+Thermal-only & DINOv3-B/16 & \tbd & \tbd & \tbd & \tbd & \tbd & -- & \tbd \\
+CMNeXt~\cite{zhang2023deliver} & MiT-B2 & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+StitchFusion~\cite{li2024stitchfusion} & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+Dense Anchor--Extra teacher & DINOv3-B/16 & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+Ours, $K/N=0.5$ & DINOv3-B/16 & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+\bottomrule
+\end{tabular}
+}
+\end{table*}
+
+\begin{table}[t]
+\centering
+\caption{Robustness breakdown on the primary benchmark. Report mIoU for both missing directions and each severity group.}
+\label{tab:robust}
+\small
+\setlength{\tabcolsep}{3pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lccccc}
+\toprule
+Method & Clean & RGB miss & T miss & Seen-C & Unseen-C \\
+\midrule
+Dense teacher & \tbd & \tbd & \tbd & \tbd & \tbd \\
+Sparse, $K/N=0.75$ & \tbd & \tbd & \tbd & \tbd & \tbd \\
+Sparse, $K/N=0.50$ & \tbd & \tbd & \tbd & \tbd & \tbd \\
+Sparse, $K/N=0.25$ & \tbd & \tbd & \tbd & \tbd & \tbd \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\subsection{Efficiency and Budget Trade-off}
+
+Table~\ref{tab:efficiency} must be generated from actual hard-gather inference.
+A soft gate, zero multiplication, or attention mask still allocates the dense sequence and is not counted as token compression.
+We will also plot mIoU and latency against $K/N\in\{0,0.25,0.5,0.75,1.0\}$.
+
+\begin{table}[t]
+\centering
+\caption{Efficiency at $480\times640$. Deep-token length is known analytically; all hardware-dependent values are pending.}
+\label{tab:efficiency}
+\small
+\setlength{\tabcolsep}{3.8pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lrrrr}
+\toprule
+Variant & Deep tokens & FLOPs & Latency & Memory \\
+\midrule
+Dense teacher & 2400 & \tbd & \tbd & \tbd \\
+$K/N=0.75$ & 2100 & \tbd & \tbd & \tbd \\
+$K/N=0.50$ & 1800 & \tbd & \tbd & \tbd \\
+$K/N=0.25$ & 1500 & \tbd & \tbd & \tbd \\
+Anchor-only & 1200 & \tbd & \tbd & \tbd \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\subsection{Ablation Studies}
+
+The core ablation sequence should establish necessity before combining all components.
+We first compare direct $2N\rightarrow N$ fusion, dense $N+N$ Anchor--Extra processing, random Extra selection, utility Top-$K$, and mask-only selection.
+We then remove each training stage and each Stage~3 loss.
+Finally, we vary fusion depth $R$, adapter width, budget $K/N$, and the soft-to-hard transition.
+
+\begin{table*}[t]
+\centering
+\caption{Required ablations on MFNet. Each row changes one factor from the full sparse model. ``Seq.'' is the actual deep sequence length.}
+\label{tab:ablation}
+\small
+\setlength{\tabcolsep}{4.5pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccc}
+\toprule
+Variant & Clean & Corr. & RGB miss & T miss & Seq. & Latency & $\Delta$ clean \\
+\midrule
+Full model, $K/N=0.5$ & \tbd & \tbd & \tbd & \tbd & 1800 & \tbd & -- \\
+No Stage~1 adaptation & \tbd & \tbd & \tbd & \tbd & 1800 & \tbd & \tbd \\
+No Stage~2B EMA & \tbd & \tbd & \tbd & \tbd & 1800 & \tbd & \tbd \\
+No $\mathcal L_{\mathrm{comp}}$ & \tbd & \tbd & \tbd & \tbd & 1800 & \tbd & \tbd \\
+No $\mathcal L_{\mathrm{rob}}$ & \tbd & \tbd & \tbd & \tbd & 1800 & \tbd & \tbd \\
+No logit distillation & \tbd & \tbd & \tbd & \tbd & 1800 & \tbd & \tbd \\
+Random $K$ Extras & \tbd & \tbd & \tbd & \tbd & 1800 & \tbd & \tbd \\
+Mask-only, no gather & \tbd & \tbd & \tbd & \tbd & 2400 & \tbd & \tbd \\
+Anchor-only, $K=0$ & \tbd & \tbd & \tbd & \tbd & 1200 & \tbd & \tbd \\
+\bottomrule
+\end{tabular}
+}
+\end{table*}
+
+\paragraph{Router diagnostics.}
+We will visualize selected Extra locations, compare their frequency with corruption masks and semantic boundaries, and test whether routing collapses to a fixed modality or image region.
+Selection stability across augmentations and the entropy of spatial selection provide additional diagnostics.
+These analyses are descriptive: the utility score is learned from downstream distillation, not supervised as a calibrated quality estimate.
+
+\paragraph{Cross-dataset study.}
+Because label taxonomies differ, we will separate encoder pretraining from task-specific segmentation heads.
+A useful test is to pretrain the shared encoder and fusion on deduplicated paired data, then fine-tune independent heads on MFNet, FMB, SemanticRT, and PST900.
+Joint supervised training, if used, must sample datasets uniformly before sampling images and must report both joint and per-dataset fine-tuned results.
+
+\section{Discussion and Limitations}
+\label{sec:limitations}
+
+\paragraph{Scope of ``arbitrary modality.''}
+The current architecture is not yet an arbitrary-sensor model.
+It assumes two spatially registered image grids and contains RGB/T-specific patch projections, modality embeddings, and adapters.
+Adding depth or event frames is plausible when they can be rasterized and aligned, but requires a new input stem, adapter, fusion training, dense teacher, and sparse distillation.
+Results on RGB-T alone cannot support a universal-modality claim.
+
+\paragraph{Synthetic versus real degradation.}
+Procedural corruptions provide controlled coverage and label preservation, but their severity levels are not physical calibration standards.
+Robustness conclusions must include real night, weather, sensor-noise, and missing-input conditions, as well as held-out corruption types.
+
+\paragraph{Registration and information loss.}
+Anchor--Extra fusion assumes that $r_i$ and $t_i$ refer approximately to the same location.
+Large parallax or temporal misalignment can make pairwise fusion unreliable.
+Moreover, while all spatial locations survive through Anchors, pruning Extras can still remove modality-specific evidence.
+The budget--accuracy curve and failure visualizations are therefore essential.
+
+\paragraph{Training cost.}
+Stage~2B maintains an online model and an EMA copy, and Stage~3 evaluates a dense teacher in addition to the student.
+Inference is cheaper, but training is more expensive and multi-stage checkpoint selection introduces engineering complexity.
+
+\paragraph{Closed vocabulary.}
+Large vision-language models and Open-RGBT~\cite{yu2024openrgbt} address category generalization that this work does not.
+Our contribution targets a different deployment axis---dense prediction under sensor degradation with explicit compute control---and should not be presented as a replacement for open-vocabulary segmentation.
+
+\section{Conclusion}
+
+We introduced a spatial-anchor-preserving approach to efficient and robust RGB-T semantic segmentation.
+The method converts aligned modality pairs into mandatory Anchor tokens and optional Extra tokens, preserving the complete spatial grid while shortening the deep Transformer sequence through fixed-budget hard gathering.
+A staged dense-teacher/sparse-student curriculum separates cross-modal adaptation, supervised robustness, EMA feature consistency, and compression distillation without creating semantic pseudo-labels for unlabeled data.
+The architecture is implemented with DINOv3 ViT-B/16 and Mask2Former, but its empirical claims remain to be established.
+The next step is a controlled evaluation across clean, corrupted, missing-modality, and real adverse conditions, together with reproducible latency and memory measurements.
+
+\ifcvprformat
+  \bibliographystyle{ieeenat_fullname}
+\else
+  \bibliographystyle{plain}
+\fi
+\bibliography{references}
+
+\end{document}

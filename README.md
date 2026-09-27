@@ -1,5 +1,7 @@
 # QWSEG: Quality-Aware RGB-T Semantic Segmentation
 
+> 新的纯 ViT 多阶段 Dense-Teacher / Sparse-Student 目标架构与损失设计见 [`docs/DINO_MULTISTAGE_TEACHER_STUDENT.md`](docs/DINO_MULTISTAGE_TEACHER_STUDENT.md)。该文档明确采用无伪标签训练，并与当前 Swin/质量网络实现区分。
+
 ## 项目简介
 
 QWSEG 是一个面向退化场景的 **RGB-T（可见光-热红外）鲁棒语义分割** 框架。核心创新在于提出了 **质量感知 Token 剪枝机制**：通过轻量级质量网络评估每个 ViT token 的质量分数，在退化场景下自动丢弃低质量 token，从而提升模型对光照不足、过曝、运动模糊、热噪声等退化因素的鲁棒性。
@@ -528,4 +530,3 @@ python tools/test_robustness.py \
 ```
 
 > 注意：当前基线配置使用 fp32 + 梯度检查点。Swin + Mask2Former 在 AMP（`--amp`）下易出 NaN（deformable attention 与 dice/mask loss 在半精度下数值不稳），消融实验**不要加 `--amp`**，以免引入与消融无关的训练不稳定变量。
-

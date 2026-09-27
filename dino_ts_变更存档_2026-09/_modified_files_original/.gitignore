@@ -104,17 +104,3 @@ projects/
 *.md
 ViT-Adapter/*
 
-# Keep the target architecture specification under version control.
-!docs/
-docs/*
-!docs/DINO_MULTISTAGE_TEACHER_STUDENT.md
-
-# Keep the CVPR paper sources; generated paper artifacts remain ignored.
-!paper/
-paper/*
-!paper/cvpr2027/
-paper/cvpr2027/*
-!paper/cvpr2027/main.tex
-!paper/cvpr2027/main_zh.md
-!paper/cvpr2027/references.bib
-!paper/cvpr2027/README.md

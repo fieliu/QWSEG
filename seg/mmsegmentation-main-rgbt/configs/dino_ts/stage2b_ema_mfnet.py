@@ -14,11 +14,8 @@ model = dict(
     total_epochs=200,
     lambda_anchor=1.0,
     lambda_global=0.0,   # optional DINO-style global CE; off by default
-    # degradation.make_paired supplies the weak/strong views (uses rgbt_c)
-    degradation=dict(
-        kinds=('missing', 'local_missing'),
-        kind_probs=(0.5, 0.5),
-        degrade_prob=0.8))
+    # Inherit exactly the Stage-2A policy. The EMA target sees clean pixels.
+    )
 
 # Warm-start the online model from the accepted Stage-2A weights (the EMA
 # teacher is deep-copied from these on the first training step).

@@ -6,7 +6,7 @@
 # labeled L_logit + standard seg loss.
 _base_ = [
     '_base_dino_ts_m2f.py',
-    '../_base_/datasets/mfnet_480x640.py',
+    '_base_dino_ts_data.py',
     '../_base_/default_runtime.py',
 ]
 
@@ -46,10 +46,7 @@ model = dict(
     #   --cfg-options model.teacher_ckpt=work_dirs/stage2b/best_mIoU.pth
     teacher_ckpt=None,
     init_from_teacher=True,
-    degradation=dict(
-        kinds=('missing', 'local_missing'),
-        kind_probs=(0.5, 0.5),
-        degrade_prob=0.8),
+    degradation={{_base_.degradation_policy}},
     train_cfg=dict(),
     test_cfg=dict(mode='slide', crop_size=crop_size, stride=(320, 427)))
 

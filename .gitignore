@@ -102,12 +102,14 @@ projects/
 # Notebooks (often with embedded images)
 *.ipynb
 *.md
+!tools/server/README.md
 ViT-Adapter/*
 
 # Keep the target architecture specification under version control.
 !docs/
 docs/*
 !docs/DINO_MULTISTAGE_TEACHER_STUDENT.md
+!docs/RGBT-C_Benchmark.md
 
 # Keep the CVPR paper sources; generated paper artifacts remain ignored.
 !paper/

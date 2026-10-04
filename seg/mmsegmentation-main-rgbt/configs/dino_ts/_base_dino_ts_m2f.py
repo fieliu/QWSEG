@@ -13,9 +13,18 @@ custom_imports = dict(
     ],
     allow_failed_imports=False)
 
-crop_size = (480, 640)
+dino_crop_size = (480, 640)
 num_classes = 9
 embed_dim = 768  # DINOv3 ViT-B
+
+# Shared training policy; fog, stripe_noise and t_quantization are held out.
+# Changing this list changes what can legitimately be called unseen at test.
+degradation_policy = dict(
+    corruptions=['seen'], degrade_prob=0.8,
+    modality_probs=(0.45, 0.45, 0.10),
+    scope_probs=(0.5, 0.25, 0.25),
+    severity_range=(1, 5), area_range=(0.1, 0.6),
+    missing_prob=0.1, weak_severity=0)
 
 data_preprocessor = dict(
     type='SegDataPreProcessor',
@@ -24,7 +33,7 @@ data_preprocessor = dict(
     bgr_to_rgb=True,
     pad_val=0,
     seg_pad_val=255,
-    size=crop_size,
+    size=dino_crop_size,
     test_cfg=dict(size_divisor=32))
 
 # backbone: one shared DINOv3 ViT, per-modality patch embeds + shallow adapters,
@@ -34,7 +43,7 @@ backbone = dict(
     type='DinoSharedViT',
     backbone_name='facebook/dinov3-vitb16-pretrain-lvd1689m',
     backbone_ckpt='pretrain/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth',
-    img_size=crop_size,
+    img_size=dino_crop_size,
     patch_size=16,
     embed_dims=embed_dim,
     depth=12,

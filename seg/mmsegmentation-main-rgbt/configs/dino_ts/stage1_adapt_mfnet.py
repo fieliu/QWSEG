@@ -10,7 +10,7 @@
 # unlabeled set for the real run.
 _base_ = [
     '_base_dino_ts_m2f.py',
-    '../_base_/datasets/mfnet_480x640.py',
+    '_base_dino_ts_data.py',
     '../_base_/default_runtime.py',
 ]
 

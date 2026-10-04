@@ -62,23 +62,32 @@ class DinoTSSparse(DinoTSDense):
         self.logit_temperature = logit_temperature
 
         # frozen dense teacher (same arch, keeps all extras)
+        self.teacher_ckpt = teacher_ckpt
+        self.init_from_teacher = init_from_teacher
         self.teacher = None
         if teacher_cfg is not None:
             self.teacher = MODELS.build(teacher_cfg)
-            if teacher_ckpt is not None:
-                load_checkpoint(self.teacher, teacher_ckpt, map_location='cpu')
-                if init_from_teacher:
-                    missing, unexpected = self.load_state_dict(
-                        self.teacher.state_dict(), strict=False)
-                    student_only = [k for k in missing
-                                    if not k.startswith('teacher.')]
-                    print_log(
-                        f'DinoTSSparse warm-start from teacher: '
-                        f'{len(student_only)} student-only params kept own '
-                        f'init; {len(unexpected)} unexpected.', logger='current')
             self.teacher.eval()
             for p in self.teacher.parameters():
                 p.requires_grad = False
+
+    def init_weights(self):
+        # Runner initializes decoder/neck modules after construction. Load the
+        # checkpoint afterwards so their init_weights cannot erase the teacher
+        # or the student's warm start. Runner's load_from/resume still runs later.
+        if self._is_init:
+            return
+        super().init_weights()
+        if self.teacher is not None and self.teacher_ckpt is not None:
+            load_checkpoint(self.teacher, self.teacher_ckpt, map_location='cpu')
+            if self.init_from_teacher:
+                missing, unexpected = self.load_state_dict(
+                    self.teacher.state_dict(), strict=False)
+                student_only = [k for k in missing if not k.startswith('teacher.')]
+                print_log(
+                    f'DinoTSSparse warm-start from teacher: '
+                    f'{len(student_only)} student-only params kept own init; '
+                    f'{len(unexpected)} unexpected.', logger='current')
 
     def train(self, mode=True):
         super().train(mode)
@@ -127,7 +136,7 @@ class DinoTSSparse(DinoTSDense):
         mode = self._student_mode()
 
         # same degraded input C(x) to student and teacher (doc 9.3)
-        deg_inputs = self._make_degraded(inputs)
+        deg_inputs = self._make_degraded(inputs, data_samples)
 
         # student sparse anchors on C(x); build seg feats from the same forward
         s_out = self._sparse_anchors(deg_inputs, mode, k)

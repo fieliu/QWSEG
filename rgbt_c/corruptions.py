@@ -1,7 +1,7 @@
-"""RGBT-C 标准退化实现 (12 种全局退化).
+"""Project-defined RGB-T synthetic corruptions (13 operators).
 
-设计依据: docs/RGBT-C_Benchmark.md v1.0
-参数严格对齐 ImageNet-C, T 模态按物理特性调整.
+Several operators borrow ImageNet-C parameters; this is not an official
+ImageNet-C or physically calibrated sensor benchmark. Color input is RGB.
 
 接口约定:
     corruption = RGBGaussianNoise()
@@ -14,8 +14,6 @@
 """
 import numpy as np
 import cv2
-from io import BytesIO
-from PIL import Image as PILImage
 
 from .utils import (
     disk, plasma_fractal, motion_blur_kernel, apply_blur_per_channel,
@@ -31,7 +29,7 @@ class Corruption:
     modality = 'both'
     n_severity = 5
 
-    def __call__(self, img: np.ndarray, severity: int) -> np.ndarray:
+    def __call__(self, img: np.ndarray, severity: int, rng=None) -> np.ndarray:
         raise NotImplementedError
 
     def get_params(self, severity: int) -> dict:
@@ -81,11 +79,12 @@ class RGBGaussianNoise(Corruption):
     modality = 'rgb'
     _sigmas = [0.08, 0.12, 0.18, 0.26, 0.38]
 
-    def __call__(self, img, severity=1):
+    def __call__(self, img, severity=1, rng=None):
+        rng = np.random if rng is None else rng
         self._validate(img, severity)
         c = self._sigmas[severity - 1]
         x = to_float01(img)
-        x = x + np.random.normal(size=x.shape, scale=c)
+        x = x + rng.normal(size=x.shape, scale=c)
         return to_uint8(x).astype(np.uint8)
 
     def get_params(self, severity):
@@ -99,11 +98,12 @@ class RGBShotNoise(Corruption):
     modality = 'rgb'
     _rates = [60, 25, 12, 5, 3]
 
-    def __call__(self, img, severity=1):
+    def __call__(self, img, severity=1, rng=None):
+        rng = np.random if rng is None else rng
         self._validate(img, severity)
         c = self._rates[severity - 1]
         x = to_float01(img)
-        x = np.random.poisson(x * c) / float(c)
+        x = rng.poisson(x * c) / float(c)
         return to_uint8(x).astype(np.uint8)
 
     def get_params(self, severity):
@@ -119,10 +119,11 @@ class RGBMotionBlur(Corruption):
     modality = 'rgb'
     _params = [(10, 3), (15, 5), (15, 8), (15, 12), (20, 15)]
 
-    def __call__(self, img, severity=1):
+    def __call__(self, img, severity=1, rng=None):
+        rng = np.random if rng is None else rng
         self._validate(img, severity)
         radius, sigma = self._params[severity - 1]
-        angle = np.random.uniform(-45, 45)
+        angle = rng.uniform(-45, 45)
         kernel = motion_blur_kernel(length=radius, angle=angle, sigma=sigma)
         x = to_float01(img)
         x = apply_blur_per_channel(x, kernel)
@@ -140,7 +141,8 @@ class RGBDefocusBlur(Corruption):
     modality = 'rgb'
     _params = [(3, 0.1), (4, 0.5), (6, 0.5), (8, 0.5), (10, 0.5)]
 
-    def __call__(self, img, severity=1):
+    def __call__(self, img, severity=1, rng=None):
+        rng = np.random if rng is None else rng
         self._validate(img, severity)
         radius, alias_blur = self._params[severity - 1]
         kernel = disk(radius=radius, alias_blur=alias_blur)
@@ -160,7 +162,8 @@ class RGBFog(Corruption):
     modality = 'rgb'
     _params = [(1.5, 2), (2., 2), (2.5, 1.7), (2.5, 1.5), (3., 1.4)]
 
-    def __call__(self, img, severity=1):
+    def __call__(self, img, severity=1, rng=None):
+        rng = np.random if rng is None else rng
         self._validate(img, severity)
         c0, c1 = self._params[severity - 1]
         x = to_float01(img)
@@ -170,7 +173,7 @@ class RGBFog(Corruption):
         mapsize = 1
         while mapsize < max(h, w):
             mapsize *= 2
-        fog_layer = plasma_fractal(mapsize=mapsize, wibbledecay=c1)[:h, :w]
+        fog_layer = plasma_fractal(mapsize=mapsize, wibbledecay=c1, rng=rng)[:h, :w]
         if x.ndim == 3:
             fog_layer = fog_layer[..., np.newaxis]
         x = x + c0 * fog_layer
@@ -194,15 +197,16 @@ class RGBLowLight(Corruption):
     # 与 ImageNet-C brightness 相同的参数, 但方向相反
     _params = [0.1, 0.2, 0.3, 0.4, 0.5]
 
-    def __call__(self, img, severity=1):
+    def __call__(self, img, severity=1, rng=None):
+        rng = np.random if rng is None else rng
         self._validate(img, severity)
         c = self._params[severity - 1]
         x = to_float01(img)
-        # BGR -> HSV (cv2 默认 BGR 输入)
-        x_hsv = cv2.cvtColor(x, cv2.COLOR_BGR2HSV)
+        # Canonical RGB input (the I/O adapter converts OpenCV BGR).
+        x_hsv = cv2.cvtColor(x, cv2.COLOR_RGB2HSV)
         # V 通道减暗 (模拟低光照)
         x_hsv[:, :, 2] = np.clip(x_hsv[:, :, 2] - c, 0, 1)
-        x = cv2.cvtColor(x_hsv, cv2.COLOR_HSV2BGR)
+        x = cv2.cvtColor(x_hsv, cv2.COLOR_HSV2RGB)
         return to_uint8(x).astype(np.uint8)
 
     def get_params(self, severity):
@@ -215,7 +219,8 @@ class RGBMissing(Corruption):
     name = 'rgb_missing'
     modality = 'rgb'
 
-    def __call__(self, img, severity=1):
+    def __call__(self, img, severity=1, rng=None):
+        rng = np.random if rng is None else rng
         self._validate(img, severity)
         # severity 不分级, 5 级均为完全缺失
         return np.zeros_like(img)
@@ -233,13 +238,14 @@ class TGaussianNoise(Corruption):
     modality = 't'
     _sigmas = [0.08, 0.12, 0.18, 0.26, 0.38]
 
-    def __call__(self, img, severity=1):
+    def __call__(self, img, severity=1, rng=None):
+        rng = np.random if rng is None else rng
         self._validate(img, severity)
         c = self._sigmas[severity - 1]
         target_ch = img.shape[2] if img.ndim == 3 else 1
         x = to_float01(img)
         x = ensure_3ch(x)
-        x = x + np.random.normal(size=x.shape, scale=c)
+        x = x + rng.normal(size=x.shape, scale=c)
         x = restore_ch(x, target_ch)
         return to_uint8(x).astype(np.uint8)
 
@@ -262,7 +268,8 @@ class TStripeNoise(Corruption):
         (0.30, 0.06,  0.12),   # sev5
     ]
 
-    def __call__(self, img, severity=1):
+    def __call__(self, img, severity=1, rng=None):
+        rng = np.random if rng is None else rng
         self._validate(img, severity)
         col_amp, row_amp, col_off_std = self._params[severity - 1]
         target_ch = img.shape[2] if img.ndim == 3 else 1
@@ -270,9 +277,9 @@ class TStripeNoise(Corruption):
         x = ensure_3ch(x)
         h, w, _ = x.shape
         # 列方向条纹 (强) + 行方向条纹 (弱)
-        col_offset = np.random.normal(0, col_off_std, size=(1, w))      # (1, W)
-        col_gain = 1.0 + np.random.normal(0, col_amp, size=(1, w))      # (1, W)
-        row_gain = 1.0 + np.random.normal(0, row_amp, size=(h, 1))      # (H, 1)
+        col_offset = rng.normal(0, col_off_std, size=(1, w))      # (1, W)
+        col_gain = 1.0 + rng.normal(0, col_amp, size=(1, w))      # (1, W)
+        row_gain = 1.0 + rng.normal(0, row_amp, size=(h, 1))      # (H, 1)
         # 广播到 (H, W, C): col_gain (1,W)->(1,W,1), row_gain (H,1)->(H,1,1)
         x = x * col_gain[:, :, np.newaxis] * row_gain[:, :, np.newaxis]
         x = x + col_offset[:, :, np.newaxis]
@@ -291,10 +298,11 @@ class TMotionBlur(Corruption):
     modality = 't'
     _params = [(10, 3), (15, 5), (15, 8), (15, 12), (20, 15)]
 
-    def __call__(self, img, severity=1):
+    def __call__(self, img, severity=1, rng=None):
+        rng = np.random if rng is None else rng
         self._validate(img, severity)
         radius, sigma = self._params[severity - 1]
-        angle = np.random.uniform(-45, 45)
+        angle = rng.uniform(-45, 45)
         kernel = motion_blur_kernel(length=radius, angle=angle, sigma=sigma)
         target_ch = img.shape[2] if img.ndim == 3 else 1
         x = to_float01(img)
@@ -324,7 +332,8 @@ class TDefocusBlur(Corruption):
         (24, 0.5),    # sev5: 比 RGB sev5 (10) 大一倍多
     ]
 
-    def __call__(self, img, severity=1):
+    def __call__(self, img, severity=1, rng=None):
+        rng = np.random if rng is None else rng
         self._validate(img, severity)
         radius, alias_blur = self._params[severity - 1]
         kernel = disk(radius=radius, alias_blur=alias_blur)
@@ -346,7 +355,8 @@ class TMissing(Corruption):
     name = 't_missing'
     modality = 't'
 
-    def __call__(self, img, severity=1):
+    def __call__(self, img, severity=1, rng=None):
+        rng = np.random if rng is None else rng
         self._validate(img, severity)
         # severity 不分级, 5 级均为完全缺失
         return np.zeros_like(img)
@@ -358,7 +368,7 @@ class TMissing(Corruption):
 @register_corruption
 class TQuantizationNoise(Corruption):
     """T 量化噪声 (T 特有).
-    模拟 14bit 热成像 → 8bit 量化损失 + 抖动.
+    对已有 8-bit 图像进一步量化至 6..2 bit，并添加抖动；不是原始 14-bit 传感器仿真。
     参考: Teutsch et al. CVPRW 2020, 热红外 14bit→8bit 色调映射量化误差.
     注: T 图像动态范围窄, 需更少 bits 才能产生可见量化效果.
     """
@@ -372,13 +382,14 @@ class TQuantizationNoise(Corruption):
         (2, 0.006),   # sev5: 2bit (4 级)    - 很严重 (减小抖动避免过度)
     ]
 
-    def __call__(self, img, severity=1):
+    def __call__(self, img, severity=1, rng=None):
+        rng = np.random if rng is None else rng
         self._validate(img, severity)
         bits, dither = self._params[severity - 1]
         target_ch = img.shape[2] if img.ndim == 3 else 1
         x = to_float01(img)
         x = ensure_3ch(x)
-        x = x + np.random.uniform(-dither, dither, size=x.shape)
+        x = x + rng.uniform(-dither, dither, size=x.shape)
         levels = 2 ** bits
         x = np.round(x * (levels - 1)) / (levels - 1)
         x = restore_ch(x, target_ch)

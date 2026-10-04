@@ -1,244 +1,165 @@
-"""生成 RGBT-C 测试数据集 (MFNet-C / FMB-C / PST900-C).
+"""Generate deterministic RGB-T benchmarks, recording recipes and checksums.
 
-设计依据: docs/RGBT-C_Benchmark.md v1.0
-
-用法:
-    # 生成 MFNet-C 全部 12 种退化 × 5 级
-    python tools/generate_rgbt_c.py \\
-        --src /home/lh/code/data/MFNet \\
-        --dst /home/lh/code/data/MFNet-C \\
-        --split test.txt \\
-        --corruptions all \\
-        --severities 1 2 3 4 5 \\
-        --workers 8
-
-    # 只生成 RGB fog 退化
-    python tools/generate_rgbt_c.py \\
-        --src /home/lh/code/data/MFNet \\
-        --dst /home/lh/code/data/MFNet-C \\
-        --corruptions fog \\
-        --severities 3
-
-输出目录结构 (见 docs/RGBT-C_Benchmark.md §5.1):
-    {dst}/images/{corruption_name}/{severity}/{filename}.png
-    {dst}/labels/  (软链接到原 labels)
-    {dst}/test.txt (复制原 split 文件)
-
-注意:
-    - 输入图像为 4 通道 PNG (RGB + T), 与 MFNet 原始格式一致
-    - 单模态退化: 只退化指定模态, 另一模态保持原始
-    - RGB 退化作用于通道 0-2, T 退化作用于通道 3
-    - 使用固定随机种子保证可复现
+Supports MFNet four-channel PNG or separate RGB/gray-T folders. Output always
+uses four-channel PNG plus unchanged labels and a normalized split manifest.
 """
 import argparse
-import os
-import sys
+from concurrent.futures import ProcessPoolExecutor
+from datetime import datetime, timezone
+import json
+from pathlib import Path, PurePosixPath
 import shutil
-import numpy as np
-import cv2
-from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import sys
 
-# 添加项目根目录到 path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from rgbt_c import (
-    get_corruption, RGB_CORRUPTIONS, T_CORRUPTIONS, ALL_CORRUPTIONS,
-)
+import cv2
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from rgbt_c.io import (library_digest, pack_4ch, read_image, sha256_file,
+                       unpack_4ch, write_png)
+from rgbt_c.protocol import (PROTOCOL_VERSION, TRAIN_CORRUPTIONS,
+                             HELDOUT_CORRUPTIONS, apply_pair, benchmark_cases,
+                             benchmark_recipe, operation, recipe)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description='Generate RGBT-C corruption benchmark dataset')
-    parser.add_argument('--src', type=str, required=True,
-                        help='Source dataset root (e.g. /home/lh/code/data/MFNet)')
-    parser.add_argument('--dst', type=str, required=True,
-                        help='Destination dataset root (e.g. /home/lh/code/data/MFNet-C)')
-    parser.add_argument('--split', type=str, default='test.txt',
-                        help='Split file name in src (default: test.txt)')
-    parser.add_argument('--images-dir', type=str, default='images',
-                        help='Images subdirectory name in src (default: images)')
-    parser.add_argument('--labels-dir', type=str, default='labels',
-                        help='Labels subdirectory name in src (default: labels)')
-    parser.add_argument('--img-suffix', type=str, default='.png',
-                        help='Image file suffix (default: .png)')
-    parser.add_argument('--corruptions', type=str, nargs='+', default=['all'],
-                        help='Corruption names (default: all). '
-                             'Use "all" / "rgb" / "t" for groups')
-    parser.add_argument('--severities', type=int, nargs='+', default=[1, 2, 3, 4, 5],
-                        help='Severity levels 1-5 (default: all)')
-    parser.add_argument('--workers', type=int, default=4,
-                        help='Number of parallel workers (default: 4)')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed for reproducibility (default: 42)')
-    parser.add_argument('--overwrite', action='store_true',
-                        help='Overwrite existing files')
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--src', required=True)
+    parser.add_argument('--dst', required=True)
+    parser.add_argument('--split', default='test.txt')
+    parser.add_argument('--images-dir', default='images')
+    parser.add_argument('--rgb-dir', help='Use with --thermal-dir for separate images')
+    parser.add_argument('--thermal-dir')
+    parser.add_argument('--labels-dir', default='labels')
+    parser.add_argument('--img-suffix', default='.png')
+    parser.add_argument('--thermal-suffix', default='.png')
+    parser.add_argument('--label-suffix', default='.png')
+    parser.add_argument('--corruptions', nargs='+', default=['all'])
+    parser.add_argument('--severities', nargs='+', type=int, default=[1, 2, 3, 4, 5])
+    parser.add_argument('--scopes', nargs='+', default=['global'])
+    parser.add_argument('--paired', nargs='*', default=[], help='E.g. low_light+t_gaussian_noise')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--overwrite', action='store_true', help='Regenerate the SAME protocol')
     return parser.parse_args()
 
 
-def resolve_corruptions(names):
-    """解析退化名称列表."""
-    result = []
-    for n in names:
-        if n == 'all':
-            result.extend(ALL_CORRUPTIONS)
-        elif n == 'rgb':
-            result.extend(RGB_CORRUPTIONS)
-        elif n == 't':
-            result.extend(T_CORRUPTIONS)
-        else:
-            result.append(n)
-    # 去重保持顺序
-    seen = set()
-    out = []
-    for n in result:
-        if n not in seen:
-            seen.add(n)
-            out.append(n)
-    return out
-
-
-def load_split(src_root, split_file):
-    """读取 split 文件, 返回图像名列表 (无扩展名)."""
-    split_path = os.path.join(src_root, split_file)
-    with open(split_path, 'r') as f:
-        names = [line.strip() for line in f if line.strip()]
+def load_split(src_root, split_file, suffix='.png'):
+    names = []
+    for line in (Path(src_root) / split_file).read_text(encoding='utf-8-sig').splitlines():
+        name = line.strip().replace('\\', '/')
+        if not name:
+            continue
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+        path = PurePosixPath(name)
+        if path.is_absolute() or '..' in path.parts or ':' in name or not name:
+            raise ValueError(f'Unsafe sample ID: {name}')
+        names.append(name)
+    if not names or len(set(names)) != len(names):
+        raise ValueError('Split is empty or contains duplicate IDs')
     return names
 
 
-def apply_corruption_to_4ch(img4, corruption_name, severity, seed=None):
-    """对 4 通道图像 (RGB+T) 施加单模态退化.
+def apply_corruption_to_4ch(img4, corruption_name, severity, seed=42):
+    """Compatibility helper using the shared raw-pixel API."""
+    rgb, thermal = unpack_4ch(img4)
+    return pack_4ch(*apply_pair(rgb, thermal, recipe([operation(corruption_name, severity, seed)])))
 
-    Args:
-        img4: (H, W, 4) uint8, 通道 0-2=RGB, 通道 3=T
-        corruption_name: 退化名称
-        severity: 1-5
-        seed: 随机种子 (按图像+退化+级别组合, 保证可复现)
-    Returns:
-        (H, W, 4) uint8
-    """
-    if seed is not None:
-        np.random.seed(seed)
 
-    rgb = img4[:, :, :3]
-    t = img4[:, :, 3:4]
-
-    corr = get_corruption(corruption_name)
-
-    if corruption_name in RGB_CORRUPTIONS:
-        # RGB 退化, T 保持
-        rgb_c = corr(rgb, severity=severity)
-        return np.concatenate([rgb_c, t], axis=2)
-    elif corruption_name in T_CORRUPTIONS:
-        # T 退化, RGB 保持
-        t_c = corr(t, severity=severity)
-        return np.concatenate([rgb, t_c], axis=2)
+def process_one(job):
+    name, cfg, cases = job
+    cv2.setNumThreads(1)
+    src, dst = Path(cfg['src']), Path(cfg['dst'])
+    if cfg['rgb_dir']:
+        rgb_path = src / cfg['rgb_dir'] / (name + cfg['img_suffix'])
+        thermal_path = src / cfg['thermal_dir'] / (name + cfg['thermal_suffix'])
+        bgr, thermal = read_image(rgb_path), read_image(thermal_path)
+        if bgr.ndim != 3 or bgr.shape[2] != 3:
+            raise ValueError(f'Expected three-channel visible image: {rgb_path}')
+        if thermal.ndim == 3:
+            if thermal.shape[2] != 3 or not np.all(thermal == thermal[:, :, :1]):
+                raise ValueError(f'Expected grayscale thermal, not pseudocolor: {thermal_path}')
+            thermal = thermal[:, :, 0]
+        rgb, thermal = bgr[:, :, ::-1].copy(), thermal[..., None]
+        sources = {str(rgb_path.relative_to(src)): sha256_file(rgb_path),
+                   str(thermal_path.relative_to(src)): sha256_file(thermal_path)}
     else:
-        raise ValueError(f'Unknown corruption: {corruption_name}')
-
-
-def process_one(args_tuple):
-    """处理单张图像 (用于多进程)."""
-    (src_img_path, dst_img_path, corruption_name, severity,
-     seed, overwrite) = args_tuple
-
-    if os.path.exists(dst_img_path) and not overwrite:
-        return f'SKIP (exists): {dst_img_path}'
-
-    # 读取 4 通道图像
-    img4 = cv2.imread(src_img_path, cv2.IMREAD_UNCHANGED)
-    if img4 is None:
-        return f'ERROR (read failed): {src_img_path}'
-    if img4.ndim != 3 or img4.shape[2] != 4:
-        return f'ERROR (not 4-channel): {src_img_path} shape={img4.shape}'
-
-    # 施加退化
-    out = apply_corruption_to_4ch(img4, corruption_name, severity, seed=seed)
-
-    # 保存
-    os.makedirs(os.path.dirname(dst_img_path), exist_ok=True)
-    # 使用 PNG 无损保存 (避免 JPEG 压缩引入额外退化)
-    cv2.imwrite(dst_img_path, out)
-    return f'OK: {dst_img_path}'
+        image_path = src / cfg['images_dir'] / (name + cfg['img_suffix'])
+        rgb, thermal = unpack_4ch(read_image(image_path))
+        sources = {str(image_path.relative_to(src)): sha256_file(image_path)}
+    label_path = src / cfg['labels_dir'] / (name + cfg['label_suffix'])
+    label_hash = sha256_file(label_path)
+    target_label = dst / 'labels' / (name + cfg['label_suffix'])
+    target_label.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(label_path, target_label)
+    records = []
+    for case in cases:
+        spec = benchmark_recipe(case, name, cfg['seed'])
+        result = pack_4ch(*apply_pair(rgb, thermal, spec))
+        relative = f"images/{case['id']}/{name}.png"
+        output = dst / relative
+        write_png(output, result)
+        records.append(dict(sample=name, case=case['id'], image=relative,
+                            source_sha256=sources, label_sha256=label_hash,
+                            output_sha256=sha256_file(output), recipe=spec))
+    return records
 
 
 def main():
     args = parse_args()
-
-    # 解析退化列表
-    corruptions = resolve_corruptions(args.corruptions)
-    print(f'Corruptions ({len(corruptions)}): {corruptions}')
-    print(f'Severities: {args.severities}')
-    print(f'Total configs: {len(corruptions) * len(args.severities)}')
-
-    # 读取 split
-    names = load_split(args.src, args.split)
-    print(f'Split file: {args.split}, {len(names)} images')
-
-    # 准备任务列表
-    tasks = []
-    for name in names:
-        src_img_path = os.path.join(args.src, args.images_dir, name + args.img_suffix)
-        for corr_name in corruptions:
-            for sev in args.severities:
-                dst_img_path = os.path.join(
-                    args.dst, 'images', corr_name, str(sev),
-                    name + args.img_suffix)
-                # 种子: 按图像名+退化+级别组合, 保证可复现且不同图像不同
-                seed = (args.seed + hash(name) % 100000
-                        + hash(corr_name) % 1000 + sev) % (2**32)
-                tasks.append((src_img_path, dst_img_path, corr_name, sev,
-                              seed, args.overwrite))
-
-    print(f'Total tasks: {len(tasks)}')
-    print(f'Workers: {args.workers}')
-
-    # 多进程执行
-    ok, skip, fail = 0, 0, 0
-    with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = [executor.submit(process_one, t) for t in tasks]
-        for i, fut in enumerate(as_completed(futures)):
-            msg = fut.result()
-            if msg.startswith('OK'):
-                ok += 1
-            elif msg.startswith('SKIP'):
-                skip += 1
-            else:
-                fail += 1
-                print(f'  {msg}')
-            if (i + 1) % 500 == 0:
-                print(f'  Progress: {i+1}/{len(tasks)} (OK={ok} SKIP={skip} FAIL={fail})')
-
-    print(f'\nDone: OK={ok} SKIP={skip} FAIL={fail}')
-
-    # 复制 labels (软链接) 和 split 文件
-    src_labels = os.path.join(args.src, args.labels_dir)
-    dst_labels = os.path.join(args.dst, args.labels_dir)
-    if os.path.exists(src_labels) and not os.path.exists(dst_labels):
-        os.symlink(os.path.abspath(src_labels), dst_labels)
-        print(f'Linked labels: {dst_labels} -> {src_labels}')
-
-    src_split = os.path.join(args.src, args.split)
-    dst_split = os.path.join(args.dst, args.split)
-    if os.path.exists(src_split) and not os.path.exists(dst_split):
-        shutil.copy(src_split, dst_split)
-        print(f'Copied split: {dst_split}')
-
-    # 写 README
-    readme_path = os.path.join(args.dst, 'README.txt')
-    with open(readme_path, 'w') as f:
-        f.write('RGBT-C Benchmark Dataset\n')
-        f.write('=' * 50 + '\n')
-        f.write(f'Source: {args.src}\n')
-        f.write(f'Split: {args.split} ({len(names)} images)\n')
-        f.write(f'Corruptions: {corruptions}\n')
-        f.write(f'Severities: {args.severities}\n')
-        f.write(f'Seed: {args.seed}\n')
-        f.write(f'Generated: {os.popen("date").read().strip()}\n')
-        f.write('\nStructure:\n')
-        f.write('  images/{corruption}/{severity}/{name}.png\n')
-        f.write('  labels/  (symlink to source)\n')
-        f.write(f'  {args.split}\n')
-    print(f'Wrote README: {readme_path}')
+    src, dst = Path(args.src).resolve(), Path(args.dst).resolve()
+    if src == dst or src in dst.parents or dst in src.parents:
+        raise ValueError('Source and destination must be separate directory trees')
+    if bool(args.rgb_dir) != bool(args.thermal_dir) or args.workers < 1:
+        raise ValueError('Supply both paired directories; workers must be positive')
+    for value in (args.split, args.images_dir, args.labels_dir, args.rgb_dir, args.thermal_dir):
+        if value is not None and not (src / value).resolve().is_relative_to(src):
+            raise ValueError(f'Path escapes source directory: {value}')
+    names = load_split(src, args.split, args.img_suffix)
+    cases = benchmark_cases(args.corruptions, args.severities, args.scopes, args.paired)
+    cfg = vars(args).copy()
+    cfg.update(src=str(src), dst=str(dst))
+    identity = {k: v for k, v in cfg.items() if k not in ('workers', 'overwrite', 'dst')}
+    identity.update(version=PROTOCOL_VERSION, library_sha256=library_digest(),
+                    split_sha256=sha256_file(src / args.split), cases=cases,
+                    numpy=np.__version__, opencv=cv2.__version__)
+    manifest_path = dst / 'manifest.json'
+    if dst.exists() and any(dst.iterdir()):
+        if not args.overwrite or not manifest_path.exists():
+            raise FileExistsError('Use a new destination, or --overwrite for the same protocol')
+        old = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if old['identity'] != identity:
+            raise ValueError('Protocol/source/version changed; choose a new destination')
+    dst.mkdir(parents=True, exist_ok=True)
+    manifest = dict(identity=identity, cases=cases, n_samples=len(names),
+                    split='split.txt', label_suffix=args.label_suffix,
+                    train_corruptions=list(TRAIN_CORRUPTIONS),
+                    heldout_corruptions=list(HELDOUT_CORRUPTIONS),
+                    status='building', created_utc=datetime.now(timezone.utc).isoformat())
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+    (dst / 'split.txt').write_text('\n'.join(names) + '\n', encoding='utf-8')
+    jobs = ((name, cfg, cases) for name in names)
+    print(f'Generating {len(names)} images x {len(cases)} conditions; {PROTOCOL_VERSION}', flush=True)
+    def save_batch(records, stream):
+        for record in records:
+            stream.write(json.dumps(record, ensure_ascii=False) + '\n')
+    with (dst / 'recipes.jsonl').open('w', encoding='utf-8') as stream:
+        if args.workers == 1:
+            for index, records in enumerate(map(process_one, jobs), 1):
+                save_batch(records, stream)
+                if index % 50 == 0:
+                    print(f'{index}/{len(names)} source images', flush=True)
+        else:
+            with ProcessPoolExecutor(max_workers=args.workers) as pool:
+                for index, records in enumerate(pool.map(process_one, jobs), 1):
+                    save_batch(records, stream)
+                    if index % 50 == 0:
+                        print(f'{index}/{len(names)} source images', flush=True)
+    manifest['status'] = 'complete'
+    manifest['recipes_sha256'] = sha256_file(dst / 'recipes.jsonl')
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+    print(f'Complete: {dst / "manifest.json"}')
 
 
 if __name__ == '__main__':

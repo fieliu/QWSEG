@@ -100,7 +100,8 @@ class DinoTSDenseEMA(DinoTSDense):
         mean = self.data_preprocessor.mean.flatten()
         std = self.data_preprocessor.std.flatten()
         (l_rgb, l_thr, h_rgb, h_thr, *_rest) = self.degrader.make_paired(
-            rgb, thermal, mean, std, epoch=self.current_epoch)
+            rgb, thermal, mean, std, epoch=self.current_epoch,
+            valid_shapes=[ds.img_shape for ds in data_samples])
         x_weak = torch.cat([l_rgb, l_thr], dim=1)
         x_strong = torch.cat([h_rgb, h_thr], dim=1)
 
@@ -109,10 +110,10 @@ class DinoTSDenseEMA(DinoTSDense):
         # segmentation (labeled only): reuse Stage-2A three-view seg on x_strong
         if has_label:
             losses.update(self._seg_loss(inputs, data_samples, 'clean'))
-            deg_inputs = self._make_degraded(inputs)
+            deg_inputs = self._make_degraded(inputs, data_samples)
             for k, v in self._seg_loss(deg_inputs, data_samples, 'deg').items():
                 losses[k] = self.lambda_deg * v
-            miss_inputs, avail = self._make_missing(inputs)
+            miss_inputs, avail = self._make_missing(inputs, data_samples)
             for k, v in self._seg_loss(miss_inputs, data_samples, 'missing',
                                        availability=avail).items():
                 losses[k] = self.lambda_missing * v

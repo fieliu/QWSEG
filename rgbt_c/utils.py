@@ -26,19 +26,20 @@ def disk(radius, alias_blur=0.1, dtype=np.float32):
     return cv2.GaussianBlur(aliased_disk, ksize=ksize, sigmaX=alias_blur)
 
 
-def plasma_fractal(mapsize=256, wibbledecay=3):
+def plasma_fractal(mapsize=256, wibbledecay=3, rng=None):
     """diamond-square 高度图 (对齐 ImageNet-C fog).
 
     Return square 2d array of floats in range 0-1.
     """
-    assert (mapsize & (mapsize - 1) == 0)
+    rng = np.random if rng is None else rng
+    assert mapsize >= 2 and (mapsize & (mapsize - 1) == 0)
     maparray = np.empty((mapsize, mapsize), dtype=np.float64)
     maparray[0, 0] = 0
     stepsize = mapsize
     wibble = 100
 
     def wibbledmean(array):
-        return array / 4 + wibble * np.random.uniform(-wibble, wibble, array.shape)
+        return array / 4 + wibble * rng.uniform(-wibble, wibble, array.shape)
 
     def fillsquares():
         cornerref = maparray[0:mapsize:stepsize, 0:mapsize:stepsize]
@@ -67,7 +68,7 @@ def plasma_fractal(mapsize=256, wibbledecay=3):
         wibble /= wibbledecay
 
     maparray -= maparray.min()
-    return maparray / maparray.max()
+    return maparray / max(maparray.max(), np.finfo(np.float64).eps)
 
 
 def clipped_zoom(img, zoom_factor):

@@ -30,9 +30,9 @@ class ModalityAdapter(nn.Module):
     """Per-modality low-rank residual branch (doc 2.3).
 
     Applied on the SAME normalized input that feeds the shared FFN, scaled by a
-    learnable ``gamma`` (init 0) so at start the adapter contributes nothing and
-    the block reproduces the frozen DINO forward. The down-projection is zero-
-    initialized to reinforce that identity start.
+    learnable ``gamma`` (init 1). The up-projection is zero-initialized, so
+    the initial residual is zero while its weights receive a gradient.
+    Zeroing both gamma and the up-projection would permanently freeze this path.
     """
 
     def __init__(self, dim: int, d_adapter: int = 64, identity: bool = False):
@@ -44,7 +44,7 @@ class ModalityAdapter(nn.Module):
         self.down = nn.Linear(dim, d_adapter)
         self.act = nn.GELU()
         self.up = nn.Linear(d_adapter, dim)
-        self.gamma = nn.Parameter(torch.zeros(1))
+        self.gamma = nn.Parameter(torch.ones(1))
         nn.init.zeros_(self.up.weight)
         nn.init.zeros_(self.up.bias)
 

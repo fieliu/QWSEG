@@ -19,7 +19,7 @@ import torch
 
 from mmseg.registry import MODELS
 from .base_dino_ts import DinoTSBase
-from ..degradation import DegradationGenerator
+from ..unified_degradation import RGBTDegrader
 
 
 @MODELS.register_module()
@@ -34,7 +34,9 @@ class DinoTSDense(DinoTSBase):
         super().__init__(*args, **kwargs)
         self.lambda_deg = lambda_deg
         self.lambda_missing = lambda_missing
-        self.degrader = DegradationGenerator(**(degradation or {}))
+        self.degrader = RGBTDegrader(
+            mean=self.data_preprocessor.mean.flatten(),
+            std=self.data_preprocessor.std.flatten(), **(degradation or {}))
         self.current_epoch = 0
 
     def _seg_loss(self, inputs, data_samples, prefix, availability=None):
@@ -44,31 +46,22 @@ class DinoTSDense(DinoTSBase):
         return {f'{prefix}.{k}': v for k, v in losses.items()}
 
     @torch.no_grad()
-    def _make_degraded(self, inputs):
-        """C(x): degrade one modality (missing/local-missing) per sample."""
+    def _make_degraded(self, inputs, data_samples=None):
+        """C(x): sample a recipe from the shared raw-pixel corruption library."""
         rgb, thermal = self._split(inputs)
-        drgb, dthr, _, _ = self.degrader(rgb, thermal, epoch=self.current_epoch)
+        shapes = [ds.img_shape for ds in data_samples] if data_samples is not None else None
+        drgb, dthr, _, _ = self.degrader(
+            rgb, thermal, epoch=self.current_epoch, valid_shapes=shapes)
         return torch.cat([drgb, dthr], dim=1)
 
     @torch.no_grad()
-    def _make_missing(self, inputs):
-        """Drop(x): zero a whole modality (RGB or Thermal), per sample.
+    def _make_missing(self, inputs, data_samples=None):
+        """Drop(x): raw black pixels, identical to the offline failure cases.
 
-        Returns (dropped_inputs, availability) so the backbone can also gate the
-        missing modality's tokens explicitly."""
-        B = inputs.shape[0]
-        dropped = inputs.clone()
-        avail_rgb = torch.ones(B, device=inputs.device)
-        avail_thr = torch.ones(B, device=inputs.device)
-        drop_rgb = torch.rand(B, device=inputs.device) < 0.5
-        for b in range(B):
-            if drop_rgb[b]:
-                dropped[b, :3] = 0
-                avail_rgb[b] = 0.0
-            else:
-                dropped[b, 3:6] = 0
-                avail_thr[b] = 0.0
-        return dropped, {'rgb': avail_rgb, 'thermal': avail_thr}
+        Do not provide privileged availability flags that are absent at test.
+        """
+        shapes = [ds.img_shape for ds in data_samples] if data_samples is not None else None
+        return self.degrader.missing(inputs, valid_shapes=shapes), None
 
     def loss(self, inputs, data_samples):
         losses = dict()
@@ -76,12 +69,12 @@ class DinoTSDense(DinoTSBase):
         losses.update(self._seg_loss(inputs, data_samples, 'clean'))
         # degraded view C(x)
         if self.lambda_deg > 0:
-            deg_inputs = self._make_degraded(inputs)
+            deg_inputs = self._make_degraded(inputs, data_samples)
             for k, v in self._seg_loss(deg_inputs, data_samples, 'deg').items():
                 losses[k] = self.lambda_deg * v
         # missing-modality view Drop(x)
         if self.lambda_missing > 0:
-            miss_inputs, avail = self._make_missing(inputs)
+            miss_inputs, avail = self._make_missing(inputs, data_samples)
             for k, v in self._seg_loss(miss_inputs, data_samples, 'missing',
                                        availability=avail).items():
                 losses[k] = self.lambda_missing * v

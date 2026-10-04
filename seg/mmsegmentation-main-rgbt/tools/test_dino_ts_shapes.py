@@ -25,6 +25,17 @@ import losses as L                    # noqa: E402
 
 def main():
     torch.manual_seed(0)
+    # Identity initialization must still allow the adapter to start learning.
+    adapter = dv.ModalityAdapter(32, 8)
+    optimizer = torch.optim.SGD(adapter.parameters(), lr=0.1)
+    x, target = torch.randn(2, 5, 32), torch.randn(2, 5, 32)
+    assert torch.count_nonzero(adapter(x)) == 0
+    (adapter(x) - target).square().mean().backward()
+    assert adapter.up.weight.grad.abs().sum() > 0
+    optimizer.step()
+    optimizer.zero_grad()
+    (adapter(x) - target).square().mean().backward()
+    assert adapter.down.weight.grad.abs().sum() > 0
     B = 2
     img = (48, 64)                     # patch 16 -> grid 3 x 4 -> N = 12
     patch = 16

@@ -6,6 +6,7 @@
 #   GPUS=1 RESUME=1 STAGE1_BATCH_SIZE=24 STAGE1_NUM_WORKERS=6 \
 #     STAGE1_MAX_EPOCHS=20 bash tools/server/train_dino_ts.sh stage1
 #   GPUS=4 bash tools/server/train_dino_ts.sh stage2a
+#   GPUS=1 MAX_EPOCHS=5 bash tools/server/train_dino_ts.sh stage2a
 #   GPUS=4 RESUME=1 bash tools/server/train_dino_ts.sh stage2a
 #   GPUS=4 INIT_CKPT=/path/to/best.pth bash tools/server/train_dino_ts.sh stage2b
 set -euo pipefail
@@ -36,7 +37,7 @@ cd "$ROOT/seg/mmsegmentation-main-rgbt"
 latest_checkpoint() {
   local directory=$1
   local pattern=$2
-  python -c 'from pathlib import Path; import sys; xs=list(Path(sys.argv[1]).glob(sys.argv[2])); sys.exit("No matching checkpoint under " + sys.argv[1]) if not xs else print(max(xs, key=lambda p: p.stat().st_mtime))' "$directory" "$pattern"
+  python -c 'from pathlib import Path; import sys; xs=list(Path(sys.argv[1]).rglob(sys.argv[2])); sys.exit("No matching checkpoint under " + sys.argv[1]) if not xs else print(max(xs, key=lambda p: p.stat().st_mtime))' "$directory" "$pattern"
 }
 
 case "$STAGE" in
@@ -59,6 +60,7 @@ case "$STAGE" in
 esac
 
 ARGS=("$CONFIG" --work-dir "$WORK_DIR")
+CFG_OPTIONS=()
 
 if [[ "$RESUME" == "1" ]]; then
   ARGS+=(--resume)
@@ -67,12 +69,12 @@ else
     stage2a)
       INIT_CKPT=${INIT_CKPT:-$(latest_checkpoint "$WORK_ROOT/stage1/weight" 'best_stage1_align_loss*.pth')}
       echo "Initialization checkpoint: $INIT_CKPT"
-      ARGS+=(--cfg-options "load_from=$INIT_CKPT")
+      CFG_OPTIONS+=("load_from=$INIT_CKPT")
       ;;
     stage2b)
       INIT_CKPT=${INIT_CKPT:-$(latest_checkpoint "$WORK_ROOT/stage2a/weight" 'best_mIoU*.pth')}
       echo "Initialization checkpoint: $INIT_CKPT"
-      ARGS+=(--cfg-options "load_from=$INIT_CKPT")
+      CFG_OPTIONS+=("load_from=$INIT_CKPT")
       ;;
   esac
 fi
@@ -82,17 +84,16 @@ fi
 if [[ "$STAGE" == "stage3" ]]; then
   TEACHER_CKPT=${TEACHER_CKPT:-${INIT_CKPT:-$(latest_checkpoint "$WORK_ROOT/stage2b/weight" 'best_mIoU*.pth')}}
   echo "Teacher checkpoint: $TEACHER_CKPT"
-  ARGS+=(--cfg-options "model.teacher_ckpt=$TEACHER_CKPT")
+  CFG_OPTIONS+=("model.teacher_ckpt=$TEACHER_CKPT")
 fi
 
 if [[ "$STAGE" == "stage1" ]]; then
-  STAGE1_OPTIONS=()
   if [[ -n "${STAGE1_BATCH_SIZE:-}" ]]; then
     [[ "$STAGE1_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || {
       echo "STAGE1_BATCH_SIZE must be a positive integer." >&2
       exit 2
     }
-    STAGE1_OPTIONS+=(
+    CFG_OPTIONS+=(
       "train_dataloader.batch_size=$STAGE1_BATCH_SIZE"
       "val_dataloader.batch_size=$STAGE1_BATCH_SIZE")
   fi
@@ -101,7 +102,7 @@ if [[ "$STAGE" == "stage1" ]]; then
       echo "STAGE1_NUM_WORKERS must be a non-negative integer." >&2
       exit 2
     }
-    STAGE1_OPTIONS+=(
+    CFG_OPTIONS+=(
       "train_dataloader.num_workers=$STAGE1_NUM_WORKERS"
       "val_dataloader.num_workers=$STAGE1_NUM_WORKERS")
   fi
@@ -110,10 +111,19 @@ if [[ "$STAGE" == "stage1" ]]; then
       echo "STAGE1_MAX_EPOCHS must be a positive integer." >&2
       exit 2
     }
-    STAGE1_OPTIONS+=("train_cfg.max_epochs=$STAGE1_MAX_EPOCHS")
+    CFG_OPTIONS+=("train_cfg.max_epochs=$STAGE1_MAX_EPOCHS")
   fi
-  [[ "${#STAGE1_OPTIONS[@]}" -eq 0 ]] || ARGS+=(--cfg-options "${STAGE1_OPTIONS[@]}")
 fi
+
+if [[ -n "${MAX_EPOCHS:-}" ]]; then
+  [[ "$MAX_EPOCHS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "MAX_EPOCHS must be a positive integer." >&2
+    exit 2
+  }
+  CFG_OPTIONS+=("train_cfg.max_epochs=$MAX_EPOCHS")
+fi
+
+[[ "${#CFG_OPTIONS[@]}" -eq 0 ]] || ARGS+=(--cfg-options "${CFG_OPTIONS[@]}")
 
 mkdir -p "$WORK_DIR"
 if [[ "$RESUME" != "1" && -f "$WORK_DIR/last_checkpoint" ]]; then

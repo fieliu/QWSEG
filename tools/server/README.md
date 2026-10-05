@@ -25,7 +25,13 @@ cd /root/autodl-tmp/code/QWSEG
 
 不要使用原来的 base 环境进行 V100 训练：该环境的 PyTorch 实际 CUDA 运算曾报架构不支持。独立环境已经通过 GPU 运算、真实 DINOv3 前向和 MMCV 算子参与的训练。
 
-`setup_v100_env.sh` 可创建 Python 3.10 环境并通过清华镜像安装依赖。MMCV 2.1.0 在本机源码编译，使用 CUDA 编译器和 g++。`restore_mmseg_assets.py` 从同版本 MMSeg wheel 提取缺失的词表，不覆盖本项目的 MMSeg 源码。
+`setup_v100_env.sh` 可创建 Python 3.10 环境，默认使用 Conda defaults 与官方 PyPI。旧清华 Conda/PyPI 地址在 2026-10-05 的新实例中分别返回 403 和空包索引，已不再作为默认源。无卡模式可先安装所有 Wheel 依赖：
+
+```bash
+QWSEG_PREPARE_ONLY=1 bash tools/server/setup_v100_env.sh
+```
+
+重新开卡后，再运行一次不带 `QWSEG_PREPARE_ONLY` 的脚本，源码编译 MMCV 2.1.0 并完成 CUDA 算子验证。默认 `TORCH_CUDA_ARCH_LIST=7.0` 对应 V100；A100/A800 使用 `TORCH_CUDA_ARCH_LIST=8.0`。`restore_mmseg_assets.py` 从同版本 MMSeg wheel 提取缺失的词表，不覆盖本项目的 MMSeg 源码。
 
 ## 数据检查
 

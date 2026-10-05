@@ -10,6 +10,11 @@ _base_ = [
 
 crop_size = (480, 640)
 
+# Two samples per step fills a 32 GiB V100 more efficiently.  With no gradient
+# accumulation this preserves the original effective batch of 2 while halving
+# the number of dataloader/optimizer-wrapper iterations per epoch.
+train_dataloader = dict(batch_size=2)
+
 model = dict(
     type='DinoTSDense',
     data_preprocessor={{_base_.data_preprocessor}},
@@ -28,7 +33,7 @@ optimizer = dict(type='AdamW', lr=3e-5, betas=(0.9, 0.999), weight_decay=0.05)
 optim_wrapper = dict(
     type='AmpOptimWrapper',
     loss_scale=dict(init_scale=128.0),
-    accumulative_counts=2,
+    accumulative_counts=1,
     optimizer=optimizer,
     constructor='LayerDecayOptimizerConstructor',
     paramwise_cfg=dict(num_layers=12, layer_decay_rate=0.9),

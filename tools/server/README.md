@@ -48,7 +48,7 @@ QWSEG_PREPARE_ONLY=1 bash tools/server/setup_v100_env.sh
 |---|---:|---|
 | Stage 1，LLVIP | 4 | 热红外适配、特征对齐反向传播 |
 | Stage 2A，MFNet clean | 4 | 分割、验证、保存 checkpoint |
-| Stage 2A，clean + degradation + missing | 2 | 退化库、模态缺失和三视图训练 |
+| Stage 2B 前置鲁棒检查，clean + degradation + missing | 2 | 退化库、模态缺失和三视图训练 |
 | Stage 2B，EMA | 2 | Stage 2A 权重加载、EMA 创建、一致性损失 |
 | Stage 3，soft | 2 | 教师加载、软门控训练、硬选择验证 |
 | Stage 3，hard | 2 | 硬选择训练及验证 |
@@ -82,8 +82,8 @@ GPUS=4 bash tools/server/train_dino_ts.sh stage3
 默认顺序与权重交接如下：
 
 1. Stage 1 在 LLVIP 的 12,025 个 train 对上做无标签模态适配，每 5 epoch 在 3,463 个官方 test 对上计算不带标签的对齐损失。
-2. Stage 2A 从 Stage 1 验证对齐损失最低的权重开始，在 MFNet 上进行稠密鲁棒分割训练。
-3. Stage 2B 从 Stage 2A 的最佳 mIoU 权重开始，训练并验证 EMA 教师。
+2. Stage 2A 从 Stage 1 验证对齐损失最低的权重开始，在 MFNet 干净输入上训练 Dense Teacher，不加入退化或模态缺失损失。
+3. Stage 2B 从 Stage 2A 的最佳 clean mIoU 权重开始，再加入退化、模态缺失与 EMA 一致性并验证 Dense Robust Teacher；该阶段可以作为是否需要 Dense 鲁棒化的消融项。
 4. Stage 3 从 Stage 2B 的最佳 EMA 权重构造冻结教师与稀疏学生。
 
 可用 `INIT_CKPT=/abs/path.pth` 覆盖 Stage 2A/2B 的输入权重，用 `TEACHER_CKPT=/abs/path.pth` 覆盖 Stage 3 教师。数据和预训练目录可分别通过 `QWSEG_DATA_ROOT`、`QWSEG_PRETRAIN_ROOT` 覆盖。

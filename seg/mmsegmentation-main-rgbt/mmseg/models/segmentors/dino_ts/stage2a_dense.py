@@ -1,7 +1,8 @@
-"""Stage 2A: Dense Robust Warm-up (doc section 7).
+"""Dense full-token segmentation used by clean Stage 2A and robust Stage 2B.
 
-Trains a full-token dense multimodal segmentation model WITHOUT any teacher, so
-it gains basic semantics, fusion, and degradation handling. Loss (doc 7.4):
+Stage 2A sets both optional robust weights to zero and first establishes a clean
+Dense Teacher.  Stage 2B enables them while adding its EMA objective.  The
+general loss implemented here is:
 
     L_stage2A = L_seg(f(x), y)
               + lambda_deg     * L_seg(f(C(x)), y)

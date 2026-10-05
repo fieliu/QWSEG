@@ -232,11 +232,11 @@ EMA 不创造新知识。多模态知识来自：
 Stage 1  Modality Adaptation
     LLVIP 配对 RGB-T，无语义标签
     ↓
-Stage 2A Dense Robust Warm-up
-    MFNet clean / degraded / missing，使用真实分割标签
+Stage 2A Clean Dense Teacher
+    MFNet clean，使用真实分割标签建立强干净基线
     ↓
 Stage 2B Dense EMA Self-Distillation
-    MFNet 分割监督 + EMA 特征一致性
+    可选的 clean / degraded / missing 鲁棒化 + EMA 特征一致性
     ↓
 Stage 3  Dense-to-Sparse Distillation
     MFNet 分割监督 + Dense Teacher 蒸馏
@@ -331,11 +331,11 @@ L_stage1 = lambda_patch * L_cross_patch
 - 使用冻结共享 ViT 的轻量线性探针时，Thermal 表现优于仅复制 RGB PatchEmbed 的初始化；
 - 不要求阶段一直接获得最终语义分割性能。
 
-## 7. Stage 2A：Dense Robust Warm-up
+## 7. Stage 2A：Clean Dense Teacher
 
 ### 7.1 目标
 
-不依赖 Teacher，先训练一个保留全部 Token 的 Dense 多模态分割模型，使其具备基本语义、融合和退化处理能力。
+不依赖 Teacher，先只用干净 RGB-T 和真实标签训练保留全部 Token 的 Dense 多模态分割模型。该阶段先确认语义、融合、数据和评估闭环正确，并产出后续蒸馏所需的强 Dense Teacher；退化、模态缺失、EMA 和 Token 剪枝都不得混入这一基线。
 
 ### 7.2 Dense 注意力路径
 
@@ -380,15 +380,9 @@ DINO 后半部分: 0.1 x base_lr
 DINO 前半部分: 0.01 x base_lr 或冻结
 ```
 
-### 7.4 有标注退化监督
+### 7.4 干净语义监督
 
 当前正式实现直接使用 MFNet 这类带像素级语义标签的 RGB-T 分割数据。数据加载器读取配对 RGB、Thermal 和分割标注；训练、验证、测试分别使用互不重叠的 `train.txt`、`val.txt`、`test.txt`。Stage 2A 从 Stage 1 选出的最佳权重初始化，Stage 2B 从 Stage 2A 验证集 mIoU 最佳权重初始化。
-
-对有标注样本 `(x, y)`，构造：
-
-- 原始输入 `x`；
-- 标签保持的随机退化输入 `C(x)`；
-- 随机整模态缺失输入 `Drop(x)`。
 
 分割损失记为：
 
@@ -398,15 +392,13 @@ L_seg = L_CE + lambda_dice * L_Dice
 
 如果使用 Mask2Former，则沿用其分类、Mask BCE 和 Dice 组合损失。
 
-Stage 2A 损失：
+Stage 2A 只计算干净输入的分割损失：
 
 ```text
 L_stage2A = L_seg(f(x), y)
-          + lambda_deg * L_seg(f(C(x)), y)
-          + lambda_missing * L_seg(f(Drop(x)), y)
 ```
 
-这里复用真实语义标签，因为程序退化必须保持场景语义和输出坐标系不变。这不是伪标签。
+实现中设置 `lambda_deg=0`、`lambda_missing=0`。Mask2Former 对最后一层及全部中间 decoder 层计算分类、Mask BCE 和 Dice 辅助监督，保持与标准训练方式一致。
 
 ### 7.5 Dense 模型验收条件
 
@@ -414,9 +406,9 @@ L_stage2A = L_seg(f(x), y)
 
 - RGB-T Dense 模型优于 RGB-only 和 Thermal-only 基线；
 - 干净输入性能达到可接受基线；
-- 在 RGB 缺失、Thermal 缺失和单模态退化下不会完全崩溃；
-- 模态遮蔽实验表明模型没有永久塌缩到 RGB；
 - Anchor 输出能够支持稳定分割。
+
+退化和缺失性能在此阶段只作为监控项，不参与优化。通过干净基线验收后，再进入 Stage 2B 做可选鲁棒化，或者直接以该权重作为 Stage 3 的冻结 Dense Teacher，取决于消融方案。
 
 ## 8. Stage 2B：Dense EMA 鲁棒自蒸馏
 
@@ -647,8 +639,8 @@ after block R+6: K3 = 0
 当前代码以 MFNet 为 Stage 2A、Stage 2B 和 Stage 3 的主要有标签训练集：
 
 ```text
-Stage 2A: MFNet 真实标签 + clean/degraded/missing 三视图监督
-Stage 2B: MFNet 真实标签 + Dense EMA 一致性
+Stage 2A: MFNet 真实标签 + clean-only Dense Teacher
+Stage 2B: MFNet clean/degraded/missing + Dense EMA 一致性（可选鲁棒化）
 Stage 3:  MFNet 真实标签 + Dense-to-Sparse 蒸馏
 ```
 

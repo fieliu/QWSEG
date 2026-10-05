@@ -84,113 +84,22 @@ class Mask2FormerHead(MMDET_Mask2FormerHead):
             batch_data_samples)
 
         all_cls_scores, all_mask_preds = self(x, batch_data_samples)
+        all_cls_scores = [score.float() for score in all_cls_scores]
+        all_mask_preds = [pred.float() for pred in all_mask_preds]
+        if not all(torch.isfinite(score).all() for score in all_cls_scores):
+            raise FloatingPointError('non-finite Mask2Former class logits')
+        if not all(torch.isfinite(pred).all() for pred in all_mask_preds):
+            raise FloatingPointError('non-finite Mask2Former mask logits')
 
-        cls_scores = all_cls_scores[-1].float()
-        mask_preds = all_mask_preds[-1].float()
-
-        num_imgs = cls_scores.size(0)
-        cls_nan = torch.isnan(cls_scores)
-        cls_inf = torch.isinf(cls_scores)
-        if cls_nan.any() or cls_inf.any():
-            import logging
-            _logger = logging.getLogger(__name__)
-            _logger.warning(
-                f'cls_scores: NaN={cls_nan.sum().item()} Inf={cls_inf.sum().item()} '
-                f'/ {cls_scores.numel()} elements → cleaned. '
-                f'Loss is healthy → fp16 AMP noise, not model collapse.')
-        cls_scores_list = [
-            cls_scores[i].nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
-            for i in range(num_imgs)]
-
-        mask_nan = torch.isnan(mask_preds)
-        mask_inf = torch.isinf(mask_preds)
-        if mask_nan.any() or mask_inf.any():
-            import logging
-            _logger = logging.getLogger(__name__)
-            _logger.warning(
-                f'mask_preds: NaN={mask_nan.sum().item()} Inf={mask_inf.sum().item()} '
-                f'/ {mask_preds.numel()} elements → nan_to_num+clamp applied. '
-                f'Loss is healthy → this is fp16 AMP numerical noise, not model collapse.')
-        mask_preds_list = [
-            mask_preds[i].nan_to_num(0.0).clamp(-50, 50)
-            for i in range(num_imgs)]
-        (labels_list, label_weights_list, mask_targets_list, mask_weights_list,
-         avg_factor) = self.get_targets(cls_scores_list, mask_preds_list,
-                                        batch_gt_instances, batch_img_metas)
-        labels = torch.stack(labels_list, dim=0)
-        label_weights = torch.stack(label_weights_list, dim=0)
-        mask_targets = torch.cat(mask_targets_list, dim=0)
-        mask_weights = torch.stack(mask_weights_list, dim=0)
-
-        cls_scores_flat = cls_scores.flatten(0, 1)
-        labels_flat = labels.flatten(0, 1)
-        label_weights_flat = label_weights.flatten(0, 1)
-
-        class_weight = cls_scores_flat.new_tensor(self.class_weight)
-        loss_cls = self.loss_cls(
-            cls_scores_flat,
-            labels_flat,
-            label_weights_flat,
-            avg_factor=class_weight[labels_flat].sum())
-
-        from mmdet.utils import reduce_mean
-        num_total_masks = reduce_mean(
-            cls_scores_flat.new_tensor([avg_factor], dtype=torch.float32))
-        num_total_masks = max(num_total_masks, 1)
-
-        mask_preds_pos = mask_preds[mask_weights > 0]
-
-        if mask_targets.shape[0] == 0:
-            loss_dice = mask_preds_pos.sum()
-            loss_mask = mask_preds_pos.sum()
-        else:
-            from mmdet.models.utils.point_sample import (
-                get_uncertain_point_coords_with_randomness, point_sample)
-            with torch.no_grad():
-                points_coords = get_uncertain_point_coords_with_randomness(
-                    mask_preds_pos.unsqueeze(1), None, self.num_points,
-                    self.oversample_ratio, self.importance_sample_ratio)
-                mask_point_targets = point_sample(
-                    mask_targets.unsqueeze(1).float(), points_coords).squeeze(1)
-            mask_point_preds = point_sample(
-                mask_preds_pos.unsqueeze(1), points_coords).squeeze(1)
-
-            loss_dice = self.loss_dice(
-                mask_point_preds, mask_point_targets,
-                avg_factor=num_total_masks)
-
-            mask_point_preds_flat = mask_point_preds.reshape(-1)
-            mask_point_targets_flat = mask_point_targets.reshape(-1)
-
-            if torch.isnan(loss_dice) or torch.isnan(loss_cls):
-                print(f'[NaN-DEBUG] loss_dice={loss_dice.item()} loss_cls={loss_cls.item()}')
-                print(f'[NaN-DEBUG] mask_point_preds nan={torch.isnan(mask_point_preds_flat).any().item()} '
-                      f'inf={torch.isinf(mask_point_preds_flat).any().item()} '
-                      f'range=[{mask_point_preds_flat.min().item():.4f}, {mask_point_preds_flat.max().item():.4f}]')
-                print(f'[NaN-DEBUG] mask_point_targets nan={torch.isnan(mask_point_targets_flat).any().item()} '
-                      f'range=[{mask_point_targets_flat.min().item():.4f}, {mask_point_targets_flat.max().item():.4f}]')
-
-            loss_mask = self.loss_mask(
-                mask_point_preds_flat,
-                mask_point_targets_flat,
-                avg_factor=num_total_masks * self.num_points)
-
-            if torch.isnan(loss_mask):
-                print(f'[NaN-DEBUG] loss_mask is NaN! '
-                      f'loss_cls={loss_cls.item():.4f} loss_dice={loss_dice.item():.4f} '
-                      f'num_total_masks={num_total_masks} num_points={self.num_points} '
-                      f'avg_factor={num_total_masks * self.num_points} '
-                      f'pred_nan={torch.isnan(mask_point_preds_flat).any().item()} '
-                      f'target_nan={torch.isnan(mask_point_targets_flat).any().item()} '
-                      f'pred_range=[{mask_point_preds_flat.min().item():.4f}, {mask_point_preds_flat.max().item():.4f}] '
-                      f'target_range=[{mask_point_targets_flat.min().item():.4f}, {mask_point_targets_flat.max().item():.4f}]')
-
-        loss_dict = dict()
-        loss_dict['loss_cls'] = loss_cls
-        loss_dict['loss_mask'] = loss_mask
-        loss_dict['loss_dice'] = loss_dice
-
-        return loss_dict
+        # Keep matching and point losses in fp32, and retain Mask2Former's
+        # auxiliary supervision for every transformer-decoder layer.  The old
+        # implementation trained only the final layer, which materially slowed
+        # early convergence and was not equivalent to standard Mask2Former.
+        with torch.autocast(
+                device_type=all_cls_scores[0].device.type, enabled=False):
+            return self.loss_by_feat(
+                all_cls_scores, all_mask_preds,
+                batch_gt_instances, batch_img_metas)
 
     def predict(self, x: Tuple[Tensor], batch_img_metas: List[dict],
                 test_cfg: ConfigType) -> Tuple[Tensor]:

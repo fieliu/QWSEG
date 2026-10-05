@@ -1,7 +1,7 @@
-# Stage 2A: Dense Robust Warm-up (doc section 7) on MFNet 480x640.
-# Trains a full-token (dense) shared-ViT anchor/extra segmentor with three-view
-# supervision: clean + degraded C(x) + missing-modality Drop(x), all vs real GT.
-# This is the first trainable segmentation entry; its accepted weights seed 2B.
+# Stage 2A: clean Dense Teacher training on MFNet 480x640.
+# Establish the full-token clean segmentation baseline before introducing any
+# degradation, missing-modality objective, EMA target, or token pruning.  The
+# accepted best-mIoU checkpoint is the initialization/teacher for later stages.
 _base_ = [
     '_base_dino_ts_m2f.py',
     '_base_dino_ts_data.py',
@@ -22,8 +22,8 @@ model = dict(
     neck={{_base_.neck}},
     decode_head={{_base_.decode_head}},
     forward_mode='dense',
-    lambda_deg=1.0,
-    lambda_missing=1.0,
+    lambda_deg=0.0,
+    lambda_missing=0.0,
     degradation={{_base_.degradation_policy}},
     train_cfg=dict(),
     test_cfg=dict(mode='slide', crop_size=crop_size, stride=(320, 427)))
@@ -40,9 +40,12 @@ optim_wrapper = dict(
     clip_grad=dict(max_norm=1.0))
 
 param_scheduler = [
-    dict(type='LinearLR', start_factor=0.01, by_epoch=True, begin=0, end=5,
+    # One epoch is enough to warm up this small (784-image) split.  The former
+    # five-epoch warm-up kept the LR below its target throughout the first
+    # validation and made that checkpoint a poor convergence diagnostic.
+    dict(type='LinearLR', start_factor=0.01, by_epoch=True, begin=0, end=1,
          convert_to_iter_based=True),
-    dict(type='PolyLR', eta_min=1e-6, power=1.0, begin=5, end=200,
+    dict(type='PolyLR', eta_min=1e-6, power=1.0, begin=1, end=200,
          by_epoch=True, convert_to_iter_based=True),
 ]
 

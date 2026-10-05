@@ -1,6 +1,6 @@
 # Stage 2B: Dense EMA Robust Self-Distillation (doc section 8) on MFNet 480x640.
-# Inherits Stage 2A (dense three-view seg + degradation) and adds an EMA teacher
-# + per-position anchor consistency (online x_strong vs stop-grad EMA x_weak).
+# Starts from the accepted clean Dense Teacher, then introduces three-view
+# robustness and an EMA teacher with per-position anchor consistency.
 # Warm-start from an accepted Stage-2A checkpoint via --cfg-options load_from=...
 _base_ = ['stage2a_dense_mfnet.py']
 
@@ -9,6 +9,8 @@ crop_size = (480, 640)
 model = dict(
     type='DinoTSDenseEMA',
     forward_mode='dense',
+    lambda_deg=1.0,
+    lambda_missing=1.0,
     ema_momentum_base=0.996,
     ema_momentum_final=0.9999,
     total_epochs=200,

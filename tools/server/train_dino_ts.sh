@@ -25,7 +25,9 @@ export PYTHONPATH="$ROOT:$ROOT/seg/mmsegmentation-main-rgbt:${PYTHONPATH:-}"
 export DINOV3_CHECKPOINT=${DINOV3_CHECKPOINT:-$PRETRAIN_ROOT/dinov3-vitb16}
 export MFNET_ROOT=${MFNET_ROOT:-$DATA_ROOT/MFNet}
 export LLVIP_ROOT=${LLVIP_ROOT:-$DATA_ROOT/LLVIP}
-export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
+if [[ ! "${OMP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then
+  export OMP_NUM_THREADS=4
+fi
 
 cd "$ROOT/seg/mmsegmentation-main-rgbt"
 

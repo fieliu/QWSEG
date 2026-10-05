@@ -3,6 +3,8 @@
 #
 # Examples:
 #   GPUS=4 bash tools/server/train_dino_ts.sh stage1
+#   GPUS=1 RESUME=1 STAGE1_BATCH_SIZE=24 STAGE1_NUM_WORKERS=6 \
+#     STAGE1_MAX_EPOCHS=20 bash tools/server/train_dino_ts.sh stage1
 #   GPUS=4 bash tools/server/train_dino_ts.sh stage2a
 #   GPUS=4 RESUME=1 bash tools/server/train_dino_ts.sh stage2a
 #   GPUS=4 INIT_CKPT=/path/to/best.pth bash tools/server/train_dino_ts.sh stage2b
@@ -81,6 +83,36 @@ if [[ "$STAGE" == "stage3" ]]; then
   TEACHER_CKPT=${TEACHER_CKPT:-${INIT_CKPT:-$(latest_checkpoint "$WORK_ROOT/stage2b/weight" 'best_mIoU*.pth')}}
   echo "Teacher checkpoint: $TEACHER_CKPT"
   ARGS+=(--cfg-options "model.teacher_ckpt=$TEACHER_CKPT")
+fi
+
+if [[ "$STAGE" == "stage1" ]]; then
+  STAGE1_OPTIONS=()
+  if [[ -n "${STAGE1_BATCH_SIZE:-}" ]]; then
+    [[ "$STAGE1_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || {
+      echo "STAGE1_BATCH_SIZE must be a positive integer." >&2
+      exit 2
+    }
+    STAGE1_OPTIONS+=(
+      "train_dataloader.batch_size=$STAGE1_BATCH_SIZE"
+      "val_dataloader.batch_size=$STAGE1_BATCH_SIZE")
+  fi
+  if [[ -n "${STAGE1_NUM_WORKERS:-}" ]]; then
+    [[ "$STAGE1_NUM_WORKERS" =~ ^[0-9]+$ ]] || {
+      echo "STAGE1_NUM_WORKERS must be a non-negative integer." >&2
+      exit 2
+    }
+    STAGE1_OPTIONS+=(
+      "train_dataloader.num_workers=$STAGE1_NUM_WORKERS"
+      "val_dataloader.num_workers=$STAGE1_NUM_WORKERS")
+  fi
+  if [[ -n "${STAGE1_MAX_EPOCHS:-}" ]]; then
+    [[ "$STAGE1_MAX_EPOCHS" =~ ^[1-9][0-9]*$ ]] || {
+      echo "STAGE1_MAX_EPOCHS must be a positive integer." >&2
+      exit 2
+    }
+    STAGE1_OPTIONS+=("train_cfg.max_epochs=$STAGE1_MAX_EPOCHS")
+  fi
+  [[ "${#STAGE1_OPTIONS[@]}" -eq 0 ]] || ARGS+=(--cfg-options "${STAGE1_OPTIONS[@]}")
 fi
 
 mkdir -p "$WORK_DIR"

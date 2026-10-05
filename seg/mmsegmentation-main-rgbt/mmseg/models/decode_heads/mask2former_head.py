@@ -37,10 +37,16 @@ class Mask2FormerHead(MMDET_Mask2FormerHead):
         self.ignore_index = ignore_index
 
     def _get_targets_single(self, cls_score, mask_pred, gt_instances, img_meta):
-        # fp16 safety: clean per-image tensors before point_sample + assigner
-        mask_pred = mask_pred.nan_to_num(0.0).clamp(-50, 50)
-        cls_score = cls_score.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
-        return super()._get_targets_single(cls_score, mask_pred, gt_instances, img_meta)
+        # Hungarian matching is non-differentiable and must stay in fp32.  A
+        # plain ``.float()`` is not enough here: the surrounding AMP context
+        # would autocast the 12,544-point cost einsums back to fp16, whose
+        # reductions can overflow and make SciPy report an infeasible matrix.
+        mask_pred = mask_pred.float().nan_to_num(0.0).clamp(-50, 50)
+        cls_score = cls_score.float().nan_to_num(
+            nan=0.0, posinf=0.0, neginf=0.0)
+        with torch.autocast(device_type=cls_score.device.type, enabled=False):
+            return super()._get_targets_single(
+                cls_score, mask_pred, gt_instances, img_meta)
 
     def _seg_data_to_instance_data(self, batch_data_samples: SampleList):
         batch_img_metas = []

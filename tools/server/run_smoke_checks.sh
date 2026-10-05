@@ -6,6 +6,7 @@ export PYTHONPATH="$ROOT:$ROOT/seg/mmsegmentation-main-rgbt:${PYTHONPATH:-}"
 export CUDA_VISIBLE_DEVICES=0
 export OMP_NUM_THREADS=4
 cd "$ROOT/seg/mmsegmentation-main-rgbt"
+python tools/test_dino_ts_shapes.py
 latest_checkpoint() {
   python -c 'from pathlib import Path; import sys; print(max(Path(sys.argv[1]).rglob("iter_*.pth"), key=lambda p: p.stat().st_mtime))' "$1"
 }

@@ -27,7 +27,7 @@ from typing import Optional
 import torch
 
 from mmseg.registry import MODELS
-from mmengine.runner import load_checkpoint
+from mmengine.runner import CheckpointLoader
 from mmengine.logging import print_log
 from .stage2a_dense import DinoTSDense
 from . import losses as L
@@ -79,7 +79,27 @@ class DinoTSSparse(DinoTSDense):
             return
         super().init_weights()
         if self.teacher is not None and self.teacher_ckpt is not None:
-            load_checkpoint(self.teacher, self.teacher_ckpt, map_location='cpu')
+            checkpoint = CheckpointLoader.load_checkpoint(
+                self.teacher_ckpt, map_location='cpu')
+            state = checkpoint.get('state_dict', checkpoint)
+            state = {
+                (k[7:] if k.startswith('module.') else k): v
+                for k, v in state.items()
+            }
+            ema_state = {
+                k[len('ema.'):]: v for k, v in state.items()
+                if k.startswith('ema.') and k != 'ema._ema_initialized'
+            }
+            teacher_state = ema_state or {
+                k: v for k, v in state.items()
+                if not k.startswith('ema.') and k != '_ema_initialized'
+            }
+            missing_teacher, unexpected_teacher = self.teacher.load_state_dict(
+                teacher_state, strict=False)
+            print_log(
+                f'DinoTSSparse loaded {"EMA" if ema_state else "online"} '
+                f'teacher weights: {len(missing_teacher)} missing, '
+                f'{len(unexpected_teacher)} unexpected.', logger='current')
             if self.init_from_teacher:
                 missing, unexpected = self.load_state_dict(
                     self.teacher.state_dict(), strict=False)

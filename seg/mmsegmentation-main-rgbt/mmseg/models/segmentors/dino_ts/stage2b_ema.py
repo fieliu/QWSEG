@@ -47,20 +47,33 @@ class DinoTSDenseEMA(DinoTSDense):
         self.total_epochs = total_epochs
         self.lambda_anchor = lambda_anchor
         self.lambda_global = lambda_global
-        self._ema_built = False
         self.ema = None
-
-    # -- EMA teacher management --------------------------------------------
-    def _build_ema(self):
-        """Deep-copy the current online model into a frozen EMA teacher. Called
-        lazily on the first loss() so warm-started weights are captured."""
+        self.register_buffer(
+            '_ema_initialized', torch.tensor(False, dtype=torch.bool))
+        # Register the teacher before MMDistributedDataParallel is constructed.
+        # Its weights are synchronized from the checkpoint-loaded online model
+        # by EMAUpdateHook.before_train().
         self.ema = copy.deepcopy(self)
-        self.ema.ema = None  # avoid recursive EMA-of-EMA
+        self.ema.ema = None  # no recursive EMA-of-EMA
         for p in self.ema.parameters():
             p.requires_grad = False
         self.ema.eval()
-        self._ema_built = True
-        print_log('DinoTSDenseEMA: built EMA teacher from online weights.',
+
+    # -- EMA teacher management --------------------------------------------
+    @torch.no_grad()
+    def initialize_ema(self):
+        """Copy checkpoint-loaded online weights into the registered teacher."""
+        if bool(self._ema_initialized.item()):
+            return
+        online = {
+            k: v for k, v in self.state_dict().items()
+            if not k.startswith('ema.') and k != '_ema_initialized'
+        }
+        self.ema.load_state_dict(online, strict=False)
+        self.ema.eval()
+        self._ema_initialized.fill_(True)
+        print_log('DinoTSDenseEMA: initialized registered EMA teacher from '
+                  'checkpoint-loaded online weights.',
                   logger='current')
 
     def _current_momentum(self):
@@ -70,12 +83,24 @@ class DinoTSDenseEMA(DinoTSDense):
                 + (self.ema_momentum_final - self.ema_momentum_base) * frac)
 
     @torch.no_grad()
-    def _update_ema(self):
+    def update_ema(self):
+        """Update after the optimizer step; called by EMAUpdateHook."""
+        if not bool(self._ema_initialized.item()):
+            raise RuntimeError('EMA teacher must be initialized before updating')
         m = self._current_momentum()
-        for pe, po in zip(self.ema.parameters(), self.parameters()):
+        online_params = dict(self.named_parameters())
+        for name, pe in self.ema.named_parameters():
+            po = online_params[name]
             pe.mul_(m).add_(po.detach(), alpha=1 - m)
-        for be, bo in zip(self.ema.buffers(), self.buffers()):
-            be.copy_(bo)
+        online_buffers = dict(self.named_buffers())
+        for name, be in self.ema.named_buffers():
+            if name == '_ema_initialized':
+                continue
+            bo = online_buffers[name]
+            if torch.is_floating_point(be):
+                be.mul_(m).add_(bo.detach(), alpha=1 - m)
+            else:
+                be.copy_(bo)
 
     def train(self, mode=True):
         super().train(mode)
@@ -89,8 +114,9 @@ class DinoTSDenseEMA(DinoTSDense):
         return model._last_backbone_out['anchors']
 
     def loss(self, inputs, data_samples):
-        if not self._ema_built:
-            self._build_ema()
+        if not bool(self._ema_initialized.item()):
+            raise RuntimeError(
+                'EMA teacher is not initialized. Add EMAUpdateHook to custom_hooks.')
 
         has_label = bool(getattr(data_samples[0], 'has_label', True)) \
             if len(data_samples) else True
@@ -125,6 +151,10 @@ class DinoTSDenseEMA(DinoTSDense):
         losses['loss_anchor'] = self.lambda_anchor * L.anchor_consistency_loss(
             a_online, a_ema.detach())
 
-        # EMA update after using the teacher this step
-        self._update_ema()
         return losses
+
+    def predict(self, inputs, data_samples=None):
+        """Validate the EMA teacher, which is the artifact consumed by Stage 3."""
+        if bool(self._ema_initialized.item()):
+            return self.ema.predict(inputs, data_samples)
+        return super().predict(inputs, data_samples)

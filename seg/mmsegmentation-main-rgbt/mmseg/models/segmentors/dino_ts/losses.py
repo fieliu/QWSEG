@@ -73,6 +73,72 @@ def cross_region_loss(z_thermal: torch.Tensor, z_rgb_teacher: torch.Tensor,
                            valid_mask=None, stopgrad_b=True)
 
 
+def cross_relation_loss(z_thermal: torch.Tensor,
+                        z_rgb_teacher: torch.Tensor,
+                        grid_hw,
+                        region: int = 2,
+                        temperature: float = 0.2) -> torch.Tensor:
+    """Match within-modality region relations without copying RGB features.
+
+    Each pooled region is represented by its cosine similarities to every
+    other region in the same image.  The RGB relation distribution is a frozen
+    target and the thermal distribution is trained with row-wise KL.  The
+    diagonal is excluded because self-similarity is always one and carries no
+    cross-modal information.
+
+    Unlike direct token matching, this objective is invariant to a shared
+    rotation of the thermal feature coordinates.  Stage 1 therefore combines
+    it with a *weak* ``cross_region_loss`` to establish a common coordinate
+    system while retaining modality-specific content.
+    """
+    if temperature <= 0:
+        raise ValueError(f'temperature must be positive, got {temperature}')
+
+    H, W = grid_hw
+    B, N, D = z_thermal.shape
+    if z_rgb_teacher.shape != z_thermal.shape:
+        raise ValueError(
+            'thermal and RGB projector outputs must have identical shapes, '
+            f'got {tuple(z_thermal.shape)} and {tuple(z_rgb_teacher.shape)}')
+    if N != H * W:
+        raise ValueError(f'token count {N} != H*W {H * W}')
+
+    def pool_and_normalize(z):
+        z2d = z.transpose(1, 2).reshape(B, D, H, W)
+        z2d = F.avg_pool2d(
+            z2d, kernel_size=region, stride=region, ceil_mode=True)
+        # Similarity softmax is more stable in fp32 under AMP.
+        return F.normalize(z2d.flatten(2).transpose(1, 2).float(), dim=-1)
+
+    thermal = pool_and_normalize(z_thermal)
+    rgb = pool_and_normalize(z_rgb_teacher.detach())
+    num_regions = thermal.shape[1]
+    if num_regions < 2:
+        return z_thermal.sum() * 0.0
+
+    thermal_similarity = torch.bmm(thermal, thermal.transpose(1, 2))
+    rgb_similarity = torch.bmm(rgb, rgb.transpose(1, 2))
+    diagonal = torch.eye(
+        num_regions, device=thermal.device, dtype=torch.bool).unsqueeze(0)
+    # A finite sentinel keeps the zero-probability diagonal safe in KL under
+    # all backends (0 * inf can otherwise become NaN on some kernels).
+    # Keep this finite *after* temperature scaling.  ``-finfo.max / tau``
+    # overflows to -inf for tau < 1 and can produce 0 * inf = NaN in KL.
+    diagonal_value = -1.0e4
+    thermal_similarity = thermal_similarity.masked_fill(
+        diagonal, diagonal_value)
+    rgb_similarity = rgb_similarity.masked_fill(diagonal, diagonal_value)
+
+    teacher_relation = F.softmax(
+        rgb_similarity / temperature, dim=-1).detach()
+    student_relation = F.log_softmax(
+        thermal_similarity / temperature, dim=-1)
+    # Mean KL per query region; independent of batch size and token count.
+    return F.kl_div(
+        student_relation, teacher_relation,
+        reduction='none').sum(-1).mean().clamp_min(0.0)
+
+
 # --- Stage 2B: anchor consistency + optional global DINO (doc 8.3, 8.4) -----
 
 def anchor_consistency_loss(a_online: torch.Tensor, a_ema: torch.Tensor,
@@ -154,15 +220,17 @@ if __name__ == '__main__':
 
     l_patch = cross_patch_loss(z_t, z_r, mask)
     l_region = cross_region_loss(z_t, z_r, (H, W), region=2)
+    l_relation = cross_relation_loss(z_t, z_r, (H, W), region=2)
     l_anchor = anchor_consistency_loss(z_t, z_r, mask)
     l_comp = compression_loss(z_t, z_r, mask)
     l_rob = robust_loss(z_t, z_r, mask)
 
     for name, v in [('cross_patch', l_patch), ('cross_region', l_region),
+                    ('cross_relation', l_relation),
                     ('anchor', l_anchor), ('compression', l_comp),
                     ('robust', l_rob)]:
         assert v.dim() == 0, f'{name} must be scalar'
-        assert 0.0 <= v.item() <= 2.0 + 1e-4, f'{name} cosine dist out of range: {v.item()}'
+        assert v.item() >= 0.0, f'{name} loss must be non-negative: {v.item()}'
 
     # perfect match -> ~0 distance
     same = torch.randn(B, N, D)
@@ -181,6 +249,7 @@ if __name__ == '__main__':
     l_logit = logit_distill_loss(ls, ld, temperature=2.0)
     assert l_logit.dim() == 0 and l_logit.item() >= 0
 
-    (l_patch + l_region + l_anchor + l_comp + l_rob + l_glob + l_logit).backward()
-    print('losses.py self-test OK: all scalars, cosine in [0,2], '
+    (l_patch + l_region + l_relation + l_anchor + l_comp + l_rob
+     + l_glob + l_logit).backward()
+    print('losses.py self-test OK: all scalars, losses non-negative, '
           'perfect-match ~0, backprop clean')

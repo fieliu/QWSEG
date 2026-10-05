@@ -7,6 +7,7 @@ custom_imports = dict(
         'mmseg.models.backbones.dino_shared_vit',
         'mmseg.models.segmentors.dino_ts',
         'mmseg.engine',
+        'mmseg.evaluation.metrics.stage1_alignment_metric',
         'mmseg.datasets.mfnet',
         'mmseg.datasets.transforms.loading',
         'mmdet.models',
@@ -16,6 +17,7 @@ custom_imports = dict(
 dino_crop_size = (480, 640)
 num_classes = 9
 embed_dim = 768  # DINOv3 ViT-B
+dinov3_checkpoint = '{{$DINOV3_CHECKPOINT:/root/autodl-tmp/pretrain/dinov3-vitb16}}'
 
 # Shared training policy; fog, stripe_noise and t_quantization are held out.
 # Changing this list changes what can legitimately be called unseen at test.
@@ -42,15 +44,24 @@ data_preprocessor = dict(
 backbone = dict(
     type='DinoSharedViT',
     backbone_name='facebook/dinov3-vitb16-pretrain-lvd1689m',
-    backbone_ckpt='pretrain/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth',
+    backbone_ckpt=dinov3_checkpoint,
     img_size=dino_crop_size,
     patch_size=16,
     embed_dims=embed_dim,
     depth=12,
     fusion_block=3,       # R: shallow independent blocks before fusion
     d_adapter=64,
+    # Align only a compact common subspace.  The original 768-D modality
+    # tokens remain available to Anchor/Extra fusion, preserving thermal-only
+    # information instead of forcing the whole representation to mimic RGB.
+    align_out_dim=256,
     thr_in_channels=3,
     freeze_vit=False,
+    # SDPA dispatches to FlashAttention on supported Ampere+ CUDA inputs and
+    # safely falls back on older GPUs/CPU. Checkpointing trades compute for a
+    # substantial reduction in the 9 deep joint blocks' saved activations.
+    attention_backend='sdpa',
+    with_cp=True,
     local_files_only=True)
 
 neck = dict(

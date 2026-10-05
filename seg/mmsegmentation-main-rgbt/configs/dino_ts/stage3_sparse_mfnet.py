@@ -52,15 +52,19 @@ model = dict(
 
 optimizer = dict(type='AdamW', lr=3e-5, betas=(0.9, 0.999), weight_decay=0.05)
 optim_wrapper = dict(
-    type='OptimWrapper',
+    type='AmpOptimWrapper',
+    loss_scale=dict(init_scale=128.0),
+    accumulative_counts=2,
     optimizer=optimizer,
     constructor='LayerDecayOptimizerConstructor',
-    paramwise_cfg=dict(num_layers=12, layer_decay_rate=0.9))
+    paramwise_cfg=dict(num_layers=12, layer_decay_rate=0.9),
+    clip_grad=dict(max_norm=1.0))
 
 param_scheduler = [
-    dict(type='LinearLR', start_factor=1e-6, by_epoch=False, begin=0, end=1500),
-    dict(type='PolyLR', eta_min=0.0, power=1.0, begin=1500, end=117600,
-         by_epoch=False),
+    dict(type='LinearLR', start_factor=0.01, by_epoch=True, begin=0, end=5,
+         convert_to_iter_based=True),
+    dict(type='PolyLR', eta_min=1e-6, power=1.0, begin=5, end=200,
+         by_epoch=True, convert_to_iter_based=True),
 ]
 
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=200, val_interval=5)
@@ -71,12 +75,20 @@ default_hooks = dict(
     timer=dict(type='IterTimerHook'),
     logger=dict(type='LoggerHook', interval=50, log_metric_by_epoch=True),
     param_scheduler=dict(type='ParamSchedulerHook'),
-    checkpoint=dict(type='CheckpointHook', by_epoch=True, interval=5,
-                    save_best='mIoU'),
+    checkpoint=dict(
+        type='CheckpointHook', by_epoch=True, interval=5,
+        max_keep_ckpts=2, save_last=True, save_best='mIoU', rule='greater'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
-    visualization=dict(type='SegVisualizationHook'))
+    visualization=dict(type='SegVisualizationHook', draw=True, interval=100))
 
 custom_hooks = [
     dict(type='EpochSyncHook'),
     dict(type='PartialDegradeEvalHook', interval=5, num_samples=50),
 ]
+
+vis_backends = [
+    dict(type='LocalVisBackend'),
+    dict(type='TensorboardVisBackend'),
+]
+visualizer = dict(
+    type='SegLocalVisualizer', vis_backends=vis_backends, name='visualizer')

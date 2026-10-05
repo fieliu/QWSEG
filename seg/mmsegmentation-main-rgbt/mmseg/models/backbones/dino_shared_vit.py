@@ -40,6 +40,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 try:
     from .dino_ts_modules import (ModalityAdapter, AlignmentProjector,
@@ -65,30 +66,57 @@ except Exception:  # pragma: no cover - CPU test path without mm*
 # adapter residual, operating on an arbitrary-length token sequence.
 # ---------------------------------------------------------------------------
 
-def _eager_attention_no_rope(attn, x_norm):
-    """Manual multi-head self-attention over a DINOv3ViTAttention module WITHOUT
-    RoPE, for the deep joint [anchor ; extra] sequence (not a raster grid).
+def _dinov3_rope(q, k, position_embeddings):
+    """Apply the pinned Transformers DINOv3 RoPE without a hard dependency."""
+    if position_embeddings is None:
+        return q, k
+    try:
+        from transformers.models.dinov3_vit.modeling_dinov3_vit import (
+            apply_rotary_pos_emb)
+    except (ImportError, AttributeError) as exc:  # pragma: no cover - env error
+        raise RuntimeError(
+            'DINOv3 RoPE helper is unavailable; check the pinned transformers '
+            'version instead of silently running without positional encoding.') from exc
+    cos, sin = position_embeddings
+    return apply_rotary_pos_emb(q, k, cos, sin)
 
-    Reuses the module's q/k/v/o projections and per-head scaling, so it is
-    numerically identical to the HF attention minus the rotary step. Needed
-    because HF's forward unconditionally unpacks ``cos, sin = position_embeddings``
-    and cannot be called with None.
+
+def _projected_attention(attn, x_norm, position_embeddings=None,
+                         backend='sdpa'):
+    """DINOv3 self-attention with an eager reference and a fused SDPA path.
+
+    ``sdpa`` is PyTorch's portable dispatcher: on supported CUDA inputs it uses
+    FlashAttention or memory-efficient attention, and otherwise falls back to
+    the math kernel. No separate ``flash-attn`` package is required.
     """
+    if backend not in ('eager', 'sdpa'):
+        raise ValueError(f'attention_backend must be eager or sdpa, got {backend!r}')
     B, L, C = x_norm.shape
     Hn = attn.num_heads
     Hd = attn.head_dim
     q = attn.q_proj(x_norm).view(B, L, Hn, Hd).transpose(1, 2)
     k = attn.k_proj(x_norm).view(B, L, Hn, Hd).transpose(1, 2)
     v = attn.v_proj(x_norm).view(B, L, Hn, Hd).transpose(1, 2)
+    q, k = _dinov3_rope(q, k, position_embeddings)
     scale = getattr(attn, 'scaling', Hd ** -0.5)
-    aw = torch.matmul(q, k.transpose(-1, -2)) * scale
-    aw = F.softmax(aw, dim=-1, dtype=torch.float32).to(q.dtype)
-    out = torch.matmul(aw, v).transpose(1, 2).reshape(B, L, C).contiguous()
+    dropout = getattr(attn, 'dropout', 0.0)
+    dropout_p = dropout.p if isinstance(dropout, nn.Dropout) else float(dropout)
+    dropout_p = dropout_p if attn.training else 0.0
+    if backend == 'sdpa':
+        out = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=dropout_p, is_causal=False, scale=scale)
+    else:
+        aw = torch.matmul(q, k.transpose(-1, -2)) * scale
+        aw = F.softmax(aw, dim=-1, dtype=torch.float32).to(q.dtype)
+        aw = F.dropout(aw, p=dropout_p, training=attn.training)
+        out = torch.matmul(aw, v)
+    out = out.transpose(1, 2).reshape(B, L, C).contiguous()
     return attn.o_proj(out)
 
 
 def run_dino_block(block, x, rope=None, H=None, W=None,
-                   adapter: Optional[ModalityAdapter] = None):
+                   adapter: Optional[ModalityAdapter] = None,
+                   attention_backend: str = 'sdpa', patch_size: int = 16):
     """Run one DINOv3 ViT block on tokens x [B, L, C].
 
     rope: the backbone's rope module or None.
@@ -112,15 +140,16 @@ def run_dino_block(block, x, rope=None, H=None, W=None,
     attn = block.attn if hasattr(block, 'attn') else block.attention
 
     if hasattr(attn, 'q_proj'):
+        pos_emb = None
         if rope is not None and H is not None:
-            # shallow, grid tokens: let the HF attention apply RoPE
-            dummy = x.new_zeros(B, 3, H * 16, W * 16)
+            # Shallow grid tokens keep the pretrained DINOv3 RoPE.
+            dummy = x.new_zeros(B, 3, H * patch_size, W * patch_size)
             pos_emb = rope(dummy)  # (cos, sin)
-            out = attn(x_norm, position_embeddings=pos_emb)
-            out = out[0] if isinstance(out, (tuple, list)) else out
-        else:
-            # deep, non-grid joint sequence: manual eager attention, no RoPE
-            out = _eager_attention_no_rope(attn, x_norm)
+        # Deep joint tokens deliberately omit RoPE; additive anchor/extra
+        # position encodings are applied before this block sequence.
+        out = _projected_attention(
+            attn, x_norm, position_embeddings=pos_emb,
+            backend=attention_backend)
     elif isinstance(attn, nn.MultiheadAttention):
         # CPU shape-test stand-in (_ToyBlock): exercise the real control flow
         out, _ = attn(x_norm, x_norm, x_norm, need_weights=False)
@@ -187,6 +216,8 @@ class _DinoSharedViTImpl(nn.Module):
         align_out_dim: Optional[int] = None,
         freeze_vit: bool = False,
         local_files_only: bool = True,
+        attention_backend: str = 'sdpa',
+        with_cp: bool = False,
         _build_backbone: bool = True,   # False -> skip DINO load (CPU shape test)
         init_cfg=None,
     ):
@@ -197,6 +228,10 @@ class _DinoSharedViTImpl(nn.Module):
         self.depth = depth
         self.R = fusion_block
         self.freeze_vit = freeze_vit
+        if attention_backend not in ('eager', 'sdpa'):
+            raise ValueError('attention_backend must be "eager" or "sdpa"')
+        self.attention_backend = attention_backend
+        self.with_cp = with_cp
         self.modalities = ('rgb', 'thermal')
         # 1/16 grid for the default image size (used to size learned pos embeds)
         self.grid = (self.img_size[0] // patch_size, self.img_size[1] // patch_size)
@@ -306,13 +341,31 @@ class _DinoSharedViTImpl(nn.Module):
 
     def _run_shallow(self, tok, modality, H, W):
         for l in range(self.R):
-            tok = run_dino_block(self.blocks[l], tok, rope=self.rope, H=H, W=W,
-                                 adapter=self.adapters[modality][l])
+            block = self.blocks[l]
+            adapter = self.adapters[modality][l]
+
+            def run(x, block=block, adapter=adapter):
+                return run_dino_block(
+                    block, x, rope=self.rope, H=H, W=W, adapter=adapter,
+                    attention_backend=self.attention_backend,
+                    patch_size=self.patch_size)
+
+            tok = checkpoint(run, tok, use_reentrant=False) \
+                if self.with_cp and tok.requires_grad else run(tok)
         return tok
 
     def _run_deep(self, seq):
         for l in range(self.R, self.depth):
-            seq = run_dino_block(self.blocks[l], seq, rope=None)
+            block = self.blocks[l]
+
+            def run(x, block=block):
+                return run_dino_block(
+                    block, x, rope=None,
+                    attention_backend=self.attention_backend,
+                    patch_size=self.patch_size)
+
+            seq = checkpoint(run, seq, use_reentrant=False) \
+                if self.with_cp and seq.requires_grad else run(seq)
         return seq
 
     def forward(self, rgb, thermal, mode='dense', target_k=None,

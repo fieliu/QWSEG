@@ -18,8 +18,14 @@ model = dict(
     )
 
 # Warm-start the online model from the accepted Stage-2A weights (the EMA
-# teacher is deep-copied from these on the first training step).
+# teacher is registered before DDP and synchronized after checkpoint loading).
 # Set on the CLI:  --cfg-options load_from=work_dirs/stage2a/best_mIoU.pth
 load_from = None
 
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=200, val_interval=5)
+
+custom_hooks = [
+    dict(type='EpochSyncHook'),
+    dict(type='EMAUpdateHook'),
+    dict(type='PartialDegradeEvalHook', interval=5, num_samples=50),
+]

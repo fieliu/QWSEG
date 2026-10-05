@@ -12,6 +12,7 @@ Student AlignmentProjector.
 Loss (doc 6.4):
     L_stage1 = lambda_patch  * L_cross_patch
              + lambda_region * L_cross_region
+             + lambda_relation * L_cross_relation
 Teacher backbone + projector are fixed, so no L_var is needed (doc 6.4).
 No unlabeled semantic pseudo-labels are produced.
 
@@ -29,19 +30,28 @@ from . import losses as L
 @MODELS.register_module()
 class DinoTSStage1Adapt(DinoTSBase):
     def __init__(self, *args,
-                 lambda_patch: float = 1.0,
-                 lambda_region: float = 1.0,
+                 lambda_patch: float = 0.0,
+                 lambda_region: float = 0.25,
+                 lambda_relation: float = 1.0,
                  region: int = 2,
+                 relation_temperature: float = 0.2,
                  **kwargs):
         kwargs.setdefault('forward_mode', 'adapt')
         super().__init__(*args, **kwargs)
         self.lambda_patch = lambda_patch
         self.lambda_region = lambda_region
+        self.lambda_relation = lambda_relation
         self.region = region
+        self.relation_temperature = relation_temperature
         self._freeze_for_stage1()
 
     def _freeze_for_stage1(self):
         bb = self.backbone
+        # The two heads must start in the same coordinate system.  Keeping an
+        # independently randomized teacher fixed would provide stable but
+        # arbitrary targets and make the student learn the head mismatch in
+        # addition to the actual RGB/thermal modality gap.
+        bb.student_projector.load_state_dict(bb.teacher_projector.state_dict())
         # freeze shared DINO backbone
         if getattr(bb, 'backbone', None) is not None:
             for p in bb.backbone.parameters():
@@ -58,6 +68,10 @@ class DinoTSStage1Adapt(DinoTSBase):
                     self.neck, self.decode_head):
             for p in mod.parameters():
                 p.requires_grad = False
+        # Stage 1 calls the student projector only with modality='thermal'.
+        # Exclude its unused RGB-specific LayerNorm from the optimizer too.
+        for p in bb.student_projector.norms['rgb'].parameters():
+            p.requires_grad = False
         bb.anchor_pos_embed.requires_grad = False
 
     def loss(self, inputs, data_samples):
@@ -79,10 +93,23 @@ class DinoTSStage1Adapt(DinoTSBase):
         if self.lambda_region > 0:
             losses['loss_cross_region'] = self.lambda_region * L.cross_region_loss(
                 z_thr, z_rgb, (H, W), region=self.region)
+        if self.lambda_relation > 0:
+            losses['loss_cross_relation'] = (
+                self.lambda_relation * L.cross_relation_loss(
+                    z_thr, z_rgb, (H, W), region=self.region,
+                    temperature=self.relation_temperature))
         return losses
 
     def predict(self, inputs, data_samples=None):
-        # Stage 1 produces no segmentation; return the (unmodified) samples so a
-        # ValLoop won't crash. Real Stage-1 exit criteria (doc 6.5) use a linear
-        # probe, evaluated by a dedicated tool, not this predict path.
-        return data_samples if data_samples is not None else []
+        """Emit label-free alignment losses for held-out-pair validation."""
+        losses = self.loss(inputs, data_samples)
+        patch = losses.get('loss_cross_patch', inputs.new_tensor(0.0))
+        region = losses.get('loss_cross_region', inputs.new_tensor(0.0))
+        relation = losses.get('loss_cross_relation', inputs.new_tensor(0.0))
+        metrics = dict(
+            align_loss=float((patch + region + relation).detach().cpu()),
+            cross_patch=float(patch.detach().cpu()),
+            cross_region=float(region.detach().cpu()),
+            cross_relation=float(relation.detach().cpu()))
+        batch_size = inputs.shape[0]
+        return [metrics.copy() for _ in range(batch_size)]

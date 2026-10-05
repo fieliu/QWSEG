@@ -117,19 +117,25 @@ def detect_version_from_config(config_path):
 
 
 def save_weight_paths(weight_dir):
-    best_pth = None
-    final_pth = None
     if not osp.isdir(weight_dir):
         return
-    for f in os.listdir(weight_dir):
-        if f.startswith('best'):
-            best_pth = osp.join(weight_dir, f)
-        elif f.startswith('iter_') or f.startswith('epoch_'):
-            all_iters = sorted(
-                [x for x in os.listdir(weight_dir)
-                 if x.startswith('iter_') or x.startswith('epoch_')])
-            if all_iters:
-                final_pth = osp.join(weight_dir, all_iters[-1])
+    files = [osp.join(weight_dir, f) for f in os.listdir(weight_dir)]
+    best = [p for p in files if osp.basename(p).startswith('best')]
+    best_pth = max(best, key=osp.getmtime) if best else None
+
+    final_pth = None
+    last_checkpoint = osp.join(osp.dirname(weight_dir), 'last_checkpoint')
+    if osp.isfile(last_checkpoint):
+        with open(last_checkpoint, encoding='utf-8') as f:
+            candidate = f.read().strip()
+        if candidate:
+            final_pth = candidate
+    if final_pth is None:
+        regular = [
+            p for p in files
+            if osp.basename(p).startswith(('iter_', 'epoch_'))
+        ]
+        final_pth = max(regular, key=osp.getmtime) if regular else None
 
     info_path = osp.join(weight_dir, 'weight_paths.txt')
     with open(info_path, 'w') as f:
@@ -191,6 +197,7 @@ def save_config_info(run_dir, cfg, config_name, args):
 
 def main():
     args = parse_args()
+    is_main_process = int(os.environ.get('RANK', '0')) == 0
 
     cfg = Config.fromfile(args.config)
     cfg.launcher = args.launcher
@@ -204,15 +211,19 @@ def main():
     else:
         version_name = detect_version_from_config(args.config)
 
+    # An explicitly supplied work directory must be stable.  Apart from being
+    # the standard MMEngine behaviour, this is what lets ``--resume`` find the
+    # ``last_checkpoint`` file written by the previous process.  Runs that do
+    # not provide a directory retain the timestamped layout used by this repo.
     if args.work_dir is not None:
-        base_dir = args.work_dir
-    elif cfg.get('work_dir', None) is not None:
-        base_dir = cfg.work_dir
+        work_dir = osp.abspath(args.work_dir)
     else:
-        base_dir = osp.join('./work_dirs', version_name)
-
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    work_dir = osp.join(base_dir, timestamp)
+        if cfg.get('work_dir', None) is not None:
+            base_dir = cfg.work_dir
+        else:
+            base_dir = osp.join('./work_dirs', version_name)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        work_dir = osp.join(base_dir, timestamp)
     os.makedirs(work_dir, exist_ok=True)
 
     weight_dir = osp.join(work_dir, 'weight')
@@ -259,18 +270,41 @@ def main():
             logger='current')
 
     cfg.resume = args.resume
+    if args.resume:
+        last_checkpoint = osp.join(work_dir, 'last_checkpoint')
+        if not osp.isfile(last_checkpoint):
+            raise FileNotFoundError(
+                f'Cannot resume: {last_checkpoint} does not exist. Reuse the '
+                'same --work-dir as the interrupted run.')
 
-    save_config_info(work_dir, cfg, config_name, args)
+    if is_main_process:
+        save_config_info(work_dir, cfg, config_name, args)
 
     if 'runner_type' not in cfg:
         runner = Runner.from_cfg(cfg)
     else:
         runner = RUNNERS.build(cfg)
 
+    if is_main_process:
+        model = runner.model.module if hasattr(runner.model, 'module') \
+            else runner.model
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(
+            p.numel() for p in model.parameters() if p.requires_grad)
+        print_log(
+            f'Parameters: trainable={trainable_params:,}, '
+            f'total={total_params:,} '
+            f'({100.0 * trainable_params / max(total_params, 1):.2f}%)',
+            logger='current')
+
     runner.train()
 
-    save_weight_paths(weight_dir)
-    print_log(f'Training done. Weight paths saved to {weight_dir}/weight_paths.txt', logger='current')
+    if is_main_process:
+        save_weight_paths(weight_dir)
+        print_log(
+            f'Training done. Weight paths saved to '
+            f'{weight_dir}/weight_paths.txt',
+            logger='current')
 
 
 if __name__ == '__main__':

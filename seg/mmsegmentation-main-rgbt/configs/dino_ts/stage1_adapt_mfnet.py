@@ -21,9 +21,14 @@ model = dict(
     neck={{_base_.neck}},
     decode_head={{_base_.decode_head}},
     forward_mode='adapt',
-    lambda_patch=1.0,     # set 0.0 if the pairs are not reliably registered
-    lambda_region=1.0,
+    # Primary: preserve RGB-like spatial relations between coarse regions.
+    # Weak region cosine fixes the shared coordinate system; exact patch
+    # matching is disabled to retain thermal-specific information.
+    lambda_patch=0.0,
+    lambda_region=0.25,
+    lambda_relation=1.0,
     region=2,
+    relation_temperature=0.2,
     train_cfg=dict(),
     test_cfg=dict(mode='whole'))
 
@@ -49,9 +54,20 @@ default_hooks = dict(
     timer=dict(type='IterTimerHook'),
     logger=dict(type='LoggerHook', interval=50, log_metric_by_epoch=True),
     param_scheduler=dict(type='ParamSchedulerHook'),
-    checkpoint=dict(type='CheckpointHook', by_epoch=True, interval=10),
+    checkpoint=dict(
+        type='CheckpointHook', by_epoch=True, interval=10,
+        max_keep_ckpts=2, save_last=True),
     sampler_seed=dict(type='DistSamplerSeedHook'))
 
 custom_hooks = [
     dict(type='EpochSyncHook'),
 ]
+
+# Scalar losses/LR are written both to the normal log and TensorBoard.  Stage 1
+# has no semantic predictions to render because it is an alignment pretext.
+vis_backends = [
+    dict(type='LocalVisBackend'),
+    dict(type='TensorboardVisBackend'),
+]
+visualizer = dict(
+    type='SegLocalVisualizer', vis_backends=vis_backends, name='visualizer')

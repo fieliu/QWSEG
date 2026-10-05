@@ -22,8 +22,12 @@ try:
     from .epoch_sync_hook import EpochSyncHook
 except ImportError:
     EpochSyncHook = None
+try:
+    from .ema_update_hook import EMAUpdateHook
+except ImportError:
+    EMAUpdateHook = None
 from .visualization_hook import SegVisualizationHook
 
 __all__ = ['SegVisualizationHook', 'TrainVisHook', 'MissingModalityEvalHook',
            'EoMTRGBTVisHook', 'AdapterM2FQualityVisHook',
-           'PartialDegradeEvalHook', 'EpochSyncHook']
+           'PartialDegradeEvalHook', 'EpochSyncHook', 'EMAUpdateHook']

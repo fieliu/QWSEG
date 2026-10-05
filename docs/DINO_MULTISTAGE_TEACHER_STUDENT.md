@@ -60,6 +60,8 @@ T PatchEmbed ───────┘
 
 ### 2.3 Adapter 是共享 FFN 的补充，不是替代
 
+这里的 Adapter **不是 DINOv3 Block，也不是从 DINOv3 FFN 复制出来的一层**。RGB 与 Thermal 在融合前调用同一组预训练 DINOv3 Block；二者仅使用不同的 PatchEmbed、Modality Embedding 和低秩 Adapter。换言之，共享的是完整的 Attention/FFN 主路径，Adapter 只学习模态相关的残差修正。
+
 融合前的第 `l` 个 Block 对模态 `m` 执行：
 
 ```text
@@ -82,6 +84,21 @@ LayerNorm(D) -> Linear(D, d_adapter) -> GELU -> Linear(d_adapter, D)
 ```
 
 对于 ViT-B，可从 `d_adapter=64` 开始。Adapter 只放在融合前的前 `R=3` 或 `R=4` 个 Block。融合后 Token 已不再属于单一模态，不再使用模态专属 Adapter。
+
+当前 ViT-B、`R=3` 实现的初始化如下：
+
+| 部件 | 初始化方式 | Stage 1 状态 |
+|---|---|---|
+| 12 个共享 DINO Block | DINOv3 ViT-B 预训练权重；RGB/T 调用同一参数对象 | 冻结 |
+| RGB PatchEmbed | 复制 DINOv3 PatchEmbed 卷积权重 | 冻结 |
+| Thermal PatchEmbed（三通道） | 直接复制 RGB/DINOv3 PatchEmbed 权重 | 训练 |
+| Thermal PatchEmbed（单通道） | 对 RGB 三通道卷积核按输入通道求均值 | 训练 |
+| RGB Adapter | 新建；`up` 权重和偏置置零，初始残差严格为零 | 冻结 |
+| Thermal Adapter | 新建；`up` 权重和偏置置零，初始残差严格为零 | 训练 |
+| RGB/T Modality Embedding | 截断正态小值初始化 | 仅 Thermal 训练 |
+| Teacher/Student Projector | 先用相同参数初始化，随后固定 Teacher | Student 训练 |
+
+Adapter 的瓶颈形状为 `768 -> 64 -> 768`，与 DINOv3 FFN 的形状和职责不同，不能直接用 DINOv3 前几层 FFN 权重初始化。虽然 RGB/T Adapter 结构相同、技术上可以互相复制，但初始 RGB Adapter 本身没有预训练知识，而且两者初始输出都为零，复制不会带来有效先验。当前方案保留零输出初始化，使训练起点等价于原始 DINOv3 主路径，再由 Thermal Adapter 在 Stage 1 学习红外修正量。
 
 ### 2.4 Projector 只用于训练损失
 
@@ -213,12 +230,16 @@ EMA 不创造新知识。多模态知识来自：
 
 ```text
 Stage 1  Modality Adaptation
+    LLVIP 配对 RGB-T，无语义标签
     ↓
 Stage 2A Dense Robust Warm-up
+    MFNet clean / degraded / missing，使用真实分割标签
     ↓
 Stage 2B Dense EMA Self-Distillation
+    MFNet 分割监督 + EMA 特征一致性
     ↓
 Stage 3  Dense-to-Sparse Distillation
+    MFNet 分割监督 + Dense Teacher 蒸馏
 ```
 
 全流程不生成或使用无标签语义伪标签。
@@ -234,7 +255,7 @@ Stage 3  Dense-to-Sparse Distillation
 - 配准较好的无标签 RGB-T 对；
 - 可使用 LLVIP、KAIST 等配对数据；
 - 必须按场景或视频去重，避免与后续验证/测试数据重叠；
-- RGB 严重不可见的样本不使用 RGB 作为逐 patch Teacher，只进行同模态自监督或跳过对应区域。
+- 当前正式配置关闭逐 Patch 对齐，因此不会直接把严重低照 RGB 的每个位置强加给 Thermal。区域/关系损失仍要求配对数据基本可靠；首轮训练前应剔除明显错配样本，后续可将 RGB 区域可靠性加权作为消融扩展。
 
 ### 6.3 冻结与训练参数
 
@@ -257,7 +278,7 @@ Thermal Modality Embedding
 Student AlignmentProjector
 ```
 
-RGB Adapter 可暂设为恒等映射；进入阶段二后再与 Thermal Adapter 一起训练。
+RGB Adapter 在 Stage 1 冻结。其上投影为零，因此虽然模块存在，初始残差严格为零，RGB 路径等价于原始 DINOv3 主路径；进入 Stage 2 后再与 Thermal Adapter 一起训练。
 
 ### 6.4 对齐损失
 
@@ -276,14 +297,32 @@ L_cross_patch = mean_i(1 - cosine(z_t_i, z_rgb_i))
 L_cross_region = mean_j(1 - cosine(z_t_region_j, z_rgb_region_j))
 ```
 
+关系对齐先将 `30x40` Patch Token 以 `2x2` 区域池化为 `15x20=300` 个区域，并计算每个模态内部的区域余弦关系：
+
+```text
+S_t[j,k]   = cosine(q_t_j, q_t_k)
+S_rgb[j,k] = cosine(q_rgb_j, q_rgb_k)
+
+p_t[j]   = softmax(mask_diag(S_t[j]) / tau)
+p_rgb[j] = stopgrad(softmax(mask_diag(S_rgb[j]) / tau))
+
+L_cross_relation = mean_j KL(p_rgb[j] || p_t[j])
+```
+
+对角线是恒为 1 的自相似度，不提供跨模态信息，因此从 softmax 中排除。当前温度 `tau=0.2`。关系对齐只要求红外保持与 RGB 相近的区域结构，不要求红外向量逐点等于 RGB；但纯关系损失对特征空间的整体旋转不敏感，因此保留一个较弱的区域余弦约束来建立共同坐标系。
+
 阶段一总损失：
 
 ```text
 L_stage1 = lambda_patch * L_cross_patch
          + lambda_region * L_cross_region
+         + lambda_relation * L_cross_relation
 ```
 
-没有可靠 patch 对齐时令 `lambda_patch=0`。由于 Teacher Backbone 和 Teacher Projector 固定，默认不加入 `L_var`。
+正式配置采用 `lambda_patch=0`、`lambda_region=0.25`、`lambda_relation=1.0`。
+`L_cross_relation` 在 2x2 池化区域上匹配模态内部的余弦相似度分布，忽略恒为 1 的对角线；它保留空间语义关系而不要求红外特征逐点复制 RGB。弱 `L_cross_region` 用于消除纯关系对齐的坐标旋转歧义。由于 Teacher Backbone 和 Teacher Projector 固定，默认不加入 `L_var`。
+
+三个对齐项都只作用于 256 维公共投影。原始 768 维 RGB/T Token 不被替换，并继续进入 Stage 2 的 Anchor/Extra Fusion，因此 Thermal 的热辐射等模态专有信息仍有独立通路。
 
 ### 6.5 退出条件
 
@@ -315,6 +354,14 @@ Decoder:
     仅读取 N anchors
 ```
 
+当前输入为 `480x640`、Patch Size 为 16，因此网格为 `30x40`，`N=1200`。Stage 2A/2B 的 Dense 序列为：
+
+```text
+[1200 Anchor ; 1200 Extra] -> [B, 2400, 768]
+```
+
+拼接后的 2400 个 Token 统一进入后 9 个共享 DINO Block。Anchor 与 Extra 可以通过同一个 Self-Attention 相互读取信息。深层处理结束后只截取序列前 1200 个 Anchor，恢复为 `[B,768,30,40]`，再通过 Feature2Pyramid 和 Mask2Former 输出分割结果；Extra 不直接输入 Decoder，而是通过深层注意力影响 Anchor。Stage 3 的最终硬稀疏路径保留全部 1200 个 Anchor，只将 Extra 从 1200 个压缩到 `K=600`。
+
 ### 7.3 可训练参数
 
 ```text
@@ -334,6 +381,8 @@ DINO 前半部分: 0.01 x base_lr 或冻结
 ```
 
 ### 7.4 有标注退化监督
+
+当前正式实现直接使用 MFNet 这类带像素级语义标签的 RGB-T 分割数据。数据加载器读取配对 RGB、Thermal 和分割标注；训练、验证、测试分别使用互不重叠的 `train.txt`、`val.txt`、`test.txt`。Stage 2A 从 Stage 1 选出的最佳权重初始化，Stage 2B 从 Stage 2A 验证集 mIoU 最佳权重初始化。
 
 对有标注样本 `(x, y)`，构造：
 
@@ -586,17 +635,24 @@ after block R+6: K3 = 0
 
 ### 12.1 无标签数据
 
-LLVIP、KAIST 等仅用于：
+当前正式流程使用 LLVIP 配对数据进行 Stage 1 模态适配。KAIST 等其他配对数据可作为扩展，但必须先完成去重和协议检查。无标签数据用于：
 
 - Stage 1 跨模态特征适配；
-- Stage 2B 弱/强视图 Anchor 自蒸馏；
-- Stage 3 Dense-to-Sparse 特征蒸馏。
+- 公共关系空间学习，不参与语义分割标签监督。
 
 不生成语义伪标签，不将 Teacher 低置信度预测写回训练集。
 
 ### 12.2 有标签数据
 
-SemanticRT 可作为主要 Dense Teacher 训练集；MFNet、FMB、PST900 用于独立微调和评估。不同数据集类别体系不同时，采用：
+当前代码以 MFNet 为 Stage 2A、Stage 2B 和 Stage 3 的主要有标签训练集：
+
+```text
+Stage 2A: MFNet 真实标签 + clean/degraded/missing 三视图监督
+Stage 2B: MFNet 真实标签 + Dense EMA 一致性
+Stage 3:  MFNet 真实标签 + Dense-to-Sparse 蒸馏
+```
+
+FMB、PST900 或其他带标注 RGB-T 数据用于第二数据集复现、外部泛化验证或独立微调。不同数据集类别体系不同时，采用：
 
 ```text
 共享 PatchEmbed / Adapter / ViT / Fusion
@@ -605,7 +661,7 @@ SemanticRT 可作为主要 Dense Teacher 训练集；MFNet、FMB、PST900 用于
 
 联合训练时先均匀采样数据集，再在数据集内采样，避免大数据集完全压制小数据集。
 
-SemanticRT 与 LLVIP 等来源可能存在重叠，必须按原始视频、场景 ID 或感知哈希去重，避免训练/测试泄漏。
+任意预训练配对数据与下游分割数据都必须按原始视频、场景 ID 或感知哈希去重，避免训练/验证/测试泄漏。
 
 ## 13. RGB-T 到 RGB-X 的扩展流程
 
@@ -681,6 +737,10 @@ N Anchor + Top-K Extra
 
 ```text
 无 Stage 1
+Stage 1 仅区域对齐
+Stage 1 仅关系对齐
+Stage 1 关系对齐 + 弱区域对齐（正式版本）
+Stage 1 强逐 Patch 对齐
 无退化训练
 无整模态 dropout
 无 Dense EMA

@@ -61,11 +61,51 @@ bash tools/server/run_smoke_checks.sh
 
 这次修正了共享配置重复字段、LLVIP 无标签数据前缀、适配器零梯度初始化、退化过程对 padding 的处理，以及 Stage 3 教师加载早于框架初始化而被覆盖的问题。上述源码和辅助脚本同时保留在本地工作区和服务器，尚未提交到 Git。
 
+## 正式四阶段训练
+
+统一入口为 `tools/server/train_dino_ts.sh`。它使用固定工作目录，自动把上一阶段选中的权重交给下一阶段，并支持单卡或 `torchrun` 多卡训练：
+
+```bash
+cd /root/autodl-tmp/code/QWSEG
+GPUS=4 bash tools/server/train_dino_ts.sh stage1
+GPUS=4 bash tools/server/train_dino_ts.sh stage2a
+GPUS=4 bash tools/server/train_dino_ts.sh stage2b
+GPUS=4 bash tools/server/train_dino_ts.sh stage3
+```
+
+默认顺序与权重交接如下：
+
+1. Stage 1 在 LLVIP 的 12,025 个 train 对上做无标签模态适配，每 5 epoch 在 3,463 个官方 test 对上计算不带标签的对齐损失。
+2. Stage 2A 从 Stage 1 验证对齐损失最低的权重开始，在 MFNet 上进行稠密鲁棒分割训练。
+3. Stage 2B 从 Stage 2A 的最佳 mIoU 权重开始，训练并验证 EMA 教师。
+4. Stage 3 从 Stage 2B 的最佳 EMA 权重构造冻结教师与稀疏学生。
+
+可用 `INIT_CKPT=/abs/path.pth` 覆盖 Stage 2A/2B 的输入权重，用 `TEACHER_CKPT=/abs/path.pth` 覆盖 Stage 3 教师。数据和预训练目录可分别通过 `QWSEG_DATA_ROOT`、`QWSEG_PRETRAIN_ROOT` 覆盖。
+
+中断后使用相同阶段和工作目录恢复：
+
+```bash
+GPUS=4 RESUME=1 bash tools/server/train_dino_ts.sh stage2a
+```
+
+`--resume` 会从工作目录中的 `last_checkpoint` 恢复模型、优化器、AMP scaler、学习率调度器、epoch/iteration 和消息状态；Stage 2B checkpoint 也包含 EMA 教师及初始化状态。每 5 个 epoch 保存一次，因此突然中断最多需要重跑最近 5 个 epoch。更换卡数后通常也能恢复，但有效全局 batch size 会变化，不建议在同一次实验中途更换。
+
+权重放在 `work_dirs/dino_ts/<stage>/weight/`。Stage 1 最多保留最近 2 个普通 checkpoint 和 1 个最佳对齐损失 checkpoint；Stage 2A、2B、3 各保留最近 2 个普通 checkpoint 和 1 个当前最佳 mIoU checkpoint，旧文件由 `CheckpointHook` 自动删除。EMA 和冻结教师会让 Stage 2B/3 的单个 checkpoint 较大。启动脚本默认要求工作盘至少剩余 10 GiB；空间已另行确认时可用 `MIN_FREE_GB=0` 关闭这项启动保护。
+
+训练日志、loss、学习率、mIoU 和退化子集指标会写入普通日志及 TensorBoard；Stage 2/3 的验证预测图也会低频写入 `vis_data/`。启动查看：
+
+```bash
+tensorboard --logdir /root/autodl-tmp/code/QWSEG/work_dirs/dino_ts \
+  --host 0.0.0.0 --port 6006
+```
+
+Stage 1 是无标签特征对齐，没有语义分割预测图，主要看 train loss 与 `stage1/align_loss`。这里沿用 LLVIP 官方基线把 test split 当验证集的协议；因此不能再把该 split 上的结果当作未参与模型选择的 LLVIP 测试结果。当前不建议给 DINO-TS 添加 `--visualize`：这个可选参数调用的是旧模型的重型训练特征图 Hook，尚未针对 DINO-TS 的 anchor/extra 输出适配；标量曲线和低频验证预测已经足够监控首轮正式训练。
+
 ## 换 GPU 与正式训练前
 
 1. 保存代码、权重、数据和依赖清单。当前服务器登录提示明确写明 `/root/autodl-tmp` 不随系统镜像保存；新 Conda 环境也在此目录，不能只保存系统镜像就假定已完整备份。
 2. 在目标 GPU 上核对 PyTorch/CUDA/MMCV 的架构支持。当前 MMCV 按 V100 的 `sm_70` 编译；换其他架构应重新构建或安装匹配版本。本安装脚本默认面向 V100，不保证适用于所有新 GPU。
-3. 正式串联 Stage 1 → Stage 2A → Stage 2B → Stage 3 前，补齐阶段交接与恢复测试，尤其是 EMA 独立导出、EMA 验证选择与 EMA 断点恢复。当前 Stage 2B 的普通验证走 online 模型，不能把该指标称为 EMA 教师指标。
+3. 正式串联 Stage 1 → Stage 2A → Stage 2B → Stage 3 的启动、阶段交接和恢复逻辑已经补入统一脚本；Stage 2B 验证走 EMA 教师。仍需在重新开启的 GPU 服务器上完成一次“保存 → 终止 → 恢复”的端到端验收。
 4. 检查正式稀疏预算课程：本次 soft 测试直接使用 K=600，验证 Router 可学习。正式配置从 K=N 起步，且 hard Top-K 索引不可导，需明确软训练到硬选择后的 Router 策略。
 5. 为特征蒸馏和 logit 蒸馏补齐有效区域掩码；当前退化生成已保护 padding，但蒸馏损失的有效区域策略仍需完善。
 6. 完成正式数据协议、基线、消融、独立退化 benchmark 与多随机种子实验，之后才能评价方法效果。

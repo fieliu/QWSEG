@@ -2,7 +2,7 @@
 _base_ = ['stage1_adapt_mfnet.py']
 
 model = dict(backbone=dict(
-    backbone_ckpt='/root/autodl-tmp/pretrain/dinov3-vitb16'))
+    backbone_ckpt='/root/autodl-tmp/pretrain/dinov3-vitb16', with_cp=False))
 train_dataloader = dict(
     _delete_=True, batch_size=1, num_workers=0, persistent_workers=False,
     sampler=dict(type='DefaultSampler', shuffle=True),

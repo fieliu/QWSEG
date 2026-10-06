@@ -382,7 +382,7 @@ DINO 前半部分: 0.01 x base_lr 或冻结
 
 ### 7.4 干净语义监督
 
-当前正式实现直接使用 MFNet 这类带像素级语义标签的 RGB-T 分割数据。数据加载器读取配对 RGB、Thermal 和分割标注；训练、验证、测试分别使用互不重叠的 `train.txt`、`val.txt`、`test.txt`。Stage 2A 从 Stage 1 选出的最佳权重初始化，Stage 2B 从 Stage 2A 验证集 mIoU 最佳权重初始化。
+当前正式实现直接使用 MFNet 这类带像素级语义标签的 RGB-T 分割数据。数据加载器读取配对 RGB、Thermal 和分割标注；按本文采用的 test-set protocol，将官方 `train.txt` 与 `val.txt` 合并为 1,176 张 `trainval.txt` 训练，并用 393 张官方 `test.txt` 每轮评估和选择权重。因为 test 参与模型选择，不再声称存在未参与调参的最终测试集。Stage 2A 只从 Stage 1 最佳权重提取真正训练过的 Thermal PatchEmbed、Thermal modality embedding 和 Thermal Adapter，避免随机冻结的 Fusion/Decoder 覆盖 Stage 2 初始化；Stage 2B 从 Stage 2A mIoU 最佳权重初始化。
 
 分割损失记为：
 

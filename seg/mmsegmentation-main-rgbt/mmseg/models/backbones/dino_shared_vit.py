@@ -20,15 +20,14 @@ Token budgets (doc 2.1):
     dense:        N anchors + N extras
     sparse_hard:  N anchors + K extras  (real gather, shorter sequence)
 
-Four forward modes (doc 14.3): 'adapt' | 'dense' | 'sparse_soft' | 'sparse_hard'.
+Training modes (doc 14.3): 'adapt' | 'dense' | 'sparse_soft' | 'sparse_hard',
+plus the 'rgb_only' control used to validate the pretrained path.
 
-RoPE note: DINOv3 blocks are pretrained with rotary position embeddings on a
-raster patch grid. The shallow per-modality blocks run on the real H*W grid and
-keep RoPE. The deep blocks operate on the joint [anchor ; extra] sequence, which
-is NOT a raster grid (extras may be pruned/reordered), so RoPE is disabled there
-and position is supplied instead by a learned anchor position embedding plus the
-per-Extra spatial/type encodings added at fusion (doc 3.2). The deep blocks are
-fine-tuned (Stage 2A) to absorb this, consistent with the design.
+RoPE note: every Anchor and Extra retains the raster coordinate of the source
+patch.  Dense execution therefore repeats the pretrained DINOv3 RoPE grid for
+the two streams; hard sparse execution gathers the Extra RoPE with the same
+Top-K indices as its tokens.  This preserves the positional prior in all twelve
+pretrained blocks.
 
 This module imports only torch + the project's DINOv3 loader; the mm* registry
 decoration is optional (guarded) so the shape logic can be unit-tested on a
@@ -78,6 +77,11 @@ def _dinov3_rope(q, k, position_embeddings):
             'DINOv3 RoPE helper is unavailable; check the pinned transformers '
             'version instead of silently running without positional encoding.') from exc
     cos, sin = position_embeddings
+    # A per-sample gathered sparse grid is [B,L,D].  Attention is [B,H,L,D],
+    # so retain a singleton head dimension for correct broadcasting.
+    if cos.ndim == 3:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
     return apply_rotary_pos_emb(q, k, cos, sin)
 
 
@@ -115,20 +119,14 @@ def _projected_attention(attn, x_norm, position_embeddings=None,
 
 
 def run_dino_block(block, x, rope=None, H=None, W=None,
+                   position_embeddings=None,
                    adapter: Optional[ModalityAdapter] = None,
                    attention_backend: str = 'sdpa', patch_size: int = 16):
     """Run one DINOv3 ViT block on tokens x [B, L, C].
 
-    rope: the backbone's rope module or None.
-      - rope given (shallow blocks, tokens on the H*W grid): RoPE (cos, sin) is
-        generated for the grid and the block's own attention applies it.
-      - rope None (deep blocks over the joint [anchor ; extra] sequence, which
-        is NOT a raster grid): attention is computed manually WITHOUT RoPE. We
-        do NOT pass position_embeddings=None to the HF attention because it does
-        ``cos, sin = position_embeddings`` unconditionally and would crash.
-        Position on the joint sequence is instead supplied additively by the
-        learned anchor position embedding + per-Extra spatial/type encodings
-        (doc 3.2); the deep blocks are fine-tuned (Stage 2A) to absorb this.
+    rope: the backbone's RoPE module for a regular H*W grid.
+    position_embeddings: an already constructed/gathered ``(cos, sin)`` pair
+        for a joint or sparse sequence.  Exactly one of these two forms is used.
     adapter: optional ModalityAdapter whose residual is added to the MLP output
              (doc 2.3: h' = u + SharedFFN(LN(u)) + gamma * Adapter(LN(u))).
     """
@@ -140,13 +138,13 @@ def run_dino_block(block, x, rope=None, H=None, W=None,
     attn = block.attn if hasattr(block, 'attn') else block.attention
 
     if hasattr(attn, 'q_proj'):
-        pos_emb = None
+        pos_emb = position_embeddings
         if rope is not None and H is not None:
+            if pos_emb is not None:
+                raise ValueError('pass either rope/grid or position_embeddings')
             # Shallow grid tokens keep the pretrained DINOv3 RoPE.
             dummy = x.new_zeros(B, 3, H * patch_size, W * patch_size)
             pos_emb = rope(dummy)  # (cos, sin)
-        # Deep joint tokens deliberately omit RoPE; additive anchor/extra
-        # position encodings are applied before this block sequence.
         out = _projected_attention(
             attn, x_norm, position_embeddings=pos_emb,
             backend=attention_backend)
@@ -270,8 +268,10 @@ class _DinoSharedViTImpl(nn.Module):
             self._init_patch_embed_from_dino(conv_w, conv_b, thr_in_channels)
         self.modality_embed = nn.ParameterDict({
             m: nn.Parameter(torch.zeros(1, 1, embed_dims)) for m in self.modalities})
+        # A random modality code perturbs the pretrained RGB representation at
+        # iteration zero.  Zero is identity-preserving and remains learnable.
         for p in self.modality_embed.values():
-            nn.init.trunc_normal_(p, std=0.02)
+            nn.init.zeros_(p)
 
         # --- shallow per-modality adapters (doc 2.3): only on blocks 0..R-1 ---
         self.adapters = nn.ModuleDict({
@@ -286,7 +286,6 @@ class _DinoSharedViTImpl(nn.Module):
         self.fusion = AnchorExtraFusion(embed_dims, num_tokens=num_tokens)
         self.router = UtilityRouter(embed_dims)
         self.anchor_pos_embed = nn.Parameter(torch.zeros(1, num_tokens, embed_dims))
-        nn.init.trunc_normal_(self.anchor_pos_embed, std=0.02)
         # training-only projectors (doc 2.4): teacher(rgb) frozen/EMA, student trains
         self.student_projector = AlignmentProjector(
             embed_dims, out_dim=align_out_dim, modalities=self.modalities)
@@ -354,13 +353,14 @@ class _DinoSharedViTImpl(nn.Module):
                 if self.with_cp and tok.requires_grad else run(tok)
         return tok
 
-    def _run_deep(self, seq):
+    def _run_deep(self, seq, position_embeddings):
         for l in range(self.R, self.depth):
             block = self.blocks[l]
 
-            def run(x, block=block):
+            def run(x, block=block, position_embeddings=position_embeddings):
                 return run_dino_block(
                     block, x, rope=None,
+                    position_embeddings=position_embeddings,
                     attention_backend=self.attention_backend,
                     patch_size=self.patch_size)
 
@@ -368,16 +368,61 @@ class _DinoSharedViTImpl(nn.Module):
                 if self.with_cp and seq.requires_grad else run(seq)
         return seq
 
+    def _grid_rope(self, ref, H, W):
+        if self.rope is None:
+            return None
+        dummy = ref.new_zeros(ref.shape[0], 3,
+                              H * self.patch_size, W * self.patch_size)
+        return self.rope(dummy)
+
+    @staticmethod
+    def _repeat_rope(position_embeddings):
+        if position_embeddings is None:
+            return None
+        cos, sin = position_embeddings
+        return (torch.cat([cos, cos], dim=-2),
+                torch.cat([sin, sin], dim=-2))
+
+    @staticmethod
+    def _gather_rope(position_embeddings, idx, batch_size):
+        if position_embeddings is None:
+            return None
+        gathered = []
+        for table in position_embeddings:
+            if table.ndim == 2:
+                table = table.unsqueeze(0).expand(batch_size, -1, -1)
+            elif table.shape[0] == 1 and batch_size > 1:
+                table = table.expand(batch_size, -1, -1)
+            extra = torch.gather(
+                table, 1, idx.unsqueeze(-1).expand(-1, -1, table.shape[-1]))
+            gathered.append(torch.cat([table, extra], dim=1))
+        return tuple(gathered)
+
     def forward(self, rgb, thermal, mode='dense', target_k=None,
                 soft_tau=1.0, availability: Optional[Dict[str, torch.Tensor]] = None):
         """rgb: [B, 3, H, W]; thermal: [B, C_t, H, W].
 
         Returns a dict; keys depend on mode:
           adapt:  {rgb_tokens, thermal_tokens, grid}      (Stage 1)
+          rgb_only: native one-stream control/ablation
           else:   {anchor_map [B,D,H,W], anchors [B,N,D], extras, utility,
                    alpha, grid, seq_len}
         """
         r, (H, W) = self._embed(rgb, 'rgb')
+
+        # Diagnostic/ablation path: a single RGB stream through all pretrained
+        # blocks with the original raster RoPE.  This isolates data, optimizer,
+        # decoder, and DINO loading from all cross-modal components.
+        if mode == 'rgb_only':
+            r = self._run_shallow(r, 'rgb', H, W)
+            r = self._run_deep(r, self._grid_rope(r, H, W))
+            anchors = self.final_norm(r)
+            anchor_map = anchors.transpose(1, 2).reshape(
+                anchors.shape[0], self.embed_dims, H, W).contiguous()
+            return dict(anchor_map=anchor_map, anchors=anchors, extras=None,
+                        utility=None, alpha=None, grid=(H, W),
+                        seq_len=r.shape[1])
+
         t, _ = self._embed(thermal, 'thermal')
 
         # availability: zero a fully-missing modality's tokens (doc 3.3)
@@ -398,20 +443,25 @@ class _DinoSharedViTImpl(nn.Module):
         a = a + self.anchor_pos_embed[:, :N]
 
         u = None
+        grid_rope = self._grid_rope(a, H, W)
+        joint_rope = None
         if mode == 'dense':
             seq = torch.cat([a, e], dim=1)       # N + N
+            joint_rope = self._repeat_rope(grid_rope)
         elif mode == 'sparse_soft':
             u = self.router.utility(a, e)
             e_g = self.router.soft_gate(e, u, target_k, tau=soft_tau)
             seq = torch.cat([a, e_g], dim=1)     # N + N (gated, full length)
+            joint_rope = self._repeat_rope(grid_rope)
         elif mode == 'sparse_hard':
             u = self.router.utility(a, e)
-            e_k, _ = self.router.topk_gather(e, u, target_k)
+            e_k, idx = self.router.topk_gather(e, u, target_k)
             seq = torch.cat([a, e_k], dim=1)     # N + K (real gather)
+            joint_rope = self._gather_rope(grid_rope, idx, a.shape[0])
         else:
             raise ValueError(f'unknown mode: {mode}')
 
-        seq = self._run_deep(seq)
+        seq = self._run_deep(seq, joint_rope)
         anchors = self.final_norm(seq[:, :N])
         anchor_map = anchors.transpose(1, 2).reshape(
             anchors.shape[0], self.embed_dims, H, W).contiguous()

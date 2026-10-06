@@ -36,7 +36,7 @@ QWSEG_PREPARE_ONLY=1 bash tools/server/setup_v100_env.sh
 ## 数据检查
 
 - LLVIP：训练 12,025 对、测试 3,463 对，RGB/T 文件名配对完整。其框标注不是语义分割标签；当前用于 Stage 1 无标签适配。
-- MFNet：train/val/test = 784/392/393。全部 1,569 个样本已检查图片可解码、尺寸、标签值与配对；集合之间没有重复。训练用 train.txt，验证用 val.txt，最终测试用 test.txt。
+- MFNet：train/val/test = 784/392/393。全部 1,569 个样本已检查图片可解码、尺寸、标签值与配对；集合之间没有重复。正式协议合并 train+val 得到 1,176 张 `trainval.txt` 用于训练，393 张官方 test 用于每轮模型选择和最终报告。由于 test 参与模型选择，论文中必须明确称为 test-set protocol，不能再声称另有未使用的最终测试集。
 - FMB：RGB、T 与标签目录已发现，训练 1,220、验证 280；尚未对全量标签做与 MFNet 同等级的审计。
 - PST900：已找到数据目录；尚未进行完整训练接入与审计。
 
@@ -82,7 +82,7 @@ GPUS=4 bash tools/server/train_dino_ts.sh stage3
 默认顺序与权重交接如下：
 
 1. Stage 1 在 LLVIP 的 12,025 个 train 对上做无标签模态适配，每 5 epoch 在 3,463 个官方 test 对上计算不带标签的对齐损失。
-2. Stage 2A 从 Stage 1 验证对齐损失最低的权重开始，在 MFNet 干净输入上训练 Dense Teacher，不加入退化或模态缺失损失。
+2. Stage 2A 从 Stage 1 验证对齐损失最低的权重中只提取已训练的 Thermal PatchEmbed、Thermal modality embedding 和 Thermal Adapter，在 MFNet 干净输入上训练 Dense Teacher，不加载 Stage 1 中随机冻结的融合层/解码头，也不加入退化或模态缺失损失。
 3. Stage 2B 从 Stage 2A 的最佳 clean mIoU 权重开始，再加入退化、模态缺失与 EMA 一致性并验证 Dense Robust Teacher；该阶段可以作为是否需要 Dense 鲁棒化的消融项。
 4. Stage 3 从 Stage 2B 的最佳 EMA 权重构造冻结教师与稀疏学生。
 

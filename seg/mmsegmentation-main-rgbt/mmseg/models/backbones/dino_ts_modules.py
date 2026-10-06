@@ -109,8 +109,35 @@ class AnchorExtraFusion(nn.Module):
         # per-Extra additive encodings (doc 3.2)
         self.extra_pos_embed = nn.Parameter(torch.zeros(1, num_tokens, dim))
         self.extra_type_embed = nn.Parameter(torch.zeros(1, 1, dim))
-        nn.init.trunc_normal_(self.extra_pos_embed, std=0.02)
-        nn.init.trunc_normal_(self.extra_type_embed, std=0.02)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """Start as a near-identity RGB path instead of erasing DINO features.
+
+        The former default ``nn.Linear`` initialization replaced both DINO
+        streams with random projections before nine pretrained blocks.  The
+        segmentation head therefore did not actually receive useful DINOv3
+        features at the start of Stage 2.  RGB is the stable anchor initially;
+        thermal remains available as the Extra stream and the scorer can learn
+        a different mixture from supervision.
+        """
+        nn.init.eye_(self.v_rgb.weight)
+        nn.init.zeros_(self.v_rgb.bias)
+        nn.init.eye_(self.v_t.weight)
+        nn.init.zeros_(self.v_t.bias)
+
+        scorer_out = self.fusion_scorer[-1]
+        nn.init.zeros_(scorer_out.weight)
+        with torch.no_grad():
+            # softmax([log(9), 0]) = [0.9, 0.1]
+            scorer_out.bias.copy_(scorer_out.bias.new_tensor([2.1972246, 0.0]))
+
+        # The residual Extra path starts exactly as the thermal DINO token.
+        extra_out = self.extra_mlp[-1]
+        nn.init.zeros_(extra_out.weight)
+        nn.init.zeros_(extra_out.bias)
+        nn.init.zeros_(self.extra_pos_embed)
+        nn.init.zeros_(self.extra_type_embed)
 
     def forward(self, r: torch.Tensor, t: torch.Tensor
                 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -125,7 +152,7 @@ class AnchorExtraFusion(nn.Module):
         desc = torch.cat([r, t, (r - t).abs(), r * t], dim=-1)
         alpha = F.softmax(self.fusion_scorer(desc), dim=-1)  # [B, N, 2]
         a = alpha[..., 0:1] * self.v_rgb(r) + alpha[..., 1:2] * self.v_t(t)
-        e = self.extra_mlp(torch.cat([r - t, r, t, a], dim=-1))
+        e = t + self.extra_mlp(torch.cat([r - t, r, t, a], dim=-1))
         N = e.shape[1]
         e = e + self.extra_pos_embed[:, :N] + self.extra_type_embed
         return a, e, alpha

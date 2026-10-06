@@ -79,9 +79,23 @@ def main():
     rgb = torch.randn(B, 3, *img)
     thr = torch.randn(B, 3, *img)
 
+    # Fusion must preserve the pretrained coordinate system at initialization.
+    eye = torch.eye(D)
+    torch.testing.assert_close(net.fusion.v_rgb.weight, eye)
+    torch.testing.assert_close(net.fusion.v_t.weight, eye)
+    torch.testing.assert_close(
+        torch.softmax(net.fusion.fusion_scorer[-1].bias, dim=0),
+        torch.tensor([0.9, 0.1]))
+    assert torch.count_nonzero(net.anchor_pos_embed) == 0
+    assert all(torch.count_nonzero(v) == 0 for v in net.modality_embed.values())
+
     # ---- mode coverage (doc 14.3) ----
     o_adapt = net(rgb, thr, mode='adapt')
     assert o_adapt['rgb_tokens'].shape == (B, N, D)
+
+    o_rgb = net(rgb, thr, mode='rgb_only')
+    assert o_rgb['seq_len'] == N
+    assert o_rgb['anchor_map'].shape == (B, D, img[0] // patch, img[1] // patch)
 
     o_dense = net(rgb, thr, mode='dense')
     assert o_dense['seq_len'] == 2 * N, 'dense = N anchors + N extras'

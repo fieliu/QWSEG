@@ -67,9 +67,14 @@ if [[ "$RESUME" == "1" ]]; then
 else
   case "$STAGE" in
     stage2a)
-      INIT_CKPT=${INIT_CKPT:-$(latest_checkpoint "$WORK_ROOT/stage1/weight" 'best_stage1_align_loss*.pth')}
-      echo "Initialization checkpoint: $INIT_CKPT"
-      CFG_OPTIONS+=("load_from=$INIT_CKPT")
+      STAGE1_CKPT=${INIT_CKPT:-$(latest_checkpoint "$WORK_ROOT/stage1/weight" 'best_stage1_align_loss*.pth')}
+      TRANSFER_CKPT=${STAGE1_TRANSFER_CKPT:-${STAGE1_CKPT%.pth}_stage2_transfer.pth}
+      if [[ ! -f "$TRANSFER_CKPT" || "$STAGE1_CKPT" -nt "$TRANSFER_CKPT" ]]; then
+        python tools/extract_dino_ts_stage1.py "$STAGE1_CKPT" "$TRANSFER_CKPT"
+      fi
+      echo "Stage-1 source checkpoint: $STAGE1_CKPT"
+      echo "Selective initialization checkpoint: $TRANSFER_CKPT"
+      CFG_OPTIONS+=("load_from=$TRANSFER_CKPT")
       ;;
     stage2b)
       INIT_CKPT=${INIT_CKPT:-$(latest_checkpoint "$WORK_ROOT/stage2a/weight" 'best_mIoU*.pth')}
@@ -158,6 +163,7 @@ else
     echo "MFNet directory not found: $MFNET_ROOT" >&2
     exit 1
   }
+  python tools/prepare_mfnet_trainval.py "$MFNET_ROOT"
 fi
 
 FREE_KB=$(df -Pk "$WORK_DIR" | awk 'NR==2 {print $4}')

@@ -61,7 +61,9 @@ default_hooks = dict(
         type='CheckpointHook', by_epoch=True, interval=5,
         max_keep_ckpts=2, save_last=True, save_best='mIoU', rule='greater'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
-    visualization=dict(type='SegVisualizationHook', draw=True, interval=100))
+    # Rendering every validation sample is CPU- and disk-heavy. Enable it only
+    # for a dedicated qualitative-evaluation run.
+    visualization=dict(type='SegVisualizationHook', draw=False))
 
 custom_hooks = [
     dict(type='EpochSyncHook'),

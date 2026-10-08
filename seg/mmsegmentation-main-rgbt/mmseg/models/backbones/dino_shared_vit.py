@@ -210,6 +210,7 @@ class _DinoSharedViTImpl(nn.Module):
         fusion_block: int = 3,          # R: number of shallow (independent) blocks
         d_adapter: int = 64,
         rgb_adapter_identity: bool = False,
+        thermal_adapter_identity: bool = False,
         thr_in_channels: int = 3,
         align_out_dim: Optional[int] = None,
         freeze_vit: bool = False,
@@ -281,7 +282,9 @@ class _DinoSharedViTImpl(nn.Module):
                 ModalityAdapter(embed_dims, d_adapter, identity=rgb_adapter_identity)
                 for _ in range(self.R)]),
             'thermal': nn.ModuleList([
-                ModalityAdapter(embed_dims, d_adapter) for _ in range(self.R)]),
+                ModalityAdapter(embed_dims, d_adapter,
+                                identity=thermal_adapter_identity)
+                for _ in range(self.R)]),
         })
 
         # --- fusion + router + alignment projectors ---
@@ -425,6 +428,21 @@ class _DinoSharedViTImpl(nn.Module):
                         seq_len=r.shape[1])
 
         t, _ = self._embed(thermal, 'thermal')
+
+        # Mirror of the rgb_only control for the thermal branch: one stream
+        # through all pretrained blocks with the original raster RoPE.  Needed
+        # as the reference for "how well does thermal alone do", which is what
+        # the rgb_missing number has to be judged against -- comparing it to an
+        # RGB-only baseline would be comparing two different modalities.
+        if mode == 'thermal_only':
+            t = self._run_shallow(t, 'thermal', H, W)
+            t = self._run_deep(t, self._grid_rope(t, H, W))
+            anchors = self.final_norm(t)
+            anchor_map = anchors.transpose(1, 2).reshape(
+                anchors.shape[0], self.embed_dims, H, W).contiguous()
+            return dict(anchor_map=anchor_map, anchors=anchors, extras=None,
+                        utility=None, alpha=None, grid=(H, W),
+                        seq_len=t.shape[1])
 
         # availability: zero a fully-missing modality's tokens (doc 3.3)
         if availability is not None:

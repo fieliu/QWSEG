@@ -186,7 +186,8 @@ class UtilityRouter(nn.Module):
         return self.mlp(feat).squeeze(-1)
 
     @staticmethod
-    def topk_gather(extras: torch.Tensor, u: torch.Tensor, k: int
+    def topk_gather(extras: torch.Tensor, u: torch.Tensor, k: int,
+                    tau: float = 1.0
                     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Hard Top-K selection by utility with a REAL gather (doc 9.2/15.3):
         the returned tensor has sequence length K, not N-with-zeros.
@@ -201,6 +202,21 @@ class UtilityRouter(nn.Module):
         idx = u.topk(k, dim=1).indices  # [B, K]
         idx_exp = idx.unsqueeze(-1).expand(-1, -1, D)
         kept = torch.gather(extras, 1, idx_exp)
+        # Straight-through: the SELECTION stays hard and the sequence really
+        # is length K, but the router still receives gradient.
+        # u.topk(...).indices is non-differentiable and u is used for
+        # nothing else on this path, so without this the router gets
+        # grad=None for the whole hard-gather phase and is frozen -- it
+        # would only ever be optimised against the soft gate, whose forward
+        # keeps the full length N with the pruned tokens merely
+        # down-weighted, which is not the regime inference runs in.
+        # w / w.detach() is exactly 1.0 in the forward pass (so the kept
+        # values are bit-identical to a plain gather) and carries d(w) into
+        # u in the backward pass.  The gradient scale is (1 - w) / tau,
+        # which is bounded; w is clamped only to keep the division safe.
+        u_kept = torch.gather(u, 1, idx)                        # [B, K]
+        w = torch.sigmoid(u_kept / max(tau, 1e-6)).clamp_min(1e-6)
+        kept = kept * (w / w.detach()).unsqueeze(-1)
         return kept, idx
 
     @staticmethod

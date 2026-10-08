@@ -9,8 +9,11 @@ crop_size = (480, 640)
 model = dict(
     type='DinoTSDenseEMA',
     forward_mode='dense',
-    lambda_deg=1.0,
-    lambda_missing=1.0,
+    # Not consulted by the Stage-2B objective (doc 8.5): supervision is on the
+    # clean input, and the single stochastic strong view feeds L_anchor only.
+    # Left at 0 so the config does not imply three supervised seg views.
+    lambda_deg=0.0,
+    lambda_missing=0.0,
     ema_momentum_base=0.996,
     ema_momentum_final=0.9999,
     total_epochs=200,

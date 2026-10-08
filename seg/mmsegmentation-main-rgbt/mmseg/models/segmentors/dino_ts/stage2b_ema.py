@@ -118,36 +118,37 @@ class DinoTSDenseEMA(DinoTSDense):
             raise RuntimeError(
                 'EMA teacher is not initialized. Add EMAUpdateHook to custom_hooks.')
 
-        has_label = bool(getattr(data_samples[0], 'has_label', True)) \
-            if len(data_samples) else True
+        if self.degrader.weak_severity != 0:
+            raise NotImplementedError(
+                'The Stage-2B objective assumes weak_severity=0, so the EMA '
+                'target is the clean input we already hold.  A non-zero '
+                'weak_severity needs its own severity-1 teacher pass; add it '
+                'explicitly rather than silently degrading the target.')
 
-        # weak (light) / strong (heavy) paired views
-        rgb, thermal = self._split(inputs)
-        mean = self.data_preprocessor.mean.flatten()
-        std = self.data_preprocessor.std.flatten()
-        (l_rgb, l_thr, h_rgb, h_thr, *_rest) = self.degrader.make_paired(
-            rgb, thermal, mean, std, epoch=self.current_epoch,
-            valid_shapes=[ds.img_shape for ds in data_samples])
-        x_weak = torch.cat([l_rgb, l_thr], dim=1)
-        x_strong = torch.cat([h_rgb, h_thr], dim=1)
+        has_label = (bool(getattr(data_samples[0], 'has_label', True))
+                     if len(data_samples) else True)
 
         losses = dict()
 
-        # segmentation (labeled only): reuse Stage-2A three-view seg on x_strong
+        # L_stage2A (doc 7.4): supervised segmentation on the CLEAN input.
         if has_label:
             losses.update(self._seg_loss(inputs, data_samples, 'clean'))
-            deg_inputs = self._make_degraded(inputs, data_samples)
-            for k, v in self._seg_loss(deg_inputs, data_samples, 'deg').items():
-                losses[k] = self.lambda_deg * v
-            miss_inputs, avail = self._make_missing(inputs, data_samples)
-            for k, v in self._seg_loss(miss_inputs, data_samples, 'missing',
-                                       availability=avail).items():
-                losses[k] = self.lambda_missing * v
 
-        # anchor consistency: online(x_strong) vs stop-grad EMA(x_weak)
+        # ONE stochastic strong view per sample (doc 8.2).  This is the single
+        # place the shared degradation policy is consulted, so degrade_prob,
+        # modality_probs, scope_probs, severity_range and missing_prob all take
+        # effect exactly as the policy intends: one view per sample, sampled
+        # once.  Drawing several independent views per step (as the previous
+        # implementation did) multiplied the cost and made those probabilities
+        # meaningless, because the segmentation loss and the anchor loss ended
+        # up looking at two different random corruptions of the same batch.
+        x_strong = self._make_degraded(inputs, data_samples)
+
+        # L_anchor (doc 8.3): pull the online anchors produced from the strong
+        # view towards the stop-grad EMA anchors produced from the clean view.
         a_online = self._anchors_for(x_strong, self)
         with torch.no_grad():
-            a_ema = self._anchors_for(x_weak, self.ema)
+            a_ema = self._anchors_for(inputs, self.ema)
         losses['loss_anchor'] = self.lambda_anchor * L.anchor_consistency_loss(
             a_online, a_ema.detach())
 

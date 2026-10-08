@@ -26,8 +26,13 @@ try:
     from .ema_update_hook import EMAUpdateHook
 except ImportError:
     EMAUpdateHook = None
+try:
+    from .robust_selection_hook import RobustSelectionHook
+except ImportError:
+    RobustSelectionHook = None
 from .visualization_hook import SegVisualizationHook
 
 __all__ = ['SegVisualizationHook', 'TrainVisHook', 'MissingModalityEvalHook',
            'EoMTRGBTVisHook', 'AdapterM2FQualityVisHook',
-           'PartialDegradeEvalHook', 'EpochSyncHook', 'EMAUpdateHook']
+           'PartialDegradeEvalHook', 'EpochSyncHook', 'EMAUpdateHook',
+           'RobustSelectionHook']

@@ -144,9 +144,21 @@ class DinoTSDenseEMA(DinoTSDense):
         # up looking at two different random corruptions of the same batch.
         x_strong = self._make_degraded(inputs, data_samples)
 
+        # Strong-view anchors.  With lambda_deg > 0 the strong view also carries
+        # the supervised segmentation loss (design C), so its forward is run
+        # ONCE here and the anchors are read straight out of that same pass --
+        # extract_feat stashes them in _last_backbone_out.  With lambda_deg = 0
+        # there is no segmentation term and the anchors are taken directly
+        # (design A).  Either way the strong view is forwarded exactly once.
+        if has_label and self.lambda_deg > 0:
+            for k, v in self._seg_loss(x_strong, data_samples, 'deg').items():
+                losses[k] = self.lambda_deg * v
+            a_online = self._last_backbone_out['anchors']
+        else:
+            a_online = self._anchors_for(x_strong, self)
+
         # L_anchor (doc 8.3): pull the online anchors produced from the strong
         # view towards the stop-grad EMA anchors produced from the clean view.
-        a_online = self._anchors_for(x_strong, self)
         with torch.no_grad():
             a_ema = self._anchors_for(inputs, self.ema)
         losses['loss_anchor'] = self.lambda_anchor * L.anchor_consistency_loss(

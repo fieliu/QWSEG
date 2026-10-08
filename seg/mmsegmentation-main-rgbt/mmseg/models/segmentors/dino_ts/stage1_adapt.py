@@ -72,7 +72,6 @@ class DinoTSStage1Adapt(DinoTSBase):
         # Exclude its unused RGB-specific LayerNorm from the optimizer too.
         for p in bb.student_projector.norms['rgb'].parameters():
             p.requires_grad = False
-        bb.anchor_pos_embed.requires_grad = False
 
     def loss(self, inputs, data_samples):
         rgb, thermal = self._split(inputs)

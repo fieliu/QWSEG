@@ -92,7 +92,7 @@ class AlignmentProjector(nn.Module):
 # ---------------------------------------------------------------------------
 
 class AnchorExtraFusion(nn.Module):
-    def __init__(self, dim: int, num_tokens: int, scorer_hidden: Optional[int] = None):
+    def __init__(self, dim: int, scorer_hidden: Optional[int] = None):
         super().__init__()
         h = scorer_hidden or dim
         # fusion weights over the two modalities from the 4-way descriptor
@@ -106,8 +106,14 @@ class AnchorExtraFusion(nn.Module):
         self.extra_mlp = nn.Sequential(
             nn.LayerNorm(dim * 4), nn.Linear(dim * 4, h), nn.GELU(),
             nn.Linear(h, dim))
-        # per-Extra additive encodings (doc 3.2)
-        self.extra_pos_embed = nn.Parameter(torch.zeros(1, num_tokens, dim))
+        # Type marker only.  There is deliberately NO learned position embedding
+        # here: the shallow and deep blocks both carry RoPE, and Mask2Former adds
+        # its own sine positional encoding, so an additive absolute embedding was
+        # a fourth, redundant source of position -- and the only fixed-size
+        # parameter that stopped the backbone from accepting arbitrary
+        # resolutions.  RoPE is relative and therefore cannot separate an anchor
+        # from the extra at the same index (they share the same coordinate), so
+        # the type marker stays.
         self.extra_type_embed = nn.Parameter(torch.zeros(1, 1, dim))
         self.reset_parameters()
 
@@ -136,7 +142,6 @@ class AnchorExtraFusion(nn.Module):
         extra_out = self.extra_mlp[-1]
         nn.init.zeros_(extra_out.weight)
         nn.init.zeros_(extra_out.bias)
-        nn.init.zeros_(self.extra_pos_embed)
         nn.init.zeros_(self.extra_type_embed)
 
     def forward(self, r: torch.Tensor, t: torch.Tensor
@@ -154,7 +159,7 @@ class AnchorExtraFusion(nn.Module):
         a = alpha[..., 0:1] * self.v_rgb(r) + alpha[..., 1:2] * self.v_t(t)
         e = t + self.extra_mlp(torch.cat([r - t, r, t, a], dim=-1))
         N = e.shape[1]
-        e = e + self.extra_pos_embed[:, :N] + self.extra_type_embed
+        e = e + self.extra_type_embed
         return a, e, alpha
 
 
@@ -246,7 +251,7 @@ if __name__ == '__main__':
     assert torch.allclose(z.norm(dim=-1), torch.ones(B, N), atol=1e-4), \
         'projector output must be L2-normalized'
 
-    fusion = AnchorExtraFusion(D, num_tokens=N)
+    fusion = AnchorExtraFusion(D)
     a, e, alpha = fusion(r, t)
     assert a.shape == (B, N, D) and e.shape == (B, N, D)
     assert torch.allclose(alpha.sum(-1), torch.ones(B, N), atol=1e-5), \

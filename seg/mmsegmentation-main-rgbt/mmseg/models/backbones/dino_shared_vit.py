@@ -231,9 +231,11 @@ class _DinoSharedViTImpl(nn.Module):
         self.attention_backend = attention_backend
         self.with_cp = with_cp
         self.modalities = ('rgb', 'thermal')
-        # 1/16 grid for the default image size (used to size learned pos embeds)
+        # 1/16 grid for the nominal image size.  Informational only: the model
+        # accepts any input whose sides are multiples of patch_size, because
+        # RoPE is generated from the runtime H, W and no learned position
+        # embedding is tied to a fixed token count.
         self.grid = (self.img_size[0] // patch_size, self.img_size[1] // patch_size)
-        num_tokens = self.grid[0] * self.grid[1]
 
         # --- shared DINO backbone (blocks + RoPE) ---
         self.rope = None
@@ -283,9 +285,8 @@ class _DinoSharedViTImpl(nn.Module):
         })
 
         # --- fusion + router + alignment projectors ---
-        self.fusion = AnchorExtraFusion(embed_dims, num_tokens=num_tokens)
+        self.fusion = AnchorExtraFusion(embed_dims)
         self.router = UtilityRouter(embed_dims)
-        self.anchor_pos_embed = nn.Parameter(torch.zeros(1, num_tokens, embed_dims))
         # training-only projectors (doc 2.4): teacher(rgb) frozen/EMA, student trains
         self.student_projector = AlignmentProjector(
             embed_dims, out_dim=align_out_dim, modalities=self.modalities)
@@ -440,7 +441,6 @@ class _DinoSharedViTImpl(nn.Module):
 
         a, e, alpha = self.fusion(r, t)          # [B, N, D] each
         N = a.shape[1]
-        a = a + self.anchor_pos_embed[:, :N]
 
         u = None
         grid_rope = self._grid_rope(a, H, W)

@@ -5,6 +5,7 @@ from .loading import (LoadAnnotations, LoadBiomedicalAnnotation,
                       LoadDepthAnnotation, LoadImageFromNDArray,
                       LoadMultipleRSImageFromFile, LoadSingleRSImageFromFile,
                       LoadRGBTImageFromFile, LoadRGBTImageFrom4Channel)
+from .label_remap import RemapLabels
 from .robustness_degradation import (
     CleanDegradation, RGBMissingDegradation, ThermalMissingDegradation,
     GlobalDegradation, LocalDegradation, MultiDegradation)
@@ -44,5 +45,5 @@ __all__ = [
     'RGBTNoiseDegradation', 'RGBTBlurDegradation', 'RGBTMissingDegradation',
     'RGBTLowLightDegradation', 'RGBTOverexposureDegradation',
     'RGBTPatchDegradation', 'RGBTCombinedDegradation', 'RGBTModalDegradation',
-    'apply_degradation', 'apply_multi_region_degradation'
+    'apply_degradation', 'apply_multi_region_degradation', 'RemapLabels'
 ]

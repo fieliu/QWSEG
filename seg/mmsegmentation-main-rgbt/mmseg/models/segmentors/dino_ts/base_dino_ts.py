@@ -185,6 +185,16 @@ class DinoTSBase(BaseSegmentor):
                 x1 = max(x2 - w_crop, 0)
                 crop_img = inputs[:, :, y1:y2, x1:x2]
                 batch_img_metas[0]['img_shape'] = crop_img.shape[2:]
+                # The head resizes its logits to ``pad_shape`` in preference to
+                # ``img_shape``, and the data preprocessor leaves a pad_shape
+                # behind for the *whole* (padded) image.  Overwriting only
+                # img_shape therefore made the head emit a logit as tall as the
+                # padded image while the crop was shorter, and the pad below
+                # then overshot the accumulator:
+                #   "size of tensor a (608) must match tensor b (616)"
+                # With crop_size == image size there is a single grid cell and
+                # this never fired, which is why MFNet hid it.
+                batch_img_metas[0]['pad_shape'] = crop_img.shape[2:]
                 crop_seg_logit = self.encode_decode(crop_img, batch_img_metas)
                 preds += F.pad(crop_seg_logit,
                                (int(x1), int(preds.shape[3] - x2),
